@@ -159,7 +159,7 @@ void AddOutputs(CMutableTransaction& rawTx, const UniValue& outputs_in)
     }
 }
 
-CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf, const uint32_t version)
+CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf, const uint32_t version, std::optional<uint32_t> ref_height)
 {
     CMutableTransaction rawTx;
 
@@ -170,10 +170,16 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
         rawTx.nLockTime = nLockTime;
     }
 
-    if (version < TX_MIN_STANDARD_VERSION || version > TX_MAX_STANDARD_VERSION) {
+    // BIP 462: version 4 transactions carry a reference height.
+    if (ref_height) {
+        if (version != CTransaction::REF_HEIGHT_VERSION) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid parameter, a reference height requires version %u", CTransaction::REF_HEIGHT_VERSION));
+        }
+    } else if (version < TX_MIN_STANDARD_VERSION || version > TX_MAX_STANDARD_VERSION) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid parameter, version out of range(%d~%d)", TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION));
     }
     rawTx.version = version;
+    rawTx.ref_height = ref_height;
 
     AddInputs(rawTx, inputs_in, rbf);
     AddOutputs(rawTx, outputs_in);
@@ -426,6 +432,7 @@ std::vector<RPCResult> TxDoc(const TxDocOptions& opts)
         {RPCResult::Type::NUM, "weight", "The transaction's weight (between vsize*4-3 and vsize*4)"},
         {RPCResult::Type::NUM, "version", "The version"},
         {RPCResult::Type::NUM_TIME, "locktime", "The lock time"},
+        {RPCResult::Type::NUM, "ref_height", /*optional=*/true, "The BIP 462 reference height (version 4 transactions only)"},
         {RPCResult::Type::ARR, "vin", "",
         {
             {RPCResult::Type::OBJ, "", opts.vin_inner_elision ? vin_item_doc : "", std::move(vin_inner)},

@@ -32,8 +32,10 @@ enum BuriedDeployment : int16_t {
     // SCRIPT_VERIFY_WITNESS is enforced from genesis, but the check for downloading
     // missing witness data is not. BIP 147 also relies on hardcoded activation height.
     DEPLOYMENT_SEGWIT,
+    // BIP 462 target-based demurrage (hard fork, flag-day activation height).
+    DEPLOYMENT_DEMURRAGE,
 };
-constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_SEGWIT; }
+constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_DEMURRAGE; }
 
 enum DeploymentPos : uint16_t {
     DEPLOYMENT_TESTDUMMY,
@@ -108,6 +110,17 @@ struct Params {
      * Note that segwit v0 script rules are enforced on all blocks except the
      * BIP 16 exception blocks. */
     int SegwitHeight;
+    /** BIP 462: first height of the first demurrage rate period
+     *  (ACTIVATION_HEIGHT). std::numeric_limits<int>::max() if not scheduled. */
+    int DemurrageHeight{std::numeric_limits<int>::max()};
+    /** BIP 462 RATE_PERIOD: number of blocks for which a demurrage rate applies. */
+    int nDemurrageRatePeriod{2016};
+    /** BIP 462 TARGET_RATE_PER_BLOCK, as the exact fraction num / den.
+     *  0.30% per year over 52,560 blocks per year is 3 / 52,560,000. */
+    int64_t nDemurrageTargetRateNum{3};
+    int64_t nDemurrageTargetRateDen{52'560'000};
+    /** BIP 462 FEE_POOL_DIVISOR: share of the fee pool paid out per block is 1 / divisor. */
+    int64_t nDemurrageFeePoolDivisor{1'000};
     /** Don't warn about unknown BIP 9 activations below this height.
      * This prevents us from warning about the CSV, segwit and taproot activations. */
     int MinBIP9WarningHeight;
@@ -153,6 +166,8 @@ struct Params {
             return CSVHeight;
         case DEPLOYMENT_SEGWIT:
             return SegwitHeight;
+        case DEPLOYMENT_DEMURRAGE:
+            return DemurrageHeight;
         } // no default case, so the compiler can warn about missing cases
         return std::numeric_limits<int>::max();
     }

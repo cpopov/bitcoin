@@ -4,6 +4,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <util/check.h>
 #include <wallet/receive.h>
 #include <wallet/transaction.h>
@@ -242,12 +243,50 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx)
     return CachedTxIsTrusted(wallet, wtx, trusted_parents);
 }
 
+std::optional<DemurrageValuation> GetDemurrageValuation(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const int activation_height{wallet.chain().getDemurrageActivationHeight()};
+    const int tip_height{wallet.GetLastBlockHeight()};
+    if (tip_height + 1 < activation_height) return std::nullopt;
+    // A reference height may not be below the activation height (BIP 462 rule 1).
+    const int ref_height{std::max(tip_height, activation_height)};
+    const std::optional<uint64_t> ref_index{wallet.chain().getDemurrageIndex(ref_height)};
+    if (!ref_index) return std::nullopt;
+    return DemurrageValuation{.activation_height = activation_height, .ref_height = ref_height, .ref_index = *ref_index};
+}
+
+std::optional<CAmount> GetEffectiveOutputValue(const CWallet& wallet, const CWalletTx& wtx, const CTxOut& txout, const DemurrageValuation& valuation)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const TxStateConfirmed* confirmed{wtx.state<TxStateConfirmed>()};
+    if (confirmed && confirmed->confirmed_block_height < valuation.activation_height) {
+        // Created before activation: I_created = I(ACTIVATION_HEIGHT - 1) = 1.
+        return demurrage::EffectiveValue(txout.nValue, demurrage::INDEX_ONE, valuation.ref_index);
+    }
+    std::optional<int> coin_ref_height;
+    if (wtx.GetTx()->ref_height) {
+        coin_ref_height = static_cast<int>(*wtx.GetTx()->ref_height);
+    } else if (confirmed) {
+        coin_ref_height = confirmed->confirmed_block_height;
+    }
+    // An unconfirmed legacy-version transaction's outputs are created at its
+    // unknown inclusion height; an output with a higher reference height
+    // cannot be spent at this one (rule 1).
+    if (!coin_ref_height || *coin_ref_height > valuation.ref_height) return std::nullopt;
+    const std::optional<uint64_t> index_created{wallet.chain().getDemurrageIndex(*coin_ref_height)};
+    if (!index_created) return std::nullopt;
+    return demurrage::EffectiveValue(txout.nValue, *index_created, valuation.ref_index);
+}
+
 Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse, bool include_nonmempool)
 {
     Balance ret;
     bool allow_used_addresses = !avoid_reuse || !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
     {
         LOCK(wallet.cs_wallet);
+        // BIP 462: report effective values
+        const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(wallet)};
         std::set<Txid> trusted_parents;
         for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
             const CWalletTx& wtx = txo.GetWalletTx();
@@ -279,6 +318,9 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse,
                 if (bucket) {
                     // Get the amounts for mine
                     CAmount credit_mine = txo.GetTxOut().nValue;
+                    if (demurrage_valuation) {
+                        credit_mine = GetEffectiveOutputValue(wallet, wtx, txo.GetTxOut(), *demurrage_valuation).value_or(credit_mine);
+                    }
 
                     if (!allow_used_addresses && wallet.IsSpentKey(txo.GetTxOut().scriptPubKey)) {
                         bucket = &ret.m_mine_used;

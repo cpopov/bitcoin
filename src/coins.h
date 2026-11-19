@@ -39,8 +39,14 @@ class ThreadPool;
  * A UTXO entry.
  *
  * Serialized format:
- * - VARINT((height << 1) | (coinbase ? 1 : 0))
+ * - VARINT(code), where code = (height << 1) | (coinbase ? 1 : 0), with bit 32
+ *   additionally set when the coin's BIP 462 reference height differs from
+ *   its inclusion height
+ * - if bit 32 of code is set: VARINT(height - ref_height)
  * - the non-spent CTxOut (via TxOutCompression)
+ *
+ * Coins serialized before BIP 462 never have bit 32 set (heights are 31 bits),
+ * so the existing UTXO set remains readable.
  */
 class Coin
 {
@@ -54,14 +60,25 @@ public:
     //! at which height this containing transaction was included in the active block chain
     uint32_t nHeight : 31;
 
+    //! BIP 462 reference height of the containing transaction (equal to
+    //! nHeight for legacy-version transactions and coinbases). The coin's
+    //! I_created is the demurrage index at this height.
+    uint32_t nRefHeight{0};
+
+    //! Flag in the serialized code marking the presence of a reference height delta.
+    static constexpr uint64_t REF_HEIGHT_CODE_FLAG{uint64_t{1} << 32};
+
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn) : out(outIn), fCoinBase(fCoinBaseIn),nHeight(nHeightIn) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), nRefHeight(nHeightIn) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn) : out(outIn), fCoinBase(fCoinBaseIn),nHeight(nHeightIn), nRefHeight(nHeightIn) {}
+    //! construct a Coin with an explicit BIP 462 reference height.
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, uint32_t ref_height) : out(outIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), nRefHeight(ref_height) {}
 
     void Clear() {
         out.SetNull();
         fCoinBase = false;
         nHeight = 0;
+        nRefHeight = 0;
     }
 
     //! empty constructor
@@ -74,17 +91,29 @@ public:
     template<typename Stream>
     void Serialize(Stream &s) const {
         assert(!IsSpent());
-        uint32_t code{(uint32_t{nHeight} << 1) | uint32_t{fCoinBase}};
+        assert(nRefHeight <= nHeight);
+        uint64_t code{(uint64_t{nHeight} << 1) | uint64_t{fCoinBase}};
+        if (nRefHeight != nHeight) code |= REF_HEIGHT_CODE_FLAG;
         ::Serialize(s, VARINT(code));
+        if (code & REF_HEIGHT_CODE_FLAG) {
+            ::Serialize(s, VARINT(uint32_t{nHeight} - nRefHeight));
+        }
         ::Serialize(s, Using<TxOutCompression>(out));
     }
 
     template<typename Stream>
     void Unserialize(Stream &s) {
-        uint32_t code = 0;
+        uint64_t code = 0;
         ::Unserialize(s, VARINT(code));
-        nHeight = code >> 1;
+        nHeight = (code & ~REF_HEIGHT_CODE_FLAG) >> 1;
         fCoinBase = code & 1;
+        nRefHeight = nHeight;
+        if (code & REF_HEIGHT_CODE_FLAG) {
+            uint32_t delta{0};
+            ::Unserialize(s, VARINT(delta));
+            if (delta > nHeight) throw std::ios_base::failure("Coin reference height out of range");
+            nRefHeight = nHeight - delta;
+        }
         ::Unserialize(s, Using<TxOutCompression>(out));
     }
 

@@ -104,6 +104,24 @@ extern const std::vector<std::string> CHECKLEVEL_DOC;
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
 
+/**
+ * BIP 462: build the transaction context for spending in the block after
+ * @p prev, whose demurrage index is @p spend_index. I(h) for earlier heights
+ * is looked up in the cached block states of @p prev's ancestors. The returned
+ * context references @p blockman and @p prev, and must only be used while
+ * cs_main is held.
+ */
+demurrage::TxContext MakeDemurrageTxContext(const node::BlockManager& blockman, const CBlockIndex& prev, uint64_t spend_index, const Consensus::Params& params);
+
+/** BIP 462: I(h) on the chain ending at @p tip, for h <= tip->nHeight. */
+std::optional<uint64_t> GetDemurrageIndex(const node::BlockManager& blockman, const CBlockIndex& tip, int height, const Consensus::Params& params)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+/** BIP 462: context of the block after @p tip, if BIP 462 is active for it and
+ *  the state after @p tip is known. */
+std::optional<demurrage::BlockContext> GetNextDemurrageBlockContext(const node::BlockManager& blockman, const CBlockIndex& tip, const Consensus::Params& params)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
 bool FatalError(kernel::Notifications& notifications, BlockValidationState& state, const bilingual_str& message);
 
 /** Prune block files up to a given height */
@@ -788,6 +806,14 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                       CCoinsViewCache& view, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /**
+     * BIP 462: if the block after @p prev is the activation block, make sure the
+     * demurrage state after @p prev holds the effective value of the UTXO set,
+     * computing it with a one-time scan of the UTXO set if necessary. @p prev
+     * must be the tip of this chainstate.
+     */
+    bool EnsureDemurrageBaseline(const CBlockIndex& prev, BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     // Apply the effects of a block disconnection on the UTXO set.
     bool DisconnectTip(BlockValidationState& state, DisconnectedBlockTransactions* disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);

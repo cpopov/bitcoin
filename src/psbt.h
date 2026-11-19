@@ -40,6 +40,10 @@ inline constexpr uint8_t PSBT_GLOBAL_FALLBACK_LOCKTIME = 0x03;
 inline constexpr uint8_t PSBT_GLOBAL_INPUT_COUNT = 0x04;
 inline constexpr uint8_t PSBT_GLOBAL_OUTPUT_COUNT = 0x05;
 inline constexpr uint8_t PSBT_GLOBAL_TX_MODIFIABLE = 0x06;
+//! BIP 462 reference height of the unsigned transaction (PSBTv2 only;
+//! provisional key type, pending an amendment to BIP 370). In PSBTv0 the
+//! reference height is part of the unsigned transaction.
+inline constexpr uint8_t PSBT_GLOBAL_REF_HEIGHT = 0x07;
 inline constexpr uint8_t PSBT_GLOBAL_VERSION = 0xFB;
 inline constexpr uint8_t PSBT_GLOBAL_PROPRIETARY = 0xFC;
 
@@ -1252,6 +1256,8 @@ public:
 
     uint32_t tx_version;
     std::optional<uint32_t> fallback_locktime;
+    //! BIP 462 reference height of the unsigned transaction.
+    std::optional<uint32_t> ref_height;
 
     uint32_t GetVersion() const;
 
@@ -1299,6 +1305,10 @@ public:
             if (fallback_locktime != std::nullopt) {
                 SerializeToVector(s, CompactSizeWriter(PSBT_GLOBAL_FALLBACK_LOCKTIME));
                 SerializeToVector(s, *fallback_locktime);
+            }
+            if (ref_height != std::nullopt) {
+                SerializeToVector(s, CompactSizeWriter(PSBT_GLOBAL_REF_HEIGHT));
+                SerializeToVector(s, *ref_height);
             }
 
             SerializeToVector(s, CompactSizeWriter(PSBT_GLOBAL_INPUT_COUNT));
@@ -1365,6 +1375,7 @@ public:
         bool found_output_count = false;
         bool found_tx_version = false;
         bool found_fallback_locktime = false;
+        bool found_ref_height = false;
         while(!s.empty()) {
             // Read the key of format "<keylen><keytype><keydata>" after which
             // "key" will contain "<keytype><keydata>"
@@ -1395,8 +1406,29 @@ public:
                 {
                     ExpectedKeySize("Global Unsigned TX", key, 1);
                     // Set the stream to serialize with non-witness since this should always be non-witness
+                    std::vector<unsigned char> raw_tx;
+                    s >> raw_tx;
                     tx.emplace();
-                    UnserializeFromVector(s, TX_NO_WITNESS(*tx));
+                    // BIP 462: a version 4 transaction's reference height is
+                    // non-witness data, serialized in the extended format
+                    // (marker 0x00, flag 0x02) even without witnesses.
+                    bool parsed{false};
+                    if (raw_tx.size() > 6 && raw_tx[4] == 0x00 && raw_tx[5] == 0x02) {
+                        try {
+                            SpanReader reader{raw_tx};
+                            reader >> TX_WITH_WITNESS(*tx);
+                            parsed = reader.empty() && tx->ref_height.has_value();
+                        } catch (const std::ios_base::failure&) {
+                        }
+                    }
+                    if (!parsed) {
+                        tx.emplace();
+                        SpanReader reader{raw_tx};
+                        reader >> TX_NO_WITNESS(*tx);
+                        if (!reader.empty()) {
+                            throw std::ios_base::failure("Size of value was not the stated size");
+                        }
+                    }
                     // Make sure that all scriptSigs and scriptWitnesses are empty
                     for (const CTxIn& txin : tx->vin) {
                         if (!txin.scriptSig.empty() || !txin.scriptWitness.IsNull()) {
@@ -1405,6 +1437,7 @@ public:
                     }
                     tx_version = tx->version;
                     fallback_locktime = tx->nLockTime;
+                    ref_height = tx->ref_height;
                     // Set the input and output counts
                     input_count = tx->vin.size();
                     output_count = tx->vout.size();
@@ -1423,6 +1456,17 @@ public:
                     fallback_locktime.emplace();
                     UnserializeFromVector(s, *fallback_locktime);
                     found_fallback_locktime = true;
+                    break;
+                }
+                case PSBT_GLOBAL_REF_HEIGHT:
+                {
+                    ExpectedKeySize("Global Reference Height", key, 1);
+                    if (found_ref_height) {
+                        throw std::ios_base::failure("Duplicate Key, global reference height already provided");
+                    }
+                    ref_height.emplace();
+                    UnserializeFromVector(s, *ref_height);
+                    found_ref_height = true;
                     break;
                 }
                 case PSBT_GLOBAL_INPUT_COUNT:
@@ -1523,6 +1567,9 @@ public:
             }
             if (found_fallback_locktime) {
                 throw std::ios_base::failure("PSBT_GLOBAL_FALLBACK_LOCKTIME is not allowed in PSBTv0");
+            }
+            if (found_ref_height) {
+                throw std::ios_base::failure("PSBT_GLOBAL_REF_HEIGHT is not allowed in PSBTv0");
             }
             if (found_input_count) {
                 throw std::ios_base::failure("PSBT_GLOBAL_INPUT_COUNT is not allowed in PSBTv0");

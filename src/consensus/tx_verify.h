@@ -16,6 +16,9 @@ class CBlockIndex;
 class CCoinsViewCache;
 class CTransaction;
 class TxValidationState;
+namespace demurrage {
+struct TxContext;
+} // namespace demurrage
 
 /** Transaction validation functions */
 
@@ -23,10 +26,26 @@ namespace Consensus {
 /**
  * Check whether all inputs of this transaction are valid (no double spends and amounts)
  * This does not modify the UTXO set. This does not check scripts and sigs.
- * @param[out] txfee Set to the transaction fee if successful.
+ * @param[out] txfee Set to the transaction fee if successful. When BIP 462
+ *                   applies, this is the fee at the transaction's reference
+ *                   height, fee(tx) = sum(input_value) - sum(output_value).
+ * @param[in] demurrage_ctx If set and BIP 462 is active at nSpendHeight, inputs
+ *                   are valued at the transaction's reference height and the
+ *                   reference height rules are enforced.
  * Preconditions: tx.IsCoinBase() is false.
  */
-[[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee);
+[[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee,
+                                 const demurrage::TxContext* demurrage_ctx = nullptr);
+
+/**
+ * BIP 462 context-free-of-UTXO checks on a transaction's reference height
+ * field, given whether BIP 462 is active at the inclusion height:
+ * - before activation, no transaction may carry a reference height;
+ * - after activation, a coinbase must not carry one, and a non-coinbase
+ *   transaction carries one if and only if its version is at least
+ *   CTransaction::REF_HEIGHT_VERSION.
+ */
+[[nodiscard]] bool CheckTxRefHeightField(const CTransaction& tx, TxValidationState& state, bool demurrage_active);
 } // namespace Consensus
 
 /** Auxiliary functions for transaction validation (ideally should not be exposed) */

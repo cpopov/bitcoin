@@ -1425,9 +1425,10 @@ BOOST_AUTO_TEST_CASE(tx_malformed_serialization)
         BOOST_CHECK_EXCEPTION(DataStream{std::span{ser}.first(len)} >> TX_WITH_WITNESS(tx), std::ios_base::failure, HasReason{"end of data"});
     }
 
-    // A flag other than 1 is unknown, including one without the witness bit.
+    // A flag other than 1 (witness) and 2 (BIP 462 reference height) is
+    // unknown, including one without the witness bit.
     DataStream bad_flag;
-    bad_flag << mtx.version << uint8_t{0x00} << uint8_t{0x02} << mtx.vin << mtx.vout << mtx.vin[0].scriptWitness.stack << mtx.nLockTime;
+    bad_flag << mtx.version << uint8_t{0x00} << uint8_t{0x04} << mtx.vin << mtx.vout << mtx.vin[0].scriptWitness.stack << mtx.nLockTime;
     BOOST_CHECK_EXCEPTION(bad_flag >> TX_WITH_WITNESS(tx), std::ios_base::failure, HasReason{"Unknown transaction optional data"});
 }
 

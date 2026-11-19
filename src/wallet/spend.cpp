@@ -280,6 +280,14 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
                 input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
             }
             const CWalletTx& parent_tx = txo->GetWalletTx();
+            // BIP 462: value the input at the reference height of the transaction being created.
+            if (const auto valuation{GetDemurrageValuation(wallet)}) {
+                const std::optional<CAmount> effective_value{GetEffectiveOutputValue(wallet, parent_tx, txout, *valuation)};
+                if (!effective_value) {
+                    return util::Error{strprintf(_("Pre-selected input %s cannot be spent at reference height %d"), outpoint.ToString(), valuation->ref_height)};
+                }
+                txout.nValue = *effective_value;
+            }
             if (wallet.GetTxDepthInMainChain(parent_tx) == 0) {
                 if (parent_tx.GetTx()->version == TRUC_VERSION && coin_control.m_version != TRUC_VERSION) {
                     return util::Error{strprintf(_("Can't spend unconfirmed version 3 pre-selected input with a version %d tx"), coin_control.m_version)};
@@ -333,12 +341,21 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const bool can_grind_r = wallet.CanGrindR();
     std::vector<COutPoint> outpoints;
 
+    // BIP 462: coins are offered at their effective value at the reference
+    // height of the transaction being created.
+    const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(wallet)};
+
     std::set<Txid> trusted_parents;
     // Cache for whether each tx passes the tx level checks (first bool), and whether the transaction is "safe" (second bool)
     std::unordered_map<Txid, std::pair<bool, bool>, SaltedTxidHasher> tx_safe_cache;
     for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
         const CWalletTx& wtx = txo.GetWalletTx();
-        const CTxOut& output = txo.GetTxOut();
+        CTxOut output{txo.GetTxOut()};
+        if (demurrage_valuation) {
+            const std::optional<CAmount> effective_value{GetEffectiveOutputValue(wallet, wtx, output, *demurrage_valuation)};
+            if (!effective_value) continue;
+            output.nValue = *effective_value;
+        }
 
         if (tx_safe_cache.contains(outpoint.hash) && !tx_safe_cache.at(outpoint.hash).first) {
             continue;
@@ -1071,6 +1088,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     CMutableTransaction txNew; // The resulting transaction that we make
 
     txNew.version = coin_control.m_version;
+    // BIP 462: once active, the wallet creates version 4 transactions whose
+    // inputs are valued at its last processed block.
+    const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(wallet)};
+    if (demurrage_valuation) {
+        txNew.version = CTransaction::REF_HEIGHT_VERSION;
+        txNew.ref_height = demurrage_valuation->ref_height;
+    }
 
     CoinSelectionParams coin_selection_params{rng_fast}; // Parameters for coin selection, init with dummy
     coin_selection_params.m_avoid_partial_spends = coin_control.m_avoid_partial_spends;
@@ -1085,6 +1109,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.m_long_term_feerate = wallet.m_consolidate_feerate;
     // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 witness overhead (dummy, flag, stack size)
     coin_selection_params.tx_noinputs_size = 10 + GetSizeOfCompactSize(vecSend.size()); // bytes for output count
+    // BIP 462: 4-byte reference height, and the marker and flag become non-witness data.
+    if (demurrage_valuation) coin_selection_params.tx_noinputs_size += 6;
 
     CAmount recipients_sum = 0;
     const OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);

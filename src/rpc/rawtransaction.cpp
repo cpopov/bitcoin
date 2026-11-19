@@ -404,7 +404,9 @@ static RPCMethod createrawtransaction()
                 "Returns hex-encoded raw transaction.\n"
                 "Note that the transaction's inputs are not signed, and\n"
                 "it is not stored in the wallet or transmitted to the network.\n",
-                CreateTxDoc(),
+                Cat<std::vector<RPCArg>>(CreateTxDoc(), {
+                    {"ref_height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "BIP 462 reference height: inputs are valued, and outputs created, at the demurrage index of this height. Requires (and, if version is omitted, implies) version 4."},
+                }),
                 RPCResult{
                     RPCResult::Type::STR_HEX, "transaction", "hex string of the transaction"
                 },
@@ -420,7 +422,13 @@ static RPCMethod createrawtransaction()
     if (!request.params[3].isNull()) {
         rbf = request.params[3].get_bool();
     }
-    CMutableTransaction rawTx = ConstructTransaction(request.params[0], request.params[1], request.params[2], rbf, self.Arg<uint32_t>("version"));
+    std::optional<uint32_t> ref_height;
+    uint32_t version{self.Arg<uint32_t>("version")};
+    if (!request.params[5].isNull()) {
+        ref_height = request.params[5].getInt<uint32_t>();
+        if (request.params[4].isNull()) version = CTransaction::REF_HEIGHT_VERSION;
+    }
+    CMutableTransaction rawTx = ConstructTransaction(request.params[0], request.params[1], request.params[2], rbf, version, ref_height);
 
     return EncodeHexTx(CTransaction(rawTx));
 },
@@ -1091,6 +1099,7 @@ static RPCMethod decodepsbt()
                         }},
                         {RPCResult::Type::NUM, "tx_version", /* optional */ true, "The version number of the unsigned transaction. Not to be confused with PSBT version"},
                         {RPCResult::Type::NUM, "fallback_locktime", /* optional */ true, "The locktime to fallback to if no inputs specify a required locktime."},
+                        {RPCResult::Type::NUM, "ref_height", /* optional */ true, "The BIP 462 reference height of the unsigned transaction (PSBTv2 only)."},
                         {RPCResult::Type::NUM, "input_count", /* optional */ true, "The number of inputs in this psbt"},
                         {RPCResult::Type::NUM, "output_count", /* optional */ true, "The number of outputs in this psbt."},
                         {RPCResult::Type::BOOL, "inputs_modifiable", /* optional */ true, "Whether inputs can be modified"},
@@ -1158,6 +1167,9 @@ static RPCMethod decodepsbt()
         result.pushKV("tx_version", psbtx.tx_version);
         if (psbtx.fallback_locktime.has_value()) {
             result.pushKV("fallback_locktime", static_cast<uint64_t>(*psbtx.fallback_locktime));
+        }
+        if (psbtx.ref_height.has_value()) {
+            result.pushKV("ref_height", static_cast<uint64_t>(*psbtx.ref_height));
         }
         result.pushKV("input_count", (uint64_t)psbtx.inputs.size());
         result.pushKV("output_count", (uint64_t)psbtx.outputs.size());

@@ -610,7 +610,12 @@ class CTxWitness:
 
 
 class CTransaction:
-    __slots__ = ("nLockTime", "version", "vin", "vout", "wit")
+    __slots__ = ("nLockTime", "ref_height", "version", "vin", "vout", "wit")
+
+    # BIP 462: version of transactions that carry a reference height, and the
+    # extended-serialization flag bit that marks its presence.
+    REF_HEIGHT_VERSION = 4
+    REF_HEIGHT_FLAG = 2
 
     def __init__(self, tx=None):
         if tx is None:
@@ -619,12 +624,14 @@ class CTransaction:
             self.vout = []
             self.wit = CTxWitness()
             self.nLockTime = 0
+            self.ref_height = None
         else:
             self.version = tx.version
             self.vin = copy.deepcopy(tx.vin)
             self.vout = copy.deepcopy(tx.vout)
             self.nLockTime = tx.nLockTime
             self.wit = copy.deepcopy(tx.wit)
+            self.ref_height = tx.ref_height
 
     def deserialize(self, f):
         self.version = int.from_bytes(f.read(4), "little")
@@ -639,19 +646,29 @@ class CTransaction:
                 self.vout = deser_vector(f, CTxOut)
         else:
             self.vout = deser_vector(f, CTxOut)
-        if flags != 0:
+        if flags & 1:
             self.wit.vtxinwit = [CTxInWitness() for _ in range(len(self.vin))]
             self.wit.deserialize(f)
         else:
             self.wit = CTxWitness()
         self.nLockTime = int.from_bytes(f.read(4), "little")
+        self.ref_height = None
+        if flags & self.REF_HEIGHT_FLAG:
+            self.ref_height = int.from_bytes(f.read(4), "little")
 
     def serialize_without_witness(self):
         r = b""
         r += self.version.to_bytes(4, "little")
+        if self.ref_height is not None:
+            # The reference height is non-witness data: use the extended
+            # format so that the txid commits to it.
+            r += ser_vector([])
+            r += self.REF_HEIGHT_FLAG.to_bytes(1, "little")
         r += ser_vector(self.vin)
         r += ser_vector(self.vout)
         r += self.nLockTime.to_bytes(4, "little")
+        if self.ref_height is not None:
+            r += self.ref_height.to_bytes(4, "little")
         return r
 
     # Only serialize with witness when explicitly called for
@@ -659,6 +676,8 @@ class CTransaction:
         flags = 0
         if not self.wit.is_null():
             flags |= 1
+        if self.ref_height is not None:
+            flags |= self.REF_HEIGHT_FLAG
         r = b""
         r += self.version.to_bytes(4, "little")
         if flags:
@@ -675,6 +694,8 @@ class CTransaction:
                     self.wit.vtxinwit.append(CTxInWitness())
             r += self.wit.serialize()
         r += self.nLockTime.to_bytes(4, "little")
+        if self.ref_height is not None:
+            r += self.ref_height.to_bytes(4, "little")
         return r
 
     # Regular serialization is with witness -- must explicitly
@@ -729,8 +750,8 @@ class CTransaction:
         return math.ceil(self.get_weight() / WITNESS_SCALE_FACTOR)
 
     def __repr__(self):
-        return "CTransaction(version=%i vin=%s vout=%s wit=%s nLockTime=%i)" \
-            % (self.version, repr(self.vin), repr(self.vout), repr(self.wit), self.nLockTime)
+        return "CTransaction(version=%i vin=%s vout=%s wit=%s nLockTime=%i ref_height=%s)" \
+            % (self.version, repr(self.vin), repr(self.vout), repr(self.wit), self.nLockTime, self.ref_height)
 
 
 class CBlockHeader:

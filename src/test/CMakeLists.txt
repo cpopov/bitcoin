@@ -43,6 +43,7 @@ add_executable(test_bitcoin
   crypto_tests.cpp
   cuckoocache_tests.cpp
   dbwrapper_tests.cpp
+  demurrage_tests.cpp
   denialofservice_tests.cpp
   descriptor_tests.cpp
   disconnected_transactions.cpp
@@ -148,6 +149,7 @@ include(TargetDataSources)
 target_json_data_sources(test_bitcoin
   data/base58_encode_decode.json
   data/bip341_wallet_vectors.json
+  data/bip462_tests.json
   data/bip352_send_and_receive_vectors.json
   data/blockfilters.json
   data/key_io_invalid.json

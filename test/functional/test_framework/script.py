@@ -17,6 +17,7 @@ from .messages import (
     CTxOut,
     hash256,
     ser_string,
+    ser_vector,
     sha256,
 )
 
@@ -673,7 +674,14 @@ def LegacySignatureMsg(script, txTo, inIdx, hashtype):
         txtmp.vin = []
         txtmp.vin.append(tmp)
 
-    s = txtmp.serialize_without_witness()
+    # The signature serialization never uses the extended format; a BIP 462
+    # reference height is appended after nLockTime.
+    s = txtmp.version.to_bytes(4, "little")
+    s += ser_vector(txtmp.vin)
+    s += ser_vector(txtmp.vout)
+    s += txtmp.nLockTime.to_bytes(4, "little")
+    if txtmp.ref_height is not None:
+        s += txtmp.ref_height.to_bytes(4, "little")
     s += hashtype.to_bytes(4, "little")
 
     return (s, None)
@@ -751,6 +759,8 @@ def SegwitV0SignatureMsg(script, txTo, inIdx, hashtype, amount):
     ss += txTo.vin[inIdx].nSequence.to_bytes(4, "little")
     ss += hashOutputs
     ss += txTo.nLockTime.to_bytes(4, "little")
+    if txTo.ref_height is not None:  # BIP 462
+        ss += txTo.ref_height.to_bytes(4, "little")
     ss += hashtype.to_bytes(4, "little")
     return ss
 
@@ -823,6 +833,8 @@ def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpa
     ss = bytes([0, hash_type]) # epoch, hash_type
     ss += txTo.version.to_bytes(4, "little")
     ss += txTo.nLockTime.to_bytes(4, "little")
+    if txTo.ref_height is not None:  # BIP 462
+        ss += txTo.ref_height.to_bytes(4, "little")
     if in_type != SIGHASH_ANYONECANPAY:
         ss += BIP341_sha_prevouts(txTo)
         ss += BIP341_sha_amounts(spent_utxos)
@@ -854,7 +866,7 @@ def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpa
         ss += TaggedHash("TapLeaf", bytes([leaf_ver]) + ser_string(leaf_script))
         ss += bytes([0])
         ss += codeseparator_pos.to_bytes(4, "little", signed=False)
-    assert_equal(len(ss), 175 - (in_type == SIGHASH_ANYONECANPAY) * 49 - (out_type != SIGHASH_ALL and out_type != SIGHASH_SINGLE) * 32 + (annex is not None) * 32 + scriptpath * 37)
+    assert_equal(len(ss), 175 - (in_type == SIGHASH_ANYONECANPAY) * 49 - (out_type != SIGHASH_ALL and out_type != SIGHASH_SINGLE) * 32 + (annex is not None) * 32 + scriptpath * 37 + (txTo.ref_height is not None) * 4)
     return ss
 
 def TaprootSignatureHash(*args, **kwargs):
