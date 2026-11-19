@@ -24,6 +24,7 @@ PartiallySignedTransaction::PartiallySignedTransaction(const CMutableTransaction
 
     tx_version = tx.version;
     fallback_locktime = tx.nLockTime;
+    ref_height = tx.ref_height;
     inputs.reserve(tx.vin.size());
     for (const CTxIn& input : tx.vin) {
         inputs.emplace_back(GetVersion(), input.prevout.hash, input.prevout.n, input.nSequence);
@@ -121,6 +122,7 @@ std::optional<CMutableTransaction> PartiallySignedTransaction::GetUnsignedTx() c
 {
     CMutableTransaction mtx;
     mtx.version = tx_version;
+    mtx.ref_height = ref_height;
     std::optional<uint32_t> locktime = ComputeTimeLock();
     if (!locktime) {
         return std::nullopt;

@@ -127,6 +127,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "getchainstates",
     "getchaintxstats",
     "getconnectioncount",
+    "getdemurrageinfo",
     "getdeploymentinfo",
     "getdescriptoractivity",
     "getdescriptorinfo",

@@ -10,6 +10,9 @@
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
+#include <cstdint>
+#include <optional>
+
 namespace wallet {
 bool InputIsMine(const CWallet& wallet, const CTxIn& txin) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
@@ -50,6 +53,31 @@ struct Balance {
     CAmount m_mine_used{0};              //!< Trusted/untrusted/immature funds in utxos that have already been spent from (only populated if AVOID REUSE wallet flag is set)
     CAmount m_mine_nonmempool{0};        //!< Coins spent by wallet txs that are not in the mempool
 };
+/**
+ * BIP 462: valuation of wallet outputs as inputs of a version 4 transaction
+ * with reference height @ref ref_height.
+ */
+struct DemurrageValuation {
+    int activation_height;
+    //! Reference height of transactions the wallet creates: the wallet's last
+    //! processed block (or the activation height, if that is higher).
+    int ref_height;
+    //! I(ref_height)
+    uint64_t ref_index;
+};
+
+/** BIP 462 valuation at the wallet's last processed block, if BIP 462 applies to the next block. */
+std::optional<DemurrageValuation> GetDemurrageValuation(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** BIP 462: effective value of @p txout, an output of @p wtx, as an input
+ *  valued at @p valuation's reference height. Returns nullopt if the output
+ *  cannot be spent at that reference height (its own reference height is
+ *  higher or unknown). */
+std::optional<CAmount> GetEffectiveOutputValue(const CWallet& wallet, const CWalletTx& wtx, const CTxOut& txout, const DemurrageValuation& valuation)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** Wallet balance. Once BIP 462 is active, balances are effective values at
+ *  the wallet's last processed block. */
 Balance GetBalance(const CWallet& wallet, int min_depth = 0, bool avoid_reuse = true, bool include_nonmempool = false);
 
 std::map<CTxDestination, CAmount> GetAddressBalances(const CWallet& wallet);

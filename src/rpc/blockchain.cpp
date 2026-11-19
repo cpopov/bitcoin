@@ -14,6 +14,7 @@
 #include <coins.h>
 #include <common/args.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
@@ -1230,6 +1231,8 @@ static RPCMethod gettxout()
                     {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
                 }},
                 {RPCResult::Type::BOOL, "coinbase", "Coinbase or not"},
+                {RPCResult::Type::NUM, "ref_height", /*optional=*/true, "BIP 462 reference height of the transaction that created the output (only once BIP 462 is active for the next block)"},
+                {RPCResult::Type::STR_AMOUNT, "effective_value", /*optional=*/true, "BIP 462 effective value in " + CURRENCY_UNIT + " at the demurrage index of the chain tip, i.e. the input value of a spending transaction with ref_height equal to the tip height (only once BIP 462 is active for the next block)"},
             }},
         },
         RPCExamples{
@@ -1279,6 +1282,126 @@ static RPCMethod gettxout()
     ret.pushKV("scriptPubKey", std::move(o));
     ret.pushKV("coinbase", coin->IsCoinBase());
 
+    // BIP 462
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    if (demurrage::IsActive(pindex->nHeight + 1, consensus)) {
+        const int min_ref{demurrage::MinRefHeightForCoin(coin->nHeight, coin->nRefHeight, consensus.DemurrageHeight)};
+        ret.pushKV("ref_height", min_ref);
+        const std::optional<uint64_t> tip_index{GetDemurrageIndex(active_chainstate.m_blockman, *pindex, pindex->nHeight, consensus)};
+        if (min_ref > pindex->nHeight) {
+            // Created by an unconfirmed transaction with a reference height above the tip.
+            ret.pushKV("effective_value", ValueFromAmount(coin->out.nValue));
+        } else if (tip_index) {
+            const demurrage::TxContext ctx{
+                .activation_height = consensus.DemurrageHeight,
+                .spend_height = pindex->nHeight,
+                .index_at = [&](int height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+                    return GetDemurrageIndex(active_chainstate.m_blockman, *pindex, height, consensus);
+                },
+            };
+            if (const std::optional<uint64_t> coin_index{demurrage::CoinIndex(coin->nHeight, coin->nRefHeight, ctx)}) {
+                ret.pushKV("effective_value", ValueFromAmount(demurrage::EffectiveValue(coin->out.nValue, *coin_index, *tip_index)));
+            }
+        }
+    }
+
+    return ret;
+},
+    };
+}
+
+static RPCMethod getdemurrageinfo()
+{
+    return RPCMethod{
+        "getdemurrageinfo",
+        "Returns the BIP 462 (target-based demurrage) state of the active chain at a height, and the values that apply to the next block.\n"
+        "Fixed-point values (index, rate) are integers scaled by index_scale.\n",
+        {
+            {"height", RPCArg::Type::NUM, RPCArg::DefaultHint{"the chain tip"}, "Height of the block whose state to return"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "ACTIVATION_HEIGHT (omitted if BIP 462 is not scheduled)"},
+                {RPCResult::Type::NUM, "rate_period", "RATE_PERIOD in blocks"},
+                {RPCResult::Type::NUM, "target_rate_num", "TARGET_RATE_PER_BLOCK numerator"},
+                {RPCResult::Type::NUM, "target_rate_den", "TARGET_RATE_PER_BLOCK denominator"},
+                {RPCResult::Type::NUM, "fee_pool_divisor", "FEE_POOL_DIVISOR"},
+                {RPCResult::Type::NUM, "index_scale", "Fixed-point scale of index and rate (1.0)"},
+                {RPCResult::Type::NUM, "height", "Height of the block"},
+                {RPCResult::Type::STR_HEX, "blockhash", "Hash of the block"},
+                {RPCResult::Type::BOOL, "active", "Whether BIP 462 rules applied to this block"},
+                {RPCResult::Type::NUM, "index", /*optional=*/true, "Demurrage index I(height)"},
+                {RPCResult::Type::NUM, "rate", /*optional=*/true, "Per-block demurrage rate r_k of the rate period containing this block"},
+                {RPCResult::Type::STR_AMOUNT, "pool", /*optional=*/true, "Fee pool balance after this block"},
+                {RPCResult::Type::STR_AMOUNT, "utxo_value", /*optional=*/true, "Effective value U(height) of the UTXO set after this block"},
+                {RPCResult::Type::STR_AMOUNT, "period_subsidy", /*optional=*/true, "Block subsidy of the rate period containing this block, up to and including it"},
+                {RPCResult::Type::STR_AMOUNT, "period_fees", /*optional=*/true, "Fees paid into the pool during the rate period containing this block, up to and including it"},
+                {RPCResult::Type::OBJ, "next_block", /*optional=*/true, "Values for the block after the chain tip (only when height is the tip and BIP 462 is active for the next block)", {
+                    {RPCResult::Type::NUM, "height", "Height of the next block"},
+                    {RPCResult::Type::NUM, "index", "Demurrage index of the next block"},
+                    {RPCResult::Type::NUM, "rate", "Per-block demurrage rate of the next block"},
+                    {RPCResult::Type::BOOL, "rate_period_start", "Whether the next block begins a rate period"},
+                    {RPCResult::Type::STR_AMOUNT, "subsidy", "Block subsidy"},
+                    {RPCResult::Type::STR_AMOUNT, "pool_payout", "Fee pool payout"},
+                    {RPCResult::Type::STR_AMOUNT, "dividend", "Demurrage dividend"},
+                    {RPCResult::Type::STR_AMOUNT, "coinbase_limit", "Maximum coinbase output value: subsidy + pool_payout + dividend"},
+                }},
+            }},
+        RPCExamples{
+            HelpExampleCli("getdemurrageinfo", "")
+            + HelpExampleRpc("getdemurrageinfo", "")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    const CChain& chain{chainman.ActiveChain()};
+    const CBlockIndex* tip{chain.Tip()};
+    const CBlockIndex* block{tip};
+    if (!request.params[0].isNull()) {
+        const int height{request.params[0].getInt<int>()};
+        if (height < 0 || height > tip->nHeight) throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+        block = chain[height];
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    if (consensus.DemurrageHeight != std::numeric_limits<int>::max()) ret.pushKV("activation_height", consensus.DemurrageHeight);
+    ret.pushKV("rate_period", consensus.nDemurrageRatePeriod);
+    ret.pushKV("target_rate_num", consensus.nDemurrageTargetRateNum);
+    ret.pushKV("target_rate_den", consensus.nDemurrageTargetRateDen);
+    ret.pushKV("fee_pool_divisor", consensus.nDemurrageFeePoolDivisor);
+    ret.pushKV("index_scale", demurrage::INDEX_ONE);
+    ret.pushKV("height", block->nHeight);
+    ret.pushKV("blockhash", block->GetBlockHash().GetHex());
+    ret.pushKV("active", demurrage::IsActive(block->nHeight, consensus));
+    const node::BlockManager& blockman{chainman.m_blockman};
+    if (const demurrage::BlockState* state{blockman.GetDemurrageState(*block)}) {
+        ret.pushKV("index", state->index);
+        ret.pushKV("rate", state->rate);
+        ret.pushKV("pool", ValueFromAmount(state->pool));
+        if (state->has_utxo_total) ret.pushKV("utxo_value", ValueFromAmount(state->UtxoValue()));
+        ret.pushKV("period_subsidy", ValueFromAmount(state->period_subsidy));
+        ret.pushKV("period_fees", ValueFromAmount(state->period_fees));
+    } else if (!demurrage::IsActive(block->nHeight, consensus)) {
+        ret.pushKV("index", demurrage::INDEX_ONE);
+        ret.pushKV("rate", 0);
+    }
+    if (block == tip) {
+        if (const std::optional<demurrage::BlockContext> next{GetNextDemurrageBlockContext(blockman, *tip, consensus)}) {
+            const CAmount subsidy{GetBlockSubsidy(tip->nHeight + 1, consensus)};
+            UniValue n(UniValue::VOBJ);
+            n.pushKV("height", tip->nHeight + 1);
+            n.pushKV("index", next->index);
+            n.pushKV("rate", next->rate);
+            n.pushKV("rate_period_start", next->period_start);
+            n.pushKV("subsidy", ValueFromAmount(subsidy));
+            n.pushKV("pool_payout", ValueFromAmount(next->pool_payout));
+            n.pushKV("dividend", ValueFromAmount(next->dividend));
+            n.pushKV("coinbase_limit", ValueFromAmount(subsidy + next->pool_payout + next->dividend));
+            ret.pushKV("next_block", std::move(n));
+        }
+    }
     return ret;
 },
     };
@@ -3658,6 +3781,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getchaintxstats},
         {"blockchain", &getblockstats},
         {"blockchain", &getbestblockhash},
+        {"blockchain", &getdemurrageinfo},
         {"blockchain", &getblockcount},
         {"blockchain", &getblock},
         {"blockchain", &getblockfrompeer},

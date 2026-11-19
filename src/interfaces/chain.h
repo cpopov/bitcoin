@@ -126,6 +126,13 @@ public:
     //! Get block hash. Height must be valid or this function will abort.
     virtual uint256 getBlockHash(int height) = 0;
 
+    //! BIP 462: activation height of demurrage (std::numeric_limits<int>::max() if not scheduled).
+    virtual int getDemurrageActivationHeight() = 0;
+
+    //! BIP 462: demurrage index I(height) on the active chain, for heights up
+    //! to and including the block after the tip. Returns nullopt if unknown.
+    virtual std::optional<uint64_t> getDemurrageIndex(int height) = 0;
+
     //! Check that the block is available on disk (i.e. has not been
     //! pruned), and contains transactions.
     virtual bool haveBlockOnDisk(int height) = 0;

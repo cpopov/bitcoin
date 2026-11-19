@@ -566,6 +566,22 @@ public:
         LOCK(::cs_main);
         return Assert(chainman().ActiveChain()[height])->GetBlockHash();
     }
+    int getDemurrageActivationHeight() override
+    {
+        return chainman().GetConsensus().DemurrageHeight;
+    }
+    std::optional<uint64_t> getDemurrageIndex(int height) override
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman().ActiveChain().Tip()};
+        if (!tip) return std::nullopt;
+        if (height == tip->nHeight + 1) {
+            const auto next{GetNextDemurrageBlockContext(chainman().m_blockman, *tip, chainman().GetConsensus())};
+            if (next) return next->index;
+            return demurrage::IsActive(height, chainman().GetConsensus()) ? std::nullopt : std::optional<uint64_t>{demurrage::INDEX_ONE};
+        }
+        return GetDemurrageIndex(chainman().m_blockman, *tip, height, chainman().GetConsensus());
+    }
     bool haveBlockOnDisk(int height) override
     {
         LOCK(::cs_main);
