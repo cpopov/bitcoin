@@ -99,7 +99,10 @@ bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType)
 
 bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_datacarrier_bytes, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason)
 {
-    if (tx.version > TX_MAX_STANDARD_VERSION || tx.version < TX_MIN_STANDARD_VERSION) {
+    // BIP 462: version 4 transactions with a reference height are standard
+    // (they are only valid once BIP 462 is active).
+    const bool ref_height_version{tx.ref_height && tx.version == CTransaction::REF_HEIGHT_VERSION};
+    if ((tx.version > TX_MAX_STANDARD_VERSION && !ref_height_version) || tx.version < TX_MIN_STANDARD_VERSION) {
         reason = "version";
         return false;
     }

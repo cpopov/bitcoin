@@ -10,6 +10,7 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/tx_verify.h>
@@ -179,7 +180,17 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees
-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    if (demurrage::IsActive(nHeight, chainparams.GetConsensus())) {
+        // BIP 462: fees go to the fee pool. The coinbase claims the subsidy,
+        // the pool payout and the demurrage dividend.
+        const std::optional<demurrage::BlockContext> demurrage_block{
+            GetNextDemurrageBlockContext(m_chainstate.m_blockman, *pindexPrev, chainparams.GetConsensus())};
+        if (!demurrage_block) {
+            throw std::runtime_error("BIP 462 demurrage state of the chain tip is unavailable");
+        }
+        block_reward = GetBlockSubsidy(nHeight, chainparams.GetConsensus()) + demurrage_block->pool_payout + demurrage_block->dividend;
+    }
     coinbaseTx.vout[0].nValue = block_reward;
     coinbase_tx.block_reward_remaining = block_reward;
 

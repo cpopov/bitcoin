@@ -7,6 +7,7 @@
 
 #include <attributes.h>
 #include <chain.h>
+#include <consensus/demurrage.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <kernel/blockmanager_opts.h>
@@ -100,7 +101,11 @@ class BlockTreeDB : public CDBWrapper
 {
 public:
     using CDBWrapper::CDBWrapper;
-    void WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
+    void WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo,
+                        const std::vector<std::pair<uint256, const demurrage::BlockState*>>& demurrage_states = {});
+    /** Load all BIP 462 per-block demurrage states. */
+    bool LoadDemurrageStates(const std::function<void(const uint256&, const demurrage::BlockState&)>& insert)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ReadBlockFileInfo(int nFile, CBlockFileInfo& info);
     bool ReadLastBlockFile(int& nFile);
     void WriteReindexing(bool fReindexing);
@@ -313,6 +318,13 @@ protected:
     /** Dirty block file entries. */
     std::set<int> m_dirty_fileinfo;
 
+    /** BIP 462 demurrage state after each connected block at or above the
+     *  tracking start height. Each state is a deterministic function of the
+     *  block's ancestry, so states of blocks that are reorged out stay valid. */
+    std::unordered_map<const CBlockIndex*, demurrage::BlockState> m_demurrage_states GUARDED_BY(::cs_main);
+    /** Demurrage states not yet written to the block index database. */
+    std::set<const CBlockIndex*> m_dirty_demurrage GUARDED_BY(::cs_main);
+
 public:
     using Options = kernel::BlockManagerOpts;
     using ReadRawBlockResult = util::Expected<std::vector<std::byte>, ReadRawError>;
@@ -359,6 +371,11 @@ public:
     void WriteBlockIndexDB() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /** BIP 462 demurrage state after @p block, or nullptr if not (yet) known. */
+    const demurrage::BlockState* GetDemurrageState(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Record the BIP 462 demurrage state after @p block. */
+    void SetDemurrageState(const CBlockIndex& block, const demurrage::BlockState& state) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
      * Remove any pruned block & undo files that are still on disk.
