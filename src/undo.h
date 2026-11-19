@@ -15,9 +15,10 @@
 /** Formatter for undo information for a CTxIn
  *
  *  Contains the prevout's CTxOut being spent, and its metadata as well
- *  (coinbase or not, height). The serialization contains a dummy value of
- *  zero. This is compatible with older versions which expect to see
- *  the transaction version there.
+ *  (coinbase or not, height). The serialization contains a VARINT that older
+ *  versions read as the transaction version and ignore. BIP 462 stores the
+ *  coin's reference height there, as the delta (height - ref_height), which is
+ *  zero for every coin created before BIP 462.
  */
 struct TxInUndoFormatter
 {
@@ -27,7 +28,9 @@ struct TxInUndoFormatter
         ::Serialize(s, VARINT(nCode));
         if (txout.nHeight > 0) {
             // Required to maintain compatibility with older undo format.
-            ::Serialize(s, (unsigned char)0);
+            // Holds the BIP 462 reference height delta (0 for legacy coins).
+            assert(txout.nRefHeight <= txout.nHeight);
+            ::Serialize(s, VARINT(uint32_t{txout.nHeight} - txout.nRefHeight));
         }
         ::Serialize(s, Using<TxOutCompression>(txout.out));
     }
@@ -38,12 +41,17 @@ struct TxInUndoFormatter
         ::Unserialize(s, VARINT(nCode));
         txout.nHeight = nCode >> 1;
         txout.fCoinBase = nCode & 1;
+        txout.nRefHeight = txout.nHeight;
         if (txout.nHeight > 0) {
             // Old versions stored the version number for the last spend of
             // a transaction's outputs. Non-final spends were indicated with
-            // height = 0.
-            unsigned int nVersionDummy;
-            ::Unserialize(s, VARINT(nVersionDummy));
+            // height = 0. BIP 462 stores the reference height delta here.
+            unsigned int ref_delta;
+            ::Unserialize(s, VARINT(ref_delta));
+            // Undo data written by very old versions holds a transaction
+            // version here; such coins predate BIP 462 and the value is
+            // irrelevant to them, so only accept deltas that are in range.
+            if (ref_delta <= txout.nHeight) txout.nRefHeight = txout.nHeight - ref_delta;
         }
         ::Unserialize(s, Using<TxOutCompression>(txout.out));
     }

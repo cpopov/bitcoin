@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -197,6 +198,13 @@ inline constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
  * - if (flags & 1):
  *   - CScriptWitness scriptWitness; (deserialized into CTxIn)
  * - uint32_t nLockTime
+ * - if (flags & 2):
+ *   - uint32_t ref_height (BIP 462 reference height)
+ *
+ * The ref_height flag (bit 1) is part of the transaction's non-witness data:
+ * it is serialized even when witnesses are not, so that the txid commits to
+ * it. Historical transactions cannot carry it, because every flag other than
+ * bit 0 was rejected as "Unknown transaction optional data" before BIP 462.
  */
 template<typename Stream, typename TxType>
 void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& params)
@@ -231,11 +239,22 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
             throw std::ios_base::failure("Superfluous witness record");
         }
     }
+    const bool has_ref_height{(flags & 2) != 0};
+    if (has_ref_height) {
+        /* BIP 462 reference height follows nLockTime. */
+        flags ^= 2;
+    }
     if (flags) {
         /* Unknown flag in the serialization */
         throw std::ios_base::failure("Unknown transaction optional data");
     }
     s >> tx.nLockTime;
+    tx.ref_height.reset();
+    if (has_ref_height) {
+        uint32_t ref_height;
+        s >> ref_height;
+        tx.ref_height = ref_height;
+    }
 }
 
 template<typename Stream, typename TxType>
@@ -252,8 +271,12 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
             flags |= 1;
         }
     }
+    if (tx.ref_height) {
+        /* BIP 462 reference height: non-witness data, always serialized. */
+        flags |= 2;
+    }
     if (flags) {
-        /* Use extended format in case witnesses are to be serialized. */
+        /* Use extended format in case witnesses or a reference height are to be serialized. */
         std::vector<CTxIn> vinDummy;
         s << vinDummy;
         s << flags;
@@ -266,6 +289,9 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
         }
     }
     s << tx.nLockTime;
+    if (flags & 2) {
+        s << *tx.ref_height;
+    }
 }
 
 template<typename TxType>
@@ -288,6 +314,8 @@ class CTransaction
 public:
     // Default transaction version.
     static constexpr uint32_t CURRENT_VERSION{2};
+    // BIP 462: transactions of this version (or above) carry a reference height.
+    static constexpr uint32_t REF_HEIGHT_VERSION{4};
 
     // The local variables are made const to prevent unintended modification
     // without updating the cached hash value. However, CTransaction is not
@@ -298,6 +326,10 @@ public:
     const std::vector<CTxOut> vout;
     const uint32_t version;
     const uint32_t nLockTime;
+    /** BIP 462 reference height: the height at which inputs are valued and
+     *  outputs are created. Unset for legacy-version transactions, which are
+     *  treated as having a reference height equal to their inclusion height. */
+    const std::optional<uint32_t> ref_height;
 
 private:
     /** Memory only. */
@@ -353,6 +385,7 @@ public:
     {
         return nLockTime == other.nLockTime &&
             version == other.version &&
+            ref_height == other.ref_height &&
             vout == other.vout &&
             std::ranges::equal(vin, other.vin, [&opts](const CTxIn& self, const CTxIn& other) {
                 return self.prevout == other.prevout &&
@@ -374,6 +407,7 @@ struct CMutableTransaction
     std::vector<CTxOut> vout;
     uint32_t version;
     uint32_t nLockTime;
+    std::optional<uint32_t> ref_height;
 
     explicit CMutableTransaction();
     explicit CMutableTransaction(const CTransaction& tx);

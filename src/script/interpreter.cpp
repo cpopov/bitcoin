@@ -1346,6 +1346,8 @@ public:
              SerializeOutput(s, nOutput);
         // Serialize nLockTime
         ::Serialize(s, txTo.nLockTime);
+        // BIP 462: commit to the reference height, if any
+        if (txTo.ref_height) ::Serialize(s, *txTo.ref_height);
     }
 };
 
@@ -1525,6 +1527,8 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
     // Transaction level data
     ss << tx_to.version;
     ss << tx_to.nLockTime;
+    // BIP 462: commit to the reference height, if any
+    if (tx_to.ref_height) ss << *tx_to.ref_height;
     if (input_type != SIGHASH_ANYONECANPAY) {
         ss << cache.m_prevouts_single_hash;
         ss << cache.m_spent_amounts_single_hash;
@@ -1664,6 +1668,8 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
         ss << hashOutputs;
         // Locktime
         ss << txTo.nLockTime;
+        // BIP 462: commit to the reference height, if any
+        if (txTo.ref_height) ss << *txTo.ref_height;
     } else {
         // Wrapper to serialize only the necessary parts of the transaction being signed
         CTransactionSignatureSerializer<T> txTmp(txTo, scriptCode, nIn, nHashType);

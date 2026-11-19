@@ -1965,9 +1965,10 @@ class SegWitTest(BitcoinTestFramework):
 
     @subtest
     def test_superfluous_witness(self):
-        # Serialization of tx that puts witness flag to 3 always
+        # Serialization of tx that puts witness flag to 5 always (bit 1 is
+        # the BIP 462 reference height; bit 2 is unknown)
         def serialize_with_bogus_witness(tx):
-            flags = 3
+            flags = 5
             r = b""
             r += tx.version.to_bytes(4, "little")
             if flags:
