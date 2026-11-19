@@ -130,6 +130,28 @@ class MiniWallet:
     def get_balance(self):
         return sum(u['value'] for u in self._utxos)
 
+    def demurrage_effective_value(self, utxo, ref_height):
+        """BIP 462: the value, in satoshis, of a utxo as an input of a transaction
+        with the given reference height: v * I(ref_height) / I_created."""
+        node = self._test_node
+        txout = node.gettxout(utxo['txid'], utxo['vout'])
+        assert txout is not None, f"utxo {utxo['txid']}:{utxo['vout']} not found"
+        info = node.getdemurrageinfo()
+
+        def index_at(height):
+            if height == info['height'] + 1:
+                return info['next_block']['index']
+            return node.getdemurrageinfo(height)['index']
+
+        nominal = int(txout['value'] * COIN)
+        confirmations = txout['confirmations']
+        if confirmations > 0 and info['height'] - confirmations + 1 < info['activation_height']:
+            # Outputs created before activation: I_created = I(ACTIVATION_HEIGHT - 1) = 1
+            index_created = info['index_scale']
+        else:
+            index_created = index_at(txout['ref_height'])
+        return nominal * index_at(ref_height) // index_created
+
     def rescan_utxos(self, *, include_mempool=True):
         """Drop all utxos and rescan the utxo set"""
         self._utxos = []
@@ -263,7 +285,7 @@ class MiniWallet:
         self.sendrawtransaction(from_node=from_node, tx_hex=tx['hex'])
         return tx
 
-    def send_to(self, *, from_node, scriptPubKey, amount, fee=1000):
+    def send_to(self, *, from_node, scriptPubKey, amount, fee=1000, ref_height=None):
         """
         Create and send a tx with an output to a given scriptPubKey/amount,
         plus a change output to our internal address. To keep things simple, a
@@ -272,8 +294,10 @@ class MiniWallet:
         Note that this method fails if there is no single internal utxo
         available that can cover the cost for the amount and the fixed fee
         (the utxo with the largest value is taken).
+
+        If ref_height is set, a BIP 462 version 4 transaction is created.
         """
-        tx = self.create_self_transfer(fee_rate=0)["tx"]
+        tx = self.create_self_transfer(fee_rate=0, ref_height=ref_height)["tx"]
         assert_greater_than_or_equal(tx.vout[0].nValue, amount + fee)
         tx.vout[0].nValue -= (amount + fee)           # change output -> MiniWallet
         tx.vout.append(CTxOut(amount, scriptPubKey))  # arbitrary output -> to be returned
@@ -304,18 +328,27 @@ class MiniWallet:
         fee_per_output=1000,
         target_vsize=0,
         confirmed_only=False,
+        ref_height=None,
     ):
         """
         Create and return a transaction that spends the given UTXOs and creates a
         certain number of outputs with equal amounts. The output amounts can be
         set by amount_per_output or automatically calculated with a fee_per_output.
+
+        If ref_height is set, create a BIP 462 version 4 transaction with that
+        reference height, valuing the inputs at it.
         """
         utxos_to_spend = utxos_to_spend or [self.get_utxo(confirmed_only=confirmed_only)]
         sequence = [sequence] * len(utxos_to_spend) if type(sequence) is int else sequence
         assert_equal(len(utxos_to_spend), len(sequence))
 
         # calculate output amount
-        inputs_value_total = sum([int(COIN * utxo['value']) for utxo in utxos_to_spend])
+        if ref_height is None:
+            inputs_value_total = sum([int(COIN * utxo['value']) for utxo in utxos_to_spend])
+        else:
+            inputs_value_total = sum([self.demurrage_effective_value(utxo, ref_height) for utxo in utxos_to_spend])
+            if version == 2:
+                version = CTransaction.REF_HEIGHT_VERSION
         outputs_value_total = inputs_value_total - fee_per_output * num_outputs
         amount_per_output = amount_per_output or (outputs_value_total // num_outputs)
         assert amount_per_output > 0
@@ -328,6 +361,7 @@ class MiniWallet:
         tx.vout = [CTxOut(amount_per_output, bytearray(self._scriptPubKey)) for _ in range(num_outputs)]
         tx.version = version
         tx.nLockTime = locktime
+        tx.ref_height = ref_height
 
         self.sign_tx(tx)
 
@@ -372,9 +406,14 @@ class MiniWallet:
             vsize = Decimal(168)  # P2PK (73 bytes scriptSig + 35 bytes scriptPubKey + 60 bytes other)
         else:
             assert False
+        if kwargs.get("ref_height") is not None:
+            vsize += 6  # BIP 462: marker and flag become non-witness data, plus the 4-byte reference height
         if target_vsize and not fee:  # respect fee_rate if target vsize is passed
             fee = get_fee(target_vsize, fee_rate)
-        send_value = utxo_to_spend["value"] - (fee or (fee_rate * vsize / 1000))
+        input_value = utxo_to_spend["value"]
+        if kwargs.get("ref_height") is not None:
+            input_value = Decimal(self.demurrage_effective_value(utxo_to_spend, kwargs["ref_height"])) / COIN
+        send_value = input_value - (fee or (fee_rate * vsize / 1000))
         if send_value <= 0:
             raise RuntimeError(f"UTXO value {utxo_to_spend['value']} is too small to cover fees {(fee or (fee_rate * vsize / 1000))}")
         # create tx
