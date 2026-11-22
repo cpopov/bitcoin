@@ -122,6 +122,23 @@ BOOST_AUTO_TEST_CASE(mainnet_rates)
     BOOST_CHECK_EQUAL(PeriodRate(0, params), 0);
 }
 
+BOOST_AUTO_TEST_CASE(first_charge_height)
+{
+    // getblocktemplate requires the rule from the first rate period with a
+    // non-zero rate: 1,260,000 on mainnet, or the activation height if later.
+    const auto& params{MainParams()};
+    for (int activation_height : {0, 2016, 999'936, 1'257'984, 1'260'000}) {
+        BOOST_CHECK_EQUAL(IndexSchedule(params, activation_height).FirstChargeHeight().value_or(-1), 1'260'000);
+    }
+    BOOST_CHECK_EQUAL(IndexSchedule(params, 1'262'016).FirstChargeHeight().value_or(-1), 1'262'016);
+    BOOST_CHECK_EQUAL(IndexSchedule(RegTestParams(), 432).FirstChargeHeight().value_or(-1), 576);
+    BOOST_CHECK_EQUAL(IndexSchedule(RegTestParams(), 576).FirstChargeHeight().value_or(-1), 576);
+    // A zero target never charges.
+    Consensus::Params zero_target{params};
+    zero_target.DemurrageTargetNumerator = 0;
+    BOOST_CHECK(!IndexSchedule(zero_target, 0).FirstChargeHeight());
+}
+
 BOOST_AUTO_TEST_CASE(mainnet_index)
 {
     const auto& params{MainParams()};

@@ -1,10 +1,12 @@
 # BIP 462b reference implementation
 
-This branch implements the draft **BIP 462b, Soft-Fork Demurrage Security Budget**,
-version 0.1.0 (`bip-0462b.md`). Version 0.2.0 of the draft addresses the
-problems this implementation found in 0.1.0, listed below. It changes no mainnet
-consensus rule, but its policy and interfaces differ from this implementation in
-the ways listed under [Differences from draft 0.2.0](#differences-from-draft-020).
+This branch implements the draft **BIP 462b, Soft-Fork Demurrage Security Budget**
+(`bip-0462b.md`): its consensus rules and relay policy as of version 0.1.0, and
+its `getblocktemplate` support as of version 0.3.0. Versions 0.2.0 and 0.3.0 of
+the draft address the problems this implementation found in 0.1.0, listed below.
+They change no mainnet consensus rule, but their policy differs from this
+implementation in the ways listed under
+[Differences from draft 0.3.0](#differences-from-draft-030).
 The demurrage is charged when an output is
 spent. The block owes the charge, the coinbase pays it into a pool output, and a
 deterministic claim transaction at index 1 of every later block pays out
@@ -66,7 +68,8 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 | Relay and mining policy: mining score | `CTxMemPoolEntry::m_demurrage_charge`, which `GetModifiedFee()` excludes; `ChangeSet::StageAddition`; `CTxMemPool::SetDemurrageCharge`; `MemPoolAccept::PreChecks`; `Chainstate::UpdateMempoolDemurrageCharges`, called from `ConnectTip` and `MaybeUpdateMempoolForReorg` |
 | Relay and mining policy: relay | The existing fee checks (`CheckFeeRate`, package feerate, RBF, eviction) all read modified fees, so they use the net fee at `E` |
 | Relay and mining policy: pool outputs | `PreChecks`: `demurrage-pool-output`, `demurrage-pool-spend`. Claim transactions from disconnected blocks fail the first check, so they are not returned to the mempool. |
-| Relay and mining policy: block assembly | `BlockAssembler::CreateNewBlock`, `node::GetBlockDemurrageCharge`; `node::UpdateDemurrageContribution` for `generateblock`; the contribution is added to `CoinbaseTx::required_outputs` for IPC mining clients |
+| Relay and mining policy: block assembly | `BlockAssembler::CreateNewBlock`, `node::GetDemurrageCharges`, `node::GetBlockDemurrageCharge`; `node::UpdateDemurrageContribution` for `generateblock`; the contribution is added to `CoinbaseTx::required_outputs` for IPC mining clients |
+| getblocktemplate | `getblocktemplate` in `rpc/mining.cpp`: the rule is listed as `demurrage` from activation and as `!demurrage` from `IndexSchedule::FirstChargeHeight()`, and `WarnDemurrageRuleRequired` logs the warning. `gbt_optional_rule` is `true` in `deploymentinfo.cpp`, so the version bit is set for every client while signalling. The `charge` and `demurrage_contribution` fields come from `CBlockTemplate::vTxDemurrageCharges` and `CBlockTemplate::demurrage_contribution`. |
 | Test vectors | `src/test/demurrage_tests.cpp`, `test/functional/feature_demurrage.py` |
 
 ### Reject reasons
@@ -114,7 +117,7 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 
 ## Problems found in draft 0.1.0
 
-Draft 0.2.0 addresses each of these. Each numeric claim in draft 0.1.0 was checked against an independent
+Drafts 0.2.0 and 0.3.0 address each of these. Each numeric claim in draft 0.1.0 was checked against an independent
 arbitrary-precision implementation, in the unit tests and in Python. The rate
 table, the 19,284,730,634 rate at 1,260,000, the maximum rate 57,077,625,570,
 the index falls (0.41%, 1.21%, 2.19%), the 67-, 108- and 16-byte sizes and the
@@ -164,9 +167,10 @@ interfaces and wording.
    `coinbasevalue` is the template's coinbase output 0, which here is
    `subsidy + fees − C(h)`, and nothing tells the client to add the
    contribution. Every block built by a GBT client is invalid once charges
-   begin. The deployment's `gbt_optional_rule` is `false` for this reason. The
-   IPC mining interface already has a place for it (`required_outputs`), and
-   that is implemented here.
+   begin. This implementation first made the rule required from activation for
+   this reason. It now follows draft 0.3.0 (see [getblocktemplate](#getblocktemplate)).
+   The IPC mining interface already has a place for the contribution
+   (`required_outputs`), and that is implemented here.
 8. **Ephemeral dust and other fee rules.** Policy rules that require a zero fee,
    such as ephemeral dust, must compare the fee, not the net fee, or no such
    transaction could be relayed once charges begin. This implementation
@@ -186,38 +190,59 @@ interfaces and wording.
     first 67-byte claim is clear of the proposed rule against 64-byte
     transactions (BIP 54), which the BIP could note.
 
-## Differences from draft 0.2.0
+## getblocktemplate
+
+This follows the draft's `getblocktemplate` section as of version 0.3.0.
+
+- **Rule.** From activation the template lists the optional rule `demurrage`,
+  and a client that does not declare it gets a template as usual. From the first
+  rate period with a non-zero rate (1,260,000 on mainnet, or the activation
+  height if that is later; 576 on regtest with activation at 432) the template
+  lists `!demurrage`, and a client that does not declare it gets the error
+  `Support for 'demurrage' rule requires explicit client support`. This applies
+  whether the deployment activated through version bits or was forced with
+  `-testactivationheight`.
+- **Warning.** Between the two, each request from a client that does not
+  declare the rule logs a warning that templates will require it from that
+  height, at most once an hour.
+- **Signalling.** While the deployment is `started` or `locked_in`, the
+  template's version has the deployment's bit for every client, so signalling
+  counts upgraded nodes, not upgraded mining software.
+- **Fields.** While the deployment is active, each transaction has a `charge`,
+  its charge at the template's height, and the template has a
+  `demurrage_contribution`, `C(h)`. The claim transaction is the first entry of
+  `transactions`, with the payout as its `fee` and a `charge` of 0.
+  `coinbasevalue` is `subsidy + fees − C(h)`, where fees include the payout.
+  `default_witness_commitment` is still the witness commitment. The contribution
+  is not one of the outputs it describes.
+
+## Differences from draft 0.3.0
 
 - **Unconfirmed inputs.** This implementation charges an input that spends an
-  unconfirmed output nothing. Draft 0.2.0 charges it as if the output were
+  unconfirmed output nothing. The draft charges it as if the output were
   created in the next block, so that a child's net fee cannot fall when its
   parent confirms alone.
 - **Before activation.** This implementation charges nothing until the
-  deployment is active for the next block. Draft 0.2.0 charges from lock-in,
+  deployment is active for the next block. The draft charges from lock-in,
   when `ACTIVATION_HEIGHT` is known.
-- **`getblocktemplate`.** As in draft 0.2.0, the rule is required
-  (`!demurrage`), the claim transaction is the first entry of `transactions`,
-  and `coinbasevalue` excludes `C(h)`. But the template has no `charge` or
-  `demurrage_contribution` fields.
 - **Compact blocks.** Senders do not prefill the claim transaction, and nodes do
   not check it before relaying a block ahead of validation.
-- **assumeutxo.** Draft 0.2.0 states how to find the pool inputs in a snapshot.
+- **assumeutxo.** The draft states how to find the pool inputs in a snapshot.
   This implementation does not do so yet (see below).
 
-The no-eviction rule for recomputation, the fee rule for ephemeral dust and the
-regtest parameters already match draft 0.2.0.
+The `getblocktemplate` support, the no-eviction rule for recomputation, the fee
+rule for ephemeral dust and the regtest parameters match the draft.
 
 ## Not implemented
 
 - **Wallet.** The wallet does not add the charge to its fee. Once a wallet
   transaction's charge at `E` exceeds its fee, the mempool rejects it with
   `min relay fee not met`. The wallet does not report effective balances.
-- **`getblocktemplate` fields, Stratum V2, PSBT fields**: deferred by the BIP.
+- **Stratum V2 and PSBT fields**: left by the draft to separate specifications.
 - **assumeutxo.** After a snapshot is loaded, the first blocks need the claim of
   the base block and the contributions of the 100 blocks below it, which are not
   on disk. `ConnectBlock` then stops with a fatal error. A fix is to record the
   pool outputs while loading the snapshot, using the identities in problem 6.
-- **Mempool eviction on recomputation**: see problem 2.
 - **Fee estimation** still uses fees, not net fees.
 
 ## Tests
@@ -234,12 +259,23 @@ regtest parameters already match draft 0.2.0.
     the same block, rounding and `MAX_MONEY`;
   - claim transactions with one and with two inputs, their sizes and payouts;
   - the evaluation height;
-  - the regtest schedule.
+  - the regtest schedule;
+  - the height from which `getblocktemplate` requires the rule, for several
+    activation heights.
 - `test/functional/feature_demurrage.py`. node0 enforces the rules from height
   432. node1 does not enforce them, and accepts every block node0 accepts,
   claims and contributions included, which shows the rules are a soft fork. The
   test keeps its own model of the rate, index, charges and pool, and checks
-  every block from activation against it. It covers:
+  every block from activation against it. node2 has a chain of its own, on which
+  the deployment activates through signalling. It covers:
+  - on node2, the version bit for clients that do and do not declare the rule
+    while the deployment is `started` and `locked_in`; the optional rule and the
+    rate-limited warning from activation; and the required rule from 576;
+  - on node0, the same switch at 576 with a forced activation height, and every
+    `getblocktemplate` field checked against the model: each transaction's
+    `charge` (zero for an input from an earlier transaction in the template),
+    `demurrage_contribution`, `coinbasevalue` and the claim transaction. A block
+    built from the template alone is valid;
   - pre-activation `POOL_SCRIPT` outputs, in the coinbase and in a transaction,
     and spending one after activation;
   - the zero-rate first period;

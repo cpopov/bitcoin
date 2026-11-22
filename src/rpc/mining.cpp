@@ -14,11 +14,13 @@
 #include <chainparamsbase.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <crypto/hex_base.h>
+#include <deploymentinfo.h>
 #include <interfaces/types.h>
 #include <key_io.h>
 #include <net.h>
@@ -55,6 +57,7 @@
 #include <univalue.h>
 #include <util/chaintype.h>
 #include <util/check.h>
+#include <util/log.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/string.h>
@@ -645,6 +648,21 @@ static std::string gbt_rule_value(const std::string& name, bool gbt_optional_rul
     return s;
 }
 
+static GlobalMutex g_demurrage_rule_warning_mutex;
+static std::optional<NodeClock::time_point> g_last_demurrage_rule_warning GUARDED_BY(g_demurrage_rule_warning_mutex);
+
+/** BIP 462b: warn, at most once an hour, that templates will require the demurrage rule. */
+static void WarnDemurrageRuleRequired(int required_height)
+{
+    LOCK(g_demurrage_rule_warning_mutex);
+    const auto now{NodeClock::now()};
+    if (g_last_demurrage_rule_warning && now - *g_last_demurrage_rule_warning < 1h) return;
+    g_last_demurrage_rule_warning = now;
+    LogWarning("getblocktemplate client does not declare support for the '%s' rule (BIP 462b). "
+               "Templates will require it from height %d, when blocks begin to owe a demurrage contribution.",
+               DeploymentName(Consensus::DEPLOYMENT_DEMURRAGE), required_height);
+}
+
 static RPCMethod getblocktemplate()
 {
     return RPCMethod{
@@ -706,6 +724,7 @@ static RPCMethod getblocktemplate()
                             {RPCResult::Type::NUM, "", "transactions before this one (by 1-based index in 'transactions' list) that must be present in the final block if this one is"},
                         }},
                         {RPCResult::Type::NUM, "fee", "difference in value between transaction inputs and outputs (in satoshis); for coinbase transactions, this is a negative Number of the total collected block fees (ie, not including the block subsidy); if key is not present, fee is unknown and clients MUST NOT assume there isn't one"},
+                        {RPCResult::Type::NUM, "charge", /*optional=*/true, "BIP 462b demurrage charge of the transaction's inputs at the template's height (in satoshis). Inputs spending outputs of earlier transactions in the template have none. Only while the deployment is active"},
                         {RPCResult::Type::NUM, "sigops", "total SigOps cost, as counted for purposes of block limits; if key is not present, sigop cost is unknown and clients MUST NOT assume it is zero"},
                         {RPCResult::Type::NUM, "weight", "total transaction weight, as counted for purposes of block limits"},
                     }},
@@ -714,7 +733,8 @@ static RPCMethod getblocktemplate()
                 {
                     {RPCResult::Type::STR_HEX, "key", "values must be in the coinbase (keys may be ignored)"},
                 }},
-                {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable input to coinbase transaction, including the generation award and transaction fees (in satoshis)"},
+                {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable input to coinbase transaction, including the generation award and transaction fees (in satoshis); while BIP 462b is active, less demurrage_contribution"},
+                {RPCResult::Type::NUM, "demurrage_contribution", /*optional=*/true, "BIP 462b block charge C(h), the sum of the transactions' charges (in satoshis). If it is not zero, the coinbase must have one output of this value to the pool script. Only while the deployment is active"},
                 {RPCResult::Type::STR, "longpollid", "an id to include with a request to longpoll on an update to this template"},
                 {RPCResult::Type::STR, "target", "The hash target"},
                 {RPCResult::Type::NUM_TIME, "mintime", "The minimum timestamp appropriate for the next block time, expressed in " + UNIX_EPOCH_TIME + ". Adjusted for the proposed BIP94 timewarp rule."},
@@ -957,6 +977,9 @@ static RPCMethod getblocktemplate()
 
         int index_in_template = i - 2;
         entry.pushKV("fee", tx_fees.at(index_in_template));
+        if (block_template->demurrage_contribution) {
+            entry.pushKV("charge", block_template->vTxDemurrageCharges.at(index_in_template));
+        }
         int64_t nTxSigOps{tx_sigops.at(index_in_template)};
         if (fPreSegWit) {
             CHECK_NONFATAL(nTxSigOps % WITNESS_SCALE_FACTOR == 0);
@@ -1015,11 +1038,29 @@ static RPCMethod getblocktemplate()
         }
     }
 
+    const std::string demurrage_rule{DeploymentName(Consensus::DEPLOYMENT_DEMURRAGE)};
     for (const auto& [name, info] : gbtstatus.active) {
+        if (name == demurrage_rule) continue; // See below.
         aRules.push_back(gbt_rule_value(name, info.gbt_optional_rule));
         if (!info.gbt_optional_rule && !setClientRules.contains(name)) {
             // Not supported by the client; make sure it's safe to proceed
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Support for '%s' rule requires explicit client support", name));
+        }
+    }
+
+    // BIP 462b: the rule is optional from activation, while no block can owe a
+    // charge and a client that ignores it can use the template as it is. It is
+    // required from the first rate period with a non-zero rate. This also
+    // covers a deployment forced active with -testactivationheight.
+    if (const auto activation{chainman.DemurrageActivationHeight(pindexPrev)}) {
+        const std::optional<int> required_height{chainman.DemurrageSchedule(*activation).FirstChargeHeight()};
+        const bool required{required_height && pindexPrev->nHeight + 1 >= *required_height};
+        aRules.push_back(gbt_rule_value(demurrage_rule, /*gbt_optional_rule=*/!required));
+        if (!setClientRules.contains(demurrage_rule)) {
+            if (required) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Support for '%s' rule requires explicit client support", demurrage_rule));
+            }
+            if (required_height) WarnDemurrageRuleRequired(*required_height);
         }
     }
 
@@ -1031,7 +1072,12 @@ static RPCMethod getblocktemplate()
     result.pushKV("previousblockhash", block_header.hashPrevBlock.GetHex());
     result.pushKV("transactions", std::move(transactions));
     result.pushKV("coinbaseaux", std::move(aux));
+    // The coinbase's first output pays the subsidy and fees, less any BIP 462b
+    // demurrage contribution.
     result.pushKV("coinbasevalue", block_template->block.vtx[0]->vout[0].nValue);
+    if (block_template->demurrage_contribution) {
+        result.pushKV("demurrage_contribution", *block_template->demurrage_contribution);
+    }
     result.pushKV("longpollid", tip.GetHex() + ToString(nTransactionsUpdatedLast));
     result.pushKV("target", hashTarget.GetHex());
     result.pushKV("mintime", GetMinimumTime(pindexPrev, consensusParams.DifficultyAdjustmentInterval()));
@@ -1058,9 +1104,15 @@ static RPCMethod getblocktemplate()
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
     }
 
-    if (const auto& coinbase{block_template->m_coinbase_tx}; coinbase.required_outputs.size() > 0) {
-        CHECK_NONFATAL(coinbase.required_outputs.size() == 1); // Only one output is currently expected
-        result.pushKV("default_witness_commitment", HexStr(coinbase.required_outputs[0].scriptPubKey));
+    // The required outputs are the witness commitment and, under BIP 462b, the
+    // demurrage contribution, which is given as demurrage_contribution instead.
+    std::vector<CTxOut> commitments;
+    for (const CTxOut& txout : block_template->m_coinbase_tx.required_outputs) {
+        if (!demurrage::IsPoolScript(txout.scriptPubKey)) commitments.push_back(txout);
+    }
+    if (!commitments.empty()) {
+        CHECK_NONFATAL(commitments.size() == 1); // Only one output is currently expected
+        result.pushKV("default_witness_commitment", HexStr(commitments[0].scriptPubKey));
     }
 
     return result;

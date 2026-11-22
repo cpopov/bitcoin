@@ -43,6 +43,11 @@ struct CBlockTemplate
     std::vector<CAmount> vTxFees;
     // Sigops per transaction, not including coinbase transaction (unlike CBlock::vtx).
     std::vector<int64_t> vTxSigOpsCost;
+    // BIP 462b, while the deployment is active: the demurrage charge per
+    // transaction at the template's height, not including the coinbase
+    // transaction, and their sum, the coinbase's contribution C(h).
+    std::vector<CAmount> vTxDemurrageCharges;
+    std::optional<CAmount> demurrage_contribution;
     /* A vector of package fee rates, ordered by the sequence in which
      * packages are selected for inclusion in the block template.*/
     std::vector<FeePerVSize> m_package_feerates;
@@ -125,10 +130,14 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
 void RegenerateCommitments(CBlock& block, ChainstateManager& chainman);
 
 /**
- * BIP 462b: C(h), the demurrage charge of the inputs of txs, which must not
- * include the claim transaction, in a block at height `height`. Inputs that
- * spend outputs of earlier transactions in txs have no charge.
+ * BIP 462b: the demurrage charge of each of txs, which must not include the
+ * claim transaction, in a block at height `height`. Inputs that spend outputs
+ * of earlier transactions in txs have no charge.
  */
+std::vector<CAmount> GetDemurrageCharges(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
+                                         demurrage::IndexSchedule& schedule, int height);
+
+/** BIP 462b: C(h), the sum of GetDemurrageCharges(). */
 CAmount GetBlockDemurrageCharge(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
                                 demurrage::IndexSchedule& schedule, int height);
 

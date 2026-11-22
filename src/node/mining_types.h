@@ -161,14 +161,16 @@ struct CoinbaseTx {
     /**
      * Block subsidy plus fees, minus any non-zero required_outputs.
      *
-     * Currently there are no non-zero required_outputs, so block_reward_remaining
-     * is the entire block reward. See also required_outputs.
+     * The only non-zero required output is the BIP 462b demurrage
+     * contribution. Without one, block_reward_remaining is the entire block
+     * reward. See also required_outputs.
      */
     CAmount block_reward_remaining;
     /*
      * To be included as the last outputs in the coinbase transaction.
-     * Currently this is only the witness commitment OP_RETURN, but future
-     * softforks or a custom mining patch could add more.
+     * Currently these are the BIP 462b demurrage contribution, if the block
+     * owes one, and the witness commitment OP_RETURN. Future softforks or a
+     * custom mining patch could add more.
      *
      * The dummy output that spends the full reward is excluded.
      */

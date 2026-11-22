@@ -136,6 +136,17 @@ uint64_t IndexSchedule::RateAt(int height)
     return m_rates[period];
 }
 
+std::optional<int> IndexSchedule::FirstChargeHeight()
+{
+    // Once the subsidy has ended (by era 64 at the latest), the shortfall is the
+    // whole target, so a rate that is still zero then stays zero.
+    const int64_t last_start{int64_t{64} * m_halving_interval + m_rate_period};
+    for (int64_t start{m_activation_height}; start <= last_start; start += m_rate_period) {
+        if (RateAt(static_cast<int>(start)) > 0) return static_cast<int>(start);
+    }
+    return std::nullopt;
+}
+
 uint64_t IndexSchedule::Index(int height)
 {
     if (height < m_activation_height) return INDEX_ONE;

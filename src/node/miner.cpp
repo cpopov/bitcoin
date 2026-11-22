@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -190,10 +191,14 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // claim transaction's, and the coinbase pays it as the contribution.
     CAmount demurrage_contribution{0};
     if (demurrage_activation) {
-        demurrage_contribution = GetBlockDemurrageCharge(std::span{pblock->vtx}.subspan(1), m_chainstate.CoinsTip(),
-                                                         chainman.DemurrageSchedule(*demurrage_activation), nHeight);
+        auto& charges{pblocktemplate->vTxDemurrageCharges};
+        charges = GetDemurrageCharges(std::span{pblock->vtx}.subspan(1), m_chainstate.CoinsTip(),
+                                      chainman.DemurrageSchedule(*demurrage_activation), nHeight);
+        demurrage_contribution = std::accumulate(charges.begin(), charges.end(), CAmount{0});
+        pblocktemplate->demurrage_contribution = demurrage_contribution;
         if (claim_tx) {
             pblock->vtx.insert(pblock->vtx.begin() + 1, claim_tx);
+            charges.insert(charges.begin(), 0); // The claim's inputs have no charge.
             pblocktemplate->vTxFees.insert(pblocktemplate->vTxFees.begin(), claim_fee);
             pblocktemplate->vTxSigOpsCost.insert(pblocktemplate->vTxSigOpsCost.begin(), GetLegacySigOpCount(*claim_tx) * WITNESS_SCALE_FACTOR);
             ++nBlockTx;
@@ -396,12 +401,14 @@ void BlockAssembler::addChunks()
     }
 }
 
-CAmount GetBlockDemurrageCharge(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
-                                demurrage::IndexSchedule& schedule, int height)
+std::vector<CAmount> GetDemurrageCharges(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
+                                         demurrage::IndexSchedule& schedule, int height)
 {
     std::unordered_set<Txid, SaltedTxidHasher> earlier_txids;
-    CAmount charge{0};
+    std::vector<CAmount> charges;
+    charges.reserve(txs.size());
     for (const CTransactionRef& tx : txs) {
+        CAmount charge{0};
         for (const CTxIn& txin : tx->vin) {
             // An output created in the same block has no charge.
             if (earlier_txids.contains(txin.prevout.hash)) continue;
@@ -409,9 +416,17 @@ CAmount GetBlockDemurrageCharge(std::span<const CTransactionRef> txs, const CCoi
             if (coin.IsSpent()) continue; // Block validation will reject it.
             charge += schedule.ChargeFor(coin.out.nValue, coin.nHeight, height);
         }
+        charges.push_back(charge);
         earlier_txids.insert(tx->GetHash());
     }
-    return charge;
+    return charges;
+}
+
+CAmount GetBlockDemurrageCharge(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
+                                demurrage::IndexSchedule& schedule, int height)
+{
+    const std::vector<CAmount> charges{GetDemurrageCharges(txs, coins, schedule, height)};
+    return std::accumulate(charges.begin(), charges.end(), CAmount{0});
 }
 
 void UpdateDemurrageContribution(CBlock& block, ChainstateManager& chainman)

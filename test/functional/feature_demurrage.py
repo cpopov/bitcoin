@@ -16,9 +16,14 @@ activation against it.
 On regtest the rate period is 144 blocks and the target 1/2,000 of the
 scheduled supply per block, so with activation at 432 the first rate period
 has a zero rate and charges begin at 576.
+
+node2 has a chain of its own, on which the deployment activates through
+version bits signalling. It tests the getblocktemplate rule while the
+deployment is signalling, locked in and active.
 """
 from decimal import Decimal
 
+from test_framework.address import ADDRESS_BCRT1_UNSPENDABLE
 from test_framework.blocktools import (
     add_witness_commitment,
     create_block,
@@ -31,6 +36,7 @@ from test_framework.messages import (
     CTxIn,
     CTxInWitness,
     CTxOut,
+    tx_from_hex,
 )
 from test_framework.script import CScript, OP_TRUE
 from test_framework.test_framework import BitcoinTestFramework
@@ -52,6 +58,11 @@ CHARGE_MARGIN = 144
 COINBASE_MATURITY = 100
 POOL_SCRIPT = bytes.fromhex("04706f6f6c7551")
 POOL_SCRIPT_HEX = POOL_SCRIPT.hex()
+DEMURRAGE_BIT = 4
+UNDECLARED = {"rules": ["segwit"]}
+DECLARED = {"rules": ["segwit", "demurrage"]}
+RULE_REQUIRED_ERROR = "Support for 'demurrage' rule requires explicit client support"
+RULE_WARNING = f"Templates will require it from height {FIRST_CHARGED_HEIGHT}"
 
 
 def to_sat(btc):
@@ -133,12 +144,25 @@ def build_claim(pool_inputs):
 
 class DemurrageTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 2
+        self.num_nodes = 3
         self.setup_clean_chain = True
         self.extra_args = [
             [f"-testactivationheight=demurrage@{ACTIVATION_HEIGHT}"],
             [],  # node1 does not enforce BIP 462b
+            ["-vbparams=demurrage:0:9999999999"],  # node2 activates through signalling
         ]
+
+    def setup_network(self):
+        # node2 stays on a chain of its own.
+        self.setup_nodes()
+        self.connect_nodes(0, 1)
+        self.sync_all()
+
+    def sync_blocks(self, nodes=None, **kwargs):
+        super().sync_blocks(nodes or self.nodes[:2], **kwargs)
+
+    def sync_mempools(self, nodes=None, **kwargs):
+        super().sync_mempools(nodes or self.nodes[:2], **kwargs)
 
     # ---- model ----
 
@@ -331,6 +355,44 @@ class DemurrageTest(BitcoinTestFramework):
         self.verify_chain()
         return blocks
 
+    # ---- getblocktemplate ----
+
+    def check_template(self, tmpl):
+        """Check the BIP 462b fields of a node0 template against the model."""
+        self.verify_chain()
+        height = tmpl["height"]
+        entries = tmpl["transactions"]
+        pool_inputs = self.expected_pool_inputs(tmpl["previousblockhash"], height)
+        if pool_inputs:
+            # The claim transaction comes first, with the payout as its fee.
+            assert_equal(entries[0]["txid"], build_claim(pool_inputs).txid_hex)
+            assert_equal(entries[0]["fee"], sum(value for _, value in pool_inputs) // POOL_DIVISOR)
+            assert_equal(entries[0]["charge"], 0)
+        created = {entries[0]["txid"]} if pool_inputs else set()
+        for entry in entries[1 if pool_inputs else 0:]:
+            tx = tx_from_hex(entry["data"])
+            charge = 0
+            for txin in tx.vin:
+                txid = prevout_txid(txin)
+                if txid not in created:
+                    charge += self.schedule.charge(*self.coin(txid, txin.prevout.n), height)
+            assert_equal(entry["charge"], charge)
+            created.add(entry["txid"])
+        assert_equal(tmpl["demurrage_contribution"], sum(entry["charge"] for entry in entries))
+        assert_equal(tmpl["coinbasevalue"], block_subsidy(height) + sum(entry["fee"] for entry in entries) - tmpl["demurrage_contribution"])
+        assert "default_witness_commitment" in tmpl
+
+    def block_from_template(self, tmpl):
+        """A block built from a template by a client that supports BIP 462b."""
+        coinbase = create_coinbase(tmpl["height"], script_pubkey=self.wallet.get_output_script())
+        coinbase.vout[0].nValue = tmpl["coinbasevalue"]
+        if tmpl["demurrage_contribution"] > 0:
+            coinbase.vout.append(CTxOut(tmpl["demurrage_contribution"], POOL_SCRIPT))
+        block = create_block(tmpl=tmpl, coinbase=coinbase, txlist=[entry["data"] for entry in tmpl["transactions"]])
+        add_witness_commitment(block)
+        block.solve()
+        return block
+
     # ---- tests ----
 
     def run_test(self):
@@ -342,6 +404,7 @@ class DemurrageTest(BitcoinTestFramework):
         self.presigned_wallet = MiniWallet(self.nodes[0], tag_name="presigned")
 
         self.test_model()
+        self.test_gbt_signalling()
         self.test_pre_activation()
         self.test_zero_rate_period()
         self.test_charges()
@@ -358,8 +421,49 @@ class DemurrageTest(BitcoinTestFramework):
         assert_equal(self.schedule.index_at(FIRST_CHARGED_HEIGHT), 999762054507337527)
         assert_equal(evaluation_height(577), 864)
 
+    def test_gbt_signalling(self):
+        node2 = self.nodes[2]
+
+        def status_next():
+            return node2.getdeploymentinfo()["deployments"]["demurrage"]["bip9"]["status_next"]
+
+        def mine_to(height):
+            self.generatetoaddress(node2, height - node2.getblockcount(), ADDRESS_BCRT1_UNSPENDABLE, sync_fun=self.no_op)
+
+        self.log.info("getblocktemplate: nodes signal for the deployment whether or not the client declares the rule")
+        mine_to(RATE_PERIOD - 1)
+        for status in ("started", "locked_in"):
+            assert_equal(status_next(), status)
+            for request in (UNDECLARED, DECLARED):
+                tmpl = node2.getblocktemplate(request)
+                assert tmpl["version"] & (1 << DEMURRAGE_BIT)
+                assert_equal(tmpl["vbavailable"]["demurrage"], DEMURRAGE_BIT)
+                assert "demurrage" not in tmpl["rules"]
+                assert "demurrage_contribution" not in tmpl
+            # node2's own blocks signal, so the deployment locks in, then activates.
+            mine_to(node2.getblockcount() + RATE_PERIOD)
+        assert_equal(status_next(), "active")
+        assert_equal(node2.getblockcount() + 1, ACTIVATION_HEIGHT)
+
+        self.log.info("From activation the rule is optional, and undeclared clients are warned at most once an hour")
+        with node2.assert_debug_log([RULE_WARNING]):
+            tmpl = node2.getblocktemplate(UNDECLARED)
+        assert "demurrage" in tmpl["rules"] and "!demurrage" not in tmpl["rules"]
+        assert not tmpl["version"] & (1 << DEMURRAGE_BIT)
+        assert_equal(tmpl["demurrage_contribution"], 0)
+        with node2.assert_debug_log([], unexpected_msgs=[RULE_WARNING]):
+            node2.getblocktemplate(UNDECLARED)
+            node2.getblocktemplate(DECLARED)
+        mine_to(FIRST_CHARGED_HEIGHT - 2)
+        assert "demurrage" in node2.getblocktemplate(UNDECLARED)["rules"]
+
+        self.log.info("From the first rate period with a non-zero rate, the rule is required")
+        mine_to(FIRST_CHARGED_HEIGHT - 1)
+        assert_raises_rpc_error(-8, RULE_REQUIRED_ERROR, node2.getblocktemplate, UNDECLARED)
+        assert "!demurrage" in node2.getblocktemplate(DECLARED)["rules"]
+
     def test_pre_activation(self):
-        node0, node1 = self.nodes
+        node0, node1 = self.nodes[:2]
         self.log.info("Before activation, POOL_SCRIPT outputs are ordinary outputs")
         self.generate(self.wallet, 200)
         info = node0.getdeploymentinfo()["deployments"]["demurrage"]
@@ -394,7 +498,7 @@ class DemurrageTest(BitcoinTestFramework):
         assert_equal(node0.getdeploymentinfo()["deployments"]["demurrage"]["active"], True)
 
     def test_zero_rate_period(self):
-        node0, node1 = self.nodes
+        node0, node1 = self.nodes[:2]
         self.log.info("Activation: the first rate period has a zero rate, so no block owes a charge")
         # The mempool already evaluates charges at a height in the next rate period.
         tx = self.send_charged()
@@ -402,6 +506,15 @@ class DemurrageTest(BitcoinTestFramework):
         self.mine()
         assert_equal(node0.getblockcount(), ACTIVATION_HEIGHT)
         assert_equal(self.pool[node0.getbestblockhash()]["charge"], 0)
+
+        self.log.info("getblocktemplate: the rule is optional until charges begin, and templates give charges")
+        tmpl = node0.getblocktemplate(UNDECLARED)
+        assert "demurrage" in tmpl["rules"] and "!demurrage" not in tmpl["rules"]
+        self.check_template(tmpl)
+        assert_equal(tmpl["demurrage_contribution"], 0)
+        # node1 does not enforce BIP 462b, so its templates have no BIP 462b fields.
+        tmpl = node1.getblocktemplate(UNDECLARED)
+        assert "demurrage" not in tmpl["rules"] and "demurrage_contribution" not in tmpl
 
         self.log.info("Invalid: a pool output in the coinbase when C(h) = 0, or two of them")
         self.submit(self.make_block(contributions=[1000]), "bad-cb-demurrage-unexpected")
@@ -431,6 +544,15 @@ class DemurrageTest(BitcoinTestFramework):
         coin = self.coin(prevout_txid(tx["tx"].vin[0]), tx["tx"].vin[0].prevout.n)
         assert_equal(evaluation_height(FIRST_CHARGED_HEIGHT), 720)
         self.assert_net_fee(tx["txid"], self.schedule.charge(*coin, 720))
+
+        self.log.info("getblocktemplate: from the first rate period with a non-zero rate, the rule is required")
+        assert_raises_rpc_error(-8, RULE_REQUIRED_ERROR, node0.getblocktemplate, UNDECLARED)
+        tmpl = node0.getblocktemplate(DECLARED)
+        assert "!demurrage" in tmpl["rules"]
+        assert_equal(tmpl["height"], FIRST_CHARGED_HEIGHT)
+        self.check_template(tmpl)
+        assert_greater_than(tmpl["demurrage_contribution"], 0)
+
         # The evaluation height moves in steps of CHARGE_MARGIN, and charges are recomputed then.
         self.rejoin()
         self.generateblock(node0, self.wallet.get_descriptor(), [])
@@ -494,7 +616,7 @@ class DemurrageTest(BitcoinTestFramework):
         self.wallet.rescan_utxos()
 
     def test_claims(self):
-        node0, node1 = self.nodes
+        node0, node1 = self.nodes[:2]
         self.log.info("Claims: the first claim spends the first matured contribution")
         self.mine(self.first_contribution_height + COINBASE_MATURITY - 1 - node0.getblockcount())
         assert_equal(self.pool[node0.getbestblockhash()]["carry"], None)
@@ -519,12 +641,28 @@ class DemurrageTest(BitcoinTestFramework):
         assert entry["carry"] is not None and entry["charge"] > 0
         assert_equal(node0.getblock(blockhash)["tx"][2], tx["txid"])
 
+        self.log.info("A block built from getblocktemplate, with its claim, charges and contribution, is valid")
+        self.wallet.rescan_utxos()
+        self.send_charged()
+        parent = self.send_charged()
+        child = self.wallet.create_self_transfer(utxo_to_spend=parent["new_utxo"], fee=Decimal("0.01"))
+        self.wallet.sendrawtransaction(from_node=node0, tx_hex=child["hex"])
+        tmpl = node0.getblocktemplate(DECLARED)
+        self.check_template(tmpl)
+        entries = {entry["txid"]: entry for entry in tmpl["transactions"]}
+        # The child spends an output of an earlier transaction in the template.
+        assert_equal(entries[child["txid"]]["charge"], 0)
+        assert_greater_than(entries[parent["txid"]]["charge"], 0)
+        self.submit(self.block_from_template(tmpl))
+        self.verify_chain()
+        self.wallet.rescan_utxos()
+
         self.log.info("Every later block has a claim, with two inputs when the matured block has a contribution")
         # Mine until both kinds have been seen, and the next block has both a
         # carry and a matured contribution.
         num_inputs = set()
         while num_inputs != {1, 2} or len(self.expected_pool_inputs(node0.getbestblockhash(), node0.getblockcount() + 1)) < 2:
-            assert node0.getblockcount() < self.first_contribution_height + COINBASE_MATURITY + 15
+            assert node0.getblockcount() < self.first_contribution_height + COINBASE_MATURITY + 20
             self.mine()
             entry = self.pool[node0.getbestblockhash()]
             assert entry["carry"] is not None
@@ -634,7 +772,7 @@ class DemurrageTest(BitcoinTestFramework):
         assert_equal(node0.getrawmempool(), [])
 
     def test_reorg(self):
-        node0, node1 = self.nodes
+        node0, node1 = self.nodes[:2]
         self.log.info("Reorgs: claim transactions do not return to the mempool")
         self.rejoin()
         self.wallet.rescan_utxos()
@@ -667,7 +805,7 @@ class DemurrageTest(BitcoinTestFramework):
         self.mine()
 
     def test_soft_fork(self):
-        node0, node1 = self.nodes
+        node0, node1 = self.nodes[:2]
         self.log.info("Soft fork: node1 accepted every block, and accepts blocks that node0 rejects")
         self.sync_blocks()
         assert_equal(node1.getbestblockhash(), node0.getbestblockhash())

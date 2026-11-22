@@ -78,6 +78,9 @@ public:
     uint64_t Index(int height);
     /** r_k of the rate period containing height (zero before activation). */
     uint64_t RateAt(int height);
+    /** The start of the first rate period with a non-zero rate, from which blocks
+     *  can owe a charge, or nullopt if no period has one (a zero target). */
+    std::optional<int> FirstChargeHeight();
     /** charge(v, c, h). A created height above the spent height (an output created
      *  in the same block, or not yet confirmed) has no charge. */
     CAmount ChargeFor(CAmount value, int created_height, int spent_height);
