@@ -1,12 +1,10 @@
 # BIP 462b reference implementation
 
-This branch implements the draft **BIP 462b, Soft-Fork Demurrage Security Budget**
-(`bip-0462b.md`): its consensus rules and relay policy as of version 0.1.0, and
-its `getblocktemplate` support as of version 0.3.0. Versions 0.2.0 and 0.3.0 of
-the draft address the problems this implementation found in 0.1.0, listed below.
-They change no mainnet consensus rule, but their policy differs from this
-implementation in the ways listed under
-[Differences from draft 0.3.0](#differences-from-draft-030).
+This branch implements version 0.3.0 of the draft **BIP 462b, Soft-Fork
+Demurrage Security Budget** (`bip-0462b.md`), except for the points listed under
+[Differences from draft 0.3.0](#differences-from-draft-030). It was first
+written against version 0.1.0. Versions 0.2.0 and 0.3.0 address the problems it
+found in 0.1.0, listed below, and change no mainnet consensus rule.
 The demurrage is charged when an output is
 spent. The block owes the charge, the coinbase pays it into a pool output, and a
 deterministic claim transaction at index 1 of every later block pays out
@@ -66,6 +64,7 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 | Summary of new block rules | `Chainstate::ConnectBlock`, all three rules |
 | Deployment | `DEPLOYMENT_DEMURRAGE`, `deploymentinfo.cpp`, `DemurrageActivationHeight()` in `deploymentstatus.h`, `VersionBitsCache::ActivationHeight`, `-testactivationheight` in `chainparams.cpp`, `getdeploymentinfo` in `rpc/blockchain.cpp` |
 | Relay and mining policy: mining score | `CTxMemPoolEntry::m_demurrage_charge`, which `GetModifiedFee()` excludes; `ChangeSet::StageAddition`; `CTxMemPool::SetDemurrageCharge`; `MemPoolAccept::PreChecks`; `Chainstate::UpdateMempoolDemurrageCharges`, called from `ConnectTip` and `MaybeUpdateMempoolForReorg` |
+| Relay and mining policy: unconfirmed inputs | `MemPoolAccept::PreChecks` (coins at `MEMPOOL_HEIGHT`) and `Chainstate::UpdateMempoolDemurrageCharges` (parents found with `CTxMemPool::get`) charge an output of an unconfirmed transaction from the next block's height |
 | Relay and mining policy: relay | The existing fee checks (`CheckFeeRate`, package feerate, RBF, eviction) all read modified fees, so they use the net fee at `E` |
 | Relay and mining policy: pool outputs | `PreChecks`: `demurrage-pool-output`, `demurrage-pool-spend`. Claim transactions from disconnected blocks fail the first check, so they are not returned to the mempool. |
 | Relay and mining policy: block assembly | `BlockAssembler::CreateNewBlock`, `node::GetDemurrageCharges`, `node::GetBlockDemurrageCharge`; `node::UpdateDemurrageContribution` for `generateblock`; the contribution is added to `CoinbaseTx::required_outputs` for IPC mining clients |
@@ -109,7 +108,11 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 - **When charges are recomputed.** All mempool charges are recomputed when `E`
   or the activation height changes, and after every reorg. When a block connects
   without changing either, only the entries that spend its outputs are
-  recomputed, because their inputs have just confirmed.
+  recomputed, because their inputs have just confirmed. Those inputs were
+  charged as if confirmed in the next block at the time, so their charges can
+  only fall. Other entries keep that next-block height for their unconfirmed
+  inputs until `E` moves, which overstates the charge a little more with each
+  block.
 - **Block assembly.** The claim's weight is reserved before transactions are
   selected. `C(h)` is computed exactly at the block's height from the coins tip.
   Inputs spending outputs of earlier transactions in the block have no charge.
@@ -132,9 +135,10 @@ interfaces and wording.
    when the parent confirms alone, the child suddenly owes the charge for its
    parent's output from that height to `E`, up to 287 blocks of decay. A child
    whose fee was sized for a package can then become unminable until bumped.
-   The functional test shows this. The BIP should choose a rule, for example
+   The functional test showed this. The BIP should choose a rule, for example
    assume confirmation at the next block (conservative) or in the same block
-   (this implementation).
+   (this implementation at the time). Draft 0.2.0 chose the next block, and this
+   implementation now does the same.
 2. **What a recomputation does to transactions whose net fee becomes too low is
    not specified (policy).** "Each transaction therefore pays its way for at
    least `CHARGE_MARGIN` blocks before a recomputation can evict it" implies
@@ -218,10 +222,6 @@ This follows the draft's `getblocktemplate` section as of version 0.3.0.
 
 ## Differences from draft 0.3.0
 
-- **Unconfirmed inputs.** This implementation charges an input that spends an
-  unconfirmed output nothing. The draft charges it as if the output were
-  created in the next block, so that a child's net fee cannot fall when its
-  parent confirms alone.
 - **Before activation.** This implementation charges nothing until the
   deployment is active for the next block. The draft charges from lock-in,
   when `ACTIVATION_HEIGHT` is known.
@@ -230,8 +230,9 @@ This follows the draft's `getblocktemplate` section as of version 0.3.0.
 - **assumeutxo.** The draft states how to find the pool inputs in a snapshot.
   This implementation does not do so yet (see below).
 
-The `getblocktemplate` support, the no-eviction rule for recomputation, the fee
-rule for ephemeral dust and the regtest parameters match the draft.
+The charge of unconfirmed inputs, the `getblocktemplate` support, the
+no-eviction rule for recomputation, the fee rule for ephemeral dust and the
+regtest parameters match the draft.
 
 ## Not implemented
 
@@ -281,6 +282,9 @@ rule for ephemeral dust and the regtest parameters match the draft.
   - the zero-rate first period;
   - net fees at the evaluation height, and their recomputation when `E` moves
     and when a parent confirms;
+  - inputs from unconfirmed parents, charged as if the parent confirms in the
+    next block: the child's charge stays the same when the parent confirms in
+    that block, and falls when it confirms later, also in a CPFP package;
   - contributions from block assembly and from `generateblock`;
   - an output created and spent in the same block;
   - claims with one and with two inputs, and their payouts;

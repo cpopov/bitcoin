@@ -236,12 +236,15 @@ class DemurrageTest(BitcoinTestFramework):
         return to_sat(txout["value"]), node.getblockcount() - txout["confirmations"] + 1
 
     def mempool_charge(self, coins):
-        """The charge at the evaluation height of the next block, for confirmed coins [(value, height)]."""
+        """The charge at the evaluation height of the next block, for coins [(value, height)].
+
+        A height of None is an output of an unconfirmed transaction, which is
+        charged as if it were created in the next block."""
         next_height = self.nodes[0].getblockcount() + 1
         if next_height < ACTIVATION_HEIGHT:
             return 0
         evaluation = evaluation_height(next_height)
-        return sum(self.schedule.charge(value, height, evaluation) for value, height in coins)
+        return sum(self.schedule.charge(value, next_height if height is None else height, evaluation) for value, height in coins)
 
     def assert_net_fee(self, txid, charge):
         entry = self.nodes[0].getmempoolentry(txid)
@@ -259,6 +262,15 @@ class DemurrageTest(BitcoinTestFramework):
         self.assert_net_fee(tx["txid"], charge)
         tx["charge_at_evaluation"] = charge
         return tx
+
+    def send_child(self, parent, extra_fee=20_000):
+        """Send a child of a mempool transaction that pays its charge at the evaluation height."""
+        charge = self.mempool_charge([(to_sat(parent["new_utxo"]["value"]), None)])
+        child = self.wallet.create_self_transfer(utxo_to_spend=parent["new_utxo"], fee=Decimal(charge + extra_fee) / COIN)
+        self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=child["hex"])
+        self.assert_net_fee(child["txid"], charge)
+        child["charge_at_evaluation"] = charge
+        return child
 
     def charges_and_fees(self, txs, height, claim):
         """C(h) and the fees of a block's transactions (claim first, if any)."""
@@ -567,21 +579,36 @@ class DemurrageTest(BitcoinTestFramework):
         assert_greater_than(entry["charge"], 0)
         self.first_contribution_height = node0.getblockcount()
 
-        self.log.info("A child's charge is recomputed when its parent confirms")
+        self.log.info("An input from an unconfirmed parent is charged as if the parent confirms in the next block")
         self.wallet.rescan_utxos()
         parent = self.send_charged()
-        # The child's input has no charge while its parent is unconfirmed. Its
-        # fee also covers the charge it owes once the parent confirms alone.
-        child = self.wallet.create_self_transfer(utxo_to_spend=parent["new_utxo"], fee=Decimal("5"))
-        self.wallet.sendrawtransaction(from_node=node0, tx_hex=child["hex"])
-        self.assert_net_fee(child["txid"], 0)
+        next_height = node0.getblockcount() + 1
+        # The evaluation height stays the same for the next two blocks.
+        assert_equal(evaluation_height(next_height + 2), evaluation_height(next_height))
+        child = self.send_child(parent)
+        assert_greater_than(child["charge_at_evaluation"], 0)
         self.rejoin()
+        # A block without the parent leaves the child's charge as it was.
+        self.generateblock(node0, self.wallet.get_descriptor(), [])
+        self.assert_net_fee(child["txid"], child["charge_at_evaluation"])
+
+        self.log.info("When the parent confirms later than that, the child's charge falls")
         self.generateblock(node0, self.wallet.get_descriptor(), [parent["txid"]])
         self.verify_chain()
         assert_greater_than(self.pool[node0.getbestblockhash()]["charge"], 0)
         child_coin = self.coin(parent["txid"], 0)
+        assert_equal(child_coin[1], next_height + 1)
         self.assert_net_fee(child["txid"], self.mempool_charge([child_coin]))
-        assert_greater_than(self.mempool_charge([child_coin]), 0)
+        assert_greater_than(child["charge_at_evaluation"], self.mempool_charge([child_coin]))
+        self.mine()
+        assert child["txid"] in node0.getblock(node0.getbestblockhash())["tx"]
+        self.wallet.rescan_utxos()
+
+        self.log.info("When the parent confirms in the next block, the child's charge stays the same")
+        parent = self.send_charged()
+        child = self.send_child(parent)
+        self.generateblock(node0, self.wallet.get_descriptor(), [parent["txid"]])
+        self.assert_net_fee(child["txid"], child["charge_at_evaluation"])
         self.mine()
         assert child["txid"] in node0.getblock(node0.getbestblockhash())["tx"]
         self.wallet.rescan_utxos()
@@ -645,12 +672,13 @@ class DemurrageTest(BitcoinTestFramework):
         self.wallet.rescan_utxos()
         self.send_charged()
         parent = self.send_charged()
-        child = self.wallet.create_self_transfer(utxo_to_spend=parent["new_utxo"], fee=Decimal("0.01"))
-        self.wallet.sendrawtransaction(from_node=node0, tx_hex=child["hex"])
+        child = self.send_child(parent)
         tmpl = node0.getblocktemplate(DECLARED)
         self.check_template(tmpl)
         entries = {entry["txid"]: entry for entry in tmpl["transactions"]}
-        # The child spends an output of an earlier transaction in the template.
+        # The child spends an output of an earlier transaction in the template,
+        # so in the block its input has no charge, unlike in the mempool.
+        assert_greater_than(child["charge_at_evaluation"], 0)
         assert_equal(entries[child["txid"]]["charge"], 0)
         assert_greater_than(entries[parent["txid"]]["charge"], 0)
         self.submit(self.block_from_template(tmpl))
@@ -761,10 +789,13 @@ class DemurrageTest(BitcoinTestFramework):
         parent_charge = self.mempool_charge([self.coin(prevout_txid(parent_input), parent_input.prevout.n)])
         deficit = parent_charge - to_sat(rescued["fee"])
         assert_greater_than(deficit, 0)
-        child = self.presigned_wallet.create_self_transfer(utxo_to_spend=rescued["new_utxo"], fee=Decimal(deficit + 100_000) / COIN)
+        # The child also pays its own input's charge, as if its parent confirmed in the next block.
+        child_charge = self.mempool_charge([(to_sat(rescued["new_utxo"]["value"]), None)])
+        child = self.presigned_wallet.create_self_transfer(utxo_to_spend=rescued["new_utxo"], fee=Decimal(deficit + child_charge + 100_000) / COIN)
         result = node0.submitpackage([rescued["hex"], child["hex"]], maxfeerate=0)
         assert_equal(result["package_msg"], "success")
         self.assert_net_fee(rescued["txid"], parent_charge)
+        self.assert_net_fee(child["txid"], child_charge)
         assert_greater_than(0, to_sat(node0.getmempoolentry(rescued["txid"])["fees"]["modified"]))
         self.mine()
         block = node0.getblock(node0.getbestblockhash())

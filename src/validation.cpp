@@ -432,8 +432,14 @@ void Chainstate::UpdateMempoolDemurrageCharges(const CBlock* connected_block)
     for (const CTxMemPool::txiter it : entries) {
         CAmount charge{0};
         if (schedule) {
+            // As in PreChecks, an output of an unconfirmed transaction is
+            // charged as if it were created in the next block.
+            const int next_height{tip->nHeight + 1};
             for (const CTxIn& txin : it->GetTx().vin) {
-                if (m_mempool->exists(txin.prevout.hash)) continue;
+                if (const CTransactionRef parent{m_mempool->get(txin.prevout.hash)}) {
+                    charge += schedule->ChargeFor(parent->vout.at(txin.prevout.n).nValue, next_height, evaluation->second);
+                    continue;
+                }
                 const Coin& coin{CoinsTip().AccessCoin(txin.prevout)};
                 if (coin.IsSpent()) continue;
                 charge += schedule->ChargeFor(coin.out.nValue, coin.nHeight, evaluation->second);
@@ -943,21 +949,24 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // BIP 462b policy: transactions rank by net fee, their fee less the charge
-    // of their confirmed inputs at the evaluation height. An input spending an
-    // unconfirmed output is assumed to confirm in the same block, so it has no
-    // charge.
+    // of their inputs at the evaluation height. An input spending an output of
+    // an unconfirmed transaction is charged as if that output were created in
+    // the next block, the earliest it can confirm. This is the most the input
+    // can owe, so the net fee cannot fall when the parent confirms.
     CAmount demurrage_charge{0};
     const CBlockIndex* tip{Assert(m_active_chainstate.m_chain.Tip())};
     if (const auto demurrage_activation{m_active_chainstate.m_chainman.DemurrageActivationHeight(tip)}) {
         auto& schedule{m_active_chainstate.m_chainman.DemurrageSchedule(*demurrage_activation)};
-        const int evaluation_height{demurrage::EvaluationHeight(tip->nHeight + 1)};
+        const int next_height{tip->nHeight + 1};
+        const int evaluation_height{demurrage::EvaluationHeight(next_height)};
         for (const CTxIn& txin : tx.vin) {
             const Coin& coin{m_view.AccessCoin(txin.prevout)};
-            if (coin.nHeight == MEMPOOL_HEIGHT) continue;
-            if (demurrage::IsPoolScript(coin.out.scriptPubKey) && static_cast<int>(coin.nHeight) >= *demurrage_activation) {
+            const bool unconfirmed{coin.nHeight == MEMPOOL_HEIGHT};
+            if (!unconfirmed && demurrage::IsPoolScript(coin.out.scriptPubKey) && static_cast<int>(coin.nHeight) >= *demurrage_activation) {
                 return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "demurrage-pool-spend");
             }
-            demurrage_charge += schedule.ChargeFor(coin.out.nValue, coin.nHeight, evaluation_height);
+            const int created_height{unconfirmed ? next_height : static_cast<int>(coin.nHeight)};
+            demurrage_charge += schedule.ChargeFor(coin.out.nValue, created_height, evaluation_height);
         }
     }
 
