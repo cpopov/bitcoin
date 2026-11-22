@@ -130,6 +130,26 @@ class MiniWallet:
     def get_balance(self):
         return sum(u['value'] for u in self._utxos)
 
+    def demurrage_index(self, height):
+        """BIP 462: the demurrage index I(height), up to the block after the tip."""
+        info = self._test_node.getdemurrageinfo()
+        if height < info.get('activation_height', height + 1):
+            return info['index_scale']
+        if height == info['height'] + 1:
+            return info['next_block']['index']
+        return self._test_node.getdemurrageinfo(height)['index']
+
+    def demurrage_inputs_value(self, utxos):
+        """BIP 462: the total value, in satoshis, of utxos spent together. The
+        transaction's reference height is the highest among them, and each is
+        valued at it: v * I(ref_height) / I(own reference height). A single
+        utxo is always valued at its nominal value."""
+        txouts = [self._test_node.gettxout(u['txid'], u['vout']) for u in utxos]
+        assert all(t is not None for t in txouts)
+        ref_height = max(t['ref_height'] for t in txouts)
+        ref_index = self.demurrage_index(ref_height)
+        return sum(int(t['value'] * COIN) * ref_index // self.demurrage_index(t['ref_height']) for t in txouts)
+
     def rescan_utxos(self, *, include_mempool=True):
         """Drop all utxos and rescan the utxo set"""
         self._utxos = []
@@ -304,11 +324,15 @@ class MiniWallet:
         fee_per_output=1000,
         target_vsize=0,
         confirmed_only=False,
+        demurrage=False,
     ):
         """
         Create and return a transaction that spends the given UTXOs and creates a
         certain number of outputs with equal amounts. The output amounts can be
         set by amount_per_output or automatically calculated with a fee_per_output.
+
+        If demurrage is set, value the inputs as BIP 462 does, at the highest
+        reference height among them.
         """
         utxos_to_spend = utxos_to_spend or [self.get_utxo(confirmed_only=confirmed_only)]
         sequence = [sequence] * len(utxos_to_spend) if type(sequence) is int else sequence
@@ -316,6 +340,8 @@ class MiniWallet:
 
         # calculate output amount
         inputs_value_total = sum([int(COIN * utxo['value']) for utxo in utxos_to_spend])
+        if demurrage and len(utxos_to_spend) > 1:
+            inputs_value_total = self.demurrage_inputs_value(utxos_to_spend)
         outputs_value_total = inputs_value_total - fee_per_output * num_outputs
         amount_per_output = amount_per_output or (outputs_value_total // num_outputs)
         assert amount_per_output > 0
