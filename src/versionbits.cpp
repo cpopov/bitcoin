@@ -270,6 +270,23 @@ std::optional<int> VersionBitsCache::ActivationHeight(const CBlockIndex* pindexP
     return checker.GetStateSinceHeightFor(pindexPrev, m_caches[pos]);
 }
 
+std::optional<int> VersionBitsCache::KnownActivationHeight(const CBlockIndex* pindexPrev, const Consensus::Params& params, Consensus::DeploymentPos pos)
+{
+    LOCK(m_mutex);
+    const VersionBitsConditionChecker checker(params, pos);
+    const ThresholdState state{checker.GetStateFor(pindexPrev, m_caches[pos])};
+    if (state != ThresholdState::ACTIVE && state != ThresholdState::LOCKED_IN) return std::nullopt;
+    const int since{checker.GetStateSinceHeightFor(pindexPrev, m_caches[pos])};
+    if (state == ThresholdState::ACTIVE) return since;
+    // A locked-in deployment becomes active at the start of the first later
+    // period that begins at or after min_activation_height.
+    const Consensus::BIP9Deployment& dep{params.vDeployments[pos]};
+    const int period{static_cast<int>(dep.period)};
+    const int earliest{since + period};
+    if (dep.min_activation_height <= earliest) return earliest;
+    return (dep.min_activation_height + period - 1) / period * period;
+}
+
 static int32_t ComputeBlockVersion(const CBlockIndex* pindexPrev, const Consensus::Params& params, std::array<ThresholdConditionCache, Consensus::MAX_VERSION_BITS_DEPLOYMENTS>& caches)
 {
     int32_t nVersion = VERSIONBITS_TOP_BITS;

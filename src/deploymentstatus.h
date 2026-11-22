@@ -40,6 +40,18 @@ inline std::optional<int> DemurrageActivationHeight(const CBlockIndex* pindexPre
     return versionbitscache.ActivationHeight(pindexPrev, params, Consensus::DEPLOYMENT_DEMURRAGE);
 }
 
+/**
+ * BIP 462b policy: ACTIVATION_HEIGHT, if it is known for the block after
+ * pindexPrev: once the deployment is locked in, or at any height if it is
+ * forced with -testactivationheight. Otherwise nullopt. The mempool computes
+ * charges from it; consensus uses DemurrageActivationHeight().
+ */
+inline std::optional<int> DemurrageKnownActivationHeight(const CBlockIndex* pindexPrev, const Consensus::Params& params, VersionBitsCache& versionbitscache)
+{
+    if (const auto& forced{params.DemurrageTestActivationHeight}) return forced;
+    return versionbitscache.KnownActivationHeight(pindexPrev, params, Consensus::DEPLOYMENT_DEMURRAGE);
+}
+
 /** Determine if a deployment is active for this block */
 inline bool DeploymentActiveAt(const CBlockIndex& index, const Consensus::Params& params, Consensus::BuriedDeployment dep, [[maybe_unused]] VersionBitsCache& versionbitscache)
 {

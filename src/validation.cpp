@@ -402,7 +402,8 @@ void Chainstate::UpdateMempoolDemurrageCharges(const CBlock* connected_block)
     const CBlockIndex* tip{m_chain.Tip()};
     std::optional<std::pair<int, int>> evaluation;
     if (tip) {
-        if (const auto activation{m_chainman.DemurrageActivationHeight(tip)}) {
+        // Charges are computed once ACTIVATION_HEIGHT is known, from lock-in.
+        if (const auto activation{m_chainman.DemurrageKnownActivationHeight(tip)}) {
             evaluation.emplace(*activation, demurrage::EvaluationHeight(tip->nHeight + 1));
         }
     }
@@ -952,10 +953,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // of their inputs at the evaluation height. An input spending an output of
     // an unconfirmed transaction is charged as if that output were created in
     // the next block, the earliest it can confirm. This is the most the input
-    // can owe, so the net fee cannot fall when the parent confirms.
+    // can owe, so the net fee cannot fall when the parent confirms. Charges are
+    // computed once ACTIVATION_HEIGHT is known, from lock-in: the evaluation
+    // height can lie beyond it.
     CAmount demurrage_charge{0};
     const CBlockIndex* tip{Assert(m_active_chainstate.m_chain.Tip())};
-    if (const auto demurrage_activation{m_active_chainstate.m_chainman.DemurrageActivationHeight(tip)}) {
+    if (const auto demurrage_activation{m_active_chainstate.m_chainman.DemurrageKnownActivationHeight(tip)}) {
         auto& schedule{m_active_chainstate.m_chainman.DemurrageSchedule(*demurrage_activation)};
         const int next_height{tip->nHeight + 1};
         const int evaluation_height{demurrage::EvaluationHeight(next_height)};

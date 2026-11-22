@@ -23,7 +23,6 @@ deployment is signalling, locked in and active.
 """
 from decimal import Decimal
 
-from test_framework.address import ADDRESS_BCRT1_UNSPENDABLE
 from test_framework.blocktools import (
     add_witness_commitment,
     create_block,
@@ -239,10 +238,9 @@ class DemurrageTest(BitcoinTestFramework):
         """The charge at the evaluation height of the next block, for coins [(value, height)].
 
         A height of None is an output of an unconfirmed transaction, which is
-        charged as if it were created in the next block."""
+        charged as if it were created in the next block. node0's activation
+        height is forced, so it is known, and charges computed, at any height."""
         next_height = self.nodes[0].getblockcount() + 1
-        if next_height < ACTIVATION_HEIGHT:
-            return 0
         evaluation = evaluation_height(next_height)
         return sum(self.schedule.charge(value, next_height if height is None else height, evaluation) for value, height in coins)
 
@@ -439,12 +437,15 @@ class DemurrageTest(BitcoinTestFramework):
         def status_next():
             return node2.getdeploymentinfo()["deployments"]["demurrage"]["bip9"]["status_next"]
 
+        wallet2 = MiniWallet(node2)
+
         def mine_to(height):
-            self.generatetoaddress(node2, height - node2.getblockcount(), ADDRESS_BCRT1_UNSPENDABLE, sync_fun=self.no_op)
+            self.generatetoaddress(node2, height - node2.getblockcount(), wallet2.get_address(), sync_fun=self.no_op)
 
         self.log.info("getblocktemplate: nodes signal for the deployment whether or not the client declares the rule")
         mine_to(RATE_PERIOD - 1)
-        for status in ("started", "locked_in"):
+        # node2's own blocks signal, so the deployment locks in, then activates.
+        for status, period_end in (("started", 2 * RATE_PERIOD - 1), ("locked_in", 3 * RATE_PERIOD - 1)):
             assert_equal(status_next(), status)
             for request in (UNDECLARED, DECLARED):
                 tmpl = node2.getblocktemplate(request)
@@ -452,8 +453,20 @@ class DemurrageTest(BitcoinTestFramework):
                 assert_equal(tmpl["vbavailable"]["demurrage"], DEMURRAGE_BIT)
                 assert "demurrage" not in tmpl["rules"]
                 assert "demurrage_contribution" not in tmpl
-            # node2's own blocks signal, so the deployment locks in, then activates.
-            mine_to(node2.getblockcount() + RATE_PERIOD)
+            if status == "locked_in":
+                self.log.info("From lock-in, ACTIVATION_HEIGHT is known, and the mempool charges at the evaluation height")
+                mine_to(node2.getblockcount() + 1)
+                # The evaluation height lies beyond activation, in the first rate period with a non-zero rate.
+                assert_equal(evaluation_height(node2.getblockcount() + 1), FIRST_CHARGED_HEIGHT)
+                wallet2.rescan_utxos()
+                utxo = next(u for u in wallet2.get_utxos(mark_as_spent=False, confirmed_only=True)
+                            if u["height"] <= node2.getblockcount() - COINBASE_MATURITY)
+                charge = self.schedule.charge(to_sat(utxo["value"]), utxo["height"], FIRST_CHARGED_HEIGHT)
+                assert_greater_than(charge, 0)
+                tx = wallet2.send_self_transfer(from_node=node2, utxo_to_spend=utxo, fee=Decimal(charge + 20_000) / COIN)
+                entry = node2.getmempoolentry(tx["txid"])
+                assert_equal(to_sat(entry["fees"]["modified"]), to_sat(entry["fees"]["base"]) - charge)
+            mine_to(period_end)
         assert_equal(status_next(), "active")
         assert_equal(node2.getblockcount() + 1, ACTIVATION_HEIGHT)
 

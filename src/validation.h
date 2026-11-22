@@ -1226,6 +1226,12 @@ public:
         return ::DemurrageActivationHeight(pindexPrev, GetConsensus(), m_versionbitscache);
     }
 
+    /** BIP 462b policy: ACTIVATION_HEIGHT once it is known for the block after pindexPrev, from lock-in. */
+    std::optional<int> DemurrageKnownActivationHeight(const CBlockIndex* pindexPrev) const
+    {
+        return ::DemurrageKnownActivationHeight(pindexPrev, GetConsensus(), m_versionbitscache);
+    }
+
     /** BIP 462b: the demurrage index of a chain whose deployment activated at activation_height. */
     demurrage::IndexSchedule& DemurrageSchedule(int activation_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 

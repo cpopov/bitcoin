@@ -15,7 +15,9 @@ The deployment is `demurrage`. It is defined on every network and is
 stage. On regtest it can be activated in two ways:
 
 - `-testactivationheight=demurrage@<height>` applies the rules from a fixed
-  height, whatever the version bits state. This is what the tests use.
+  height, whatever the version bits state. This is what most of the tests use.
+  The activation height is then known from the start, so the mempool computes
+  charges at the evaluation height even before it.
 - `-vbparams=demurrage:<start>:<timeout>[:<min_activation_height>]` activates it
   through signalling. The regtest period is 144 blocks and the threshold 108.
 
@@ -64,6 +66,7 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 | Summary of new block rules | `Chainstate::ConnectBlock`, all three rules |
 | Deployment | `DEPLOYMENT_DEMURRAGE`, `deploymentinfo.cpp`, `DemurrageActivationHeight()` in `deploymentstatus.h`, `VersionBitsCache::ActivationHeight`, `-testactivationheight` in `chainparams.cpp`, `getdeploymentinfo` in `rpc/blockchain.cpp` |
 | Relay and mining policy: mining score | `CTxMemPoolEntry::m_demurrage_charge`, which `GetModifiedFee()` excludes; `ChangeSet::StageAddition`; `CTxMemPool::SetDemurrageCharge`; `MemPoolAccept::PreChecks`; `Chainstate::UpdateMempoolDemurrageCharges`, called from `ConnectTip` and `MaybeUpdateMempoolForReorg` |
+| Relay and mining policy: before activation | `DemurrageKnownActivationHeight()` in `deploymentstatus.h` and `VersionBitsCache::KnownActivationHeight` give `ACTIVATION_HEIGHT` from lock-in (the next period, or `min_activation_height` if later), or at any height when forced with `-testactivationheight`. `PreChecks` and `UpdateMempoolDemurrageCharges` use it. Consensus and block assembly use `DemurrageActivationHeight()`, which applies only from activation. |
 | Relay and mining policy: unconfirmed inputs | `MemPoolAccept::PreChecks` (coins at `MEMPOOL_HEIGHT`) and `Chainstate::UpdateMempoolDemurrageCharges` (parents found with `CTxMemPool::get`) charge an output of an unconfirmed transaction from the next block's height |
 | Relay and mining policy: relay | The existing fee checks (`CheckFeeRate`, package feerate, RBF, eviction) all read modified fees, so they use the net fee at `E` |
 | Relay and mining policy: pool outputs | `PreChecks`: `demurrage-pool-output`, `demurrage-pool-spend`. Claim transactions from disconnected blocks fail the first check, so they are not returned to the mempool. |
@@ -147,9 +150,11 @@ interfaces and wording.
    replacement or a CPFP child.
 3. **Charges before activation is known (policy).** `E` is up to 287 blocks
    ahead, so it can lie beyond an activation height that version bits has not
-   yet fixed. This implementation charges nothing until the deployment is
-   active for the next block. On mainnet this changes nothing, because the rate
-   is zero until 1,260,000.
+   yet fixed. This implementation charged nothing until the deployment was
+   active for the next block. On mainnet this matters only if the deployment
+   activates at 1,260,000 or later, because the rate is zero below that height.
+   Draft 0.2.0 charges from lock-in, and this
+   implementation now does the same.
 4. **Test networks.** The BIP gives only mainnet values, and ties `RATE_PERIOD`
    to the 2,016-block difficulty adjustment period. On regtest the version bits
    period is 144, so `ACTIVATION_HEIGHT` is a multiple of 144, not of 2,016. The
@@ -222,17 +227,14 @@ This follows the draft's `getblocktemplate` section as of version 0.3.0.
 
 ## Differences from draft 0.3.0
 
-- **Before activation.** This implementation charges nothing until the
-  deployment is active for the next block. The draft charges from lock-in,
-  when `ACTIVATION_HEIGHT` is known.
 - **Compact blocks.** Senders do not prefill the claim transaction, and nodes do
   not check it before relaying a block ahead of validation.
 - **assumeutxo.** The draft states how to find the pool inputs in a snapshot.
   This implementation does not do so yet (see below).
 
-The charge of unconfirmed inputs, the `getblocktemplate` support, the
-no-eviction rule for recomputation, the fee rule for ephemeral dust and the
-regtest parameters match the draft.
+The charge of unconfirmed inputs, charges from lock-in, the `getblocktemplate`
+support, the no-eviction rule for recomputation, the fee rule for ephemeral
+dust and the regtest parameters match the draft.
 
 ## Not implemented
 
@@ -263,6 +265,9 @@ regtest parameters match the draft.
   - the regtest schedule;
   - the height from which `getblocktemplate` requires the rule, for several
     activation heights.
+- `src/test/versionbits_tests.cpp`: `VersionBitsCache::KnownActivationHeight`
+  while started, locked in and active, with and without a
+  `min_activation_height`.
 - `test/functional/feature_demurrage.py`. node0 enforces the rules from height
   432. node1 does not enforce them, and accepts every block node0 accepts,
   claims and contributions included, which shows the rules are a soft fork. The
@@ -272,6 +277,8 @@ regtest parameters match the draft.
   - on node2, the version bit for clients that do and do not declare the rule
     while the deployment is `started` and `locked_in`; the optional rule and the
     rate-limited warning from activation; and the required rule from 576;
+  - on node2, a mempool charge while the deployment is locked in, at an
+    evaluation height beyond activation;
   - on node0, the same switch at 576 with a forced activation height, and every
     `getblocktemplate` field checked against the model: each transaction's
     `charge` (zero for an input from an earlier transaction in the template),

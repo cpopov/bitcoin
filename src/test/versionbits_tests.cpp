@@ -411,6 +411,8 @@ void check_computeblockversion(VersionBitsCache& versionbitscache, const Consens
     lastBlock = secondChain.Mine(period, nTime, VERSIONBITS_LAST_OLD_BLOCK_VERSION).Tip();
     BOOST_CHECK((versionbitscache.ComputeBlockVersion(lastBlock, params) & (1 << bit)) != 0);
     BOOST_CHECK(!versionbitscache.IsActiveAfter(lastBlock, params, dep));
+    // While STARTED, the activation height is not known.
+    BOOST_CHECK(!versionbitscache.KnownActivationHeight(lastBlock, params, dep));
 
     // Mine another period worth of blocks, signaling the new bit.
     lastBlock = secondChain.Mine(period * 2, nTime, VERSIONBITS_TOP_BITS | (1<<bit)).Tip();
@@ -418,12 +420,17 @@ void check_computeblockversion(VersionBitsCache& versionbitscache, const Consens
     // We keep setting the bit for one more period though, until activation.
     BOOST_CHECK((versionbitscache.ComputeBlockVersion(lastBlock, params) & (1 << bit)) != 0);
     BOOST_CHECK(!versionbitscache.IsActiveAfter(lastBlock, params, dep));
+    // From lock-in, the activation height is known: the next period, or
+    // min_activation_height if that is later.
+    const int expected_activation_height{std::max(static_cast<int>(period) * 3, min_activation_height)};
+    BOOST_CHECK_EQUAL(versionbitscache.KnownActivationHeight(lastBlock, params, dep).value_or(-1), expected_activation_height);
 
     // Now check that we keep mining the block until the end of this period, and
     // then stop at the beginning of the next period.
     lastBlock = secondChain.Mine((period * 3) - 1, nTime, VERSIONBITS_LAST_OLD_BLOCK_VERSION).Tip();
     BOOST_CHECK((versionbitscache.ComputeBlockVersion(lastBlock, params) & (1 << bit)) != 0);
     BOOST_CHECK(!versionbitscache.IsActiveAfter(lastBlock, params, dep));
+    BOOST_CHECK_EQUAL(versionbitscache.KnownActivationHeight(lastBlock, params, dep).value_or(-1), expected_activation_height);
     lastBlock = secondChain.Mine(period * 3, nTime, VERSIONBITS_LAST_OLD_BLOCK_VERSION).Tip();
 
     if (lastBlock->nHeight + 1 < min_activation_height) {
@@ -431,6 +438,7 @@ void check_computeblockversion(VersionBitsCache& versionbitscache, const Consens
         lastBlock = secondChain.Mine(min_activation_height - 1, nTime, VERSIONBITS_LAST_OLD_BLOCK_VERSION).Tip();
         BOOST_CHECK((versionbitscache.ComputeBlockVersion(lastBlock, params) & (1 << bit)) != 0);
         BOOST_CHECK(!versionbitscache.IsActiveAfter(lastBlock, params, dep));
+        BOOST_CHECK_EQUAL(versionbitscache.KnownActivationHeight(lastBlock, params, dep).value_or(-1), expected_activation_height);
         // then reach min_activation_height, which was already REQUIRE'd to start a new period
         lastBlock = secondChain.Mine(min_activation_height, nTime, VERSIONBITS_LAST_OLD_BLOCK_VERSION).Tip();
     }
@@ -438,6 +446,8 @@ void check_computeblockversion(VersionBitsCache& versionbitscache, const Consens
     // Check that we don't signal after activation
     BOOST_CHECK_EQUAL(versionbitscache.ComputeBlockVersion(lastBlock, params) & (1 << bit), 0);
     BOOST_CHECK(versionbitscache.IsActiveAfter(lastBlock, params, dep));
+    BOOST_CHECK_EQUAL(versionbitscache.KnownActivationHeight(lastBlock, params, dep).value_or(-1), expected_activation_height);
+    BOOST_CHECK_EQUAL(versionbitscache.ActivationHeight(lastBlock, params, dep).value_or(-1), expected_activation_height);
 }
 }; // struct BlockVersionTest
 
