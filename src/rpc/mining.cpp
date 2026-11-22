@@ -83,6 +83,7 @@ using node::BlockAssembler;
 using node::GetMinimumTime;
 using node::NodeContext;
 using node::RegenerateCommitments;
+using node::UpdateDemurrageContribution;
 using node::UpdateTime;
 using util::ToString;
 
@@ -411,10 +412,12 @@ static RPCMethod generateblock()
             block = block_template->block;
         }
 
-        CHECK_NONFATAL(block.vtx.size() == 1);
+        // The template has a coinbase, and a BIP 462b claim transaction if the block needs one.
+        CHECK_NONFATAL(block.vtx.size() == 1 || block.vtx.size() == 2);
 
         // Add transactions
         block.vtx.insert(block.vtx.end(), txs.begin(), txs.end());
+        UpdateDemurrageContribution(block, chainman);
         RegenerateCommitments(block, chainman);
 
         if (BlockValidationState state{TestBlockValidity(chainman.ActiveChainstate(), block, /*check_pow=*/false, /*check_merkle_root=*/false)}; !state.IsValid()) {

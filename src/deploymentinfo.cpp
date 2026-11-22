@@ -13,6 +13,12 @@ const std::array<VBDeploymentInfo,Consensus::MAX_VERSION_BITS_DEPLOYMENTS> Versi
         .name = "testdummy",
         .gbt_optional_rule = true,
     },
+    VBDeploymentInfo{
+        // BIP 462b: a template's coinbase must pay the demurrage contribution,
+        // so clients cannot ignore this rule.
+        .name = "demurrage",
+        .gbt_optional_rule = false,
+    },
 };
 
 std::string DeploymentName(Consensus::BuriedDeployment dep)

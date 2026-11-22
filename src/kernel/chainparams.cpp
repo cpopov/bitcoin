@@ -95,6 +95,10 @@ void CChainParams::ApplyDeploymentOptions(const DeploymentOptions& opts)
         }
     }
 
+    if (opts.demurrage_activation_height) {
+        consensus.DemurrageTestActivationHeight = *opts.demurrage_activation_height;
+    }
+
     for (const auto& [deployment_pos, version_bits_params] : opts.version_bits_parameters) {
         consensus.vDeployments[deployment_pos].nStartTime = version_bits_params.start_time;
         consensus.vDeployments[deployment_pos].nTimeout = version_bits_params.timeout;
@@ -135,6 +139,17 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0; // No activation delay
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1815; // 90%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
+
+        // Deployment of BIP 462b (soft-fork demurrage). Activation parameters are not set at draft stage.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].bit = 4;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1815; // 90%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        consensus.DemurrageRatePeriod = 2016;
+        consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
+        consensus.DemurrageTargetDenominator = 52'560'000;
 
         ApplyDeploymentOptions(opts.dep_opts);
 
@@ -267,6 +282,17 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1512; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
 
+        // Deployment of BIP 462b (soft-fork demurrage). Activation parameters are not set at draft stage.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].bit = 4;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1512; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        consensus.DemurrageRatePeriod = 2016;
+        consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
+        consensus.DemurrageTargetDenominator = 52'560'000;
+
         ApplyDeploymentOptions(opts.dep_opts);
 
         consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000017f49f702147f10c0eb6"};
@@ -374,6 +400,17 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0; // No activation delay
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1512; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
+
+        // Deployment of BIP 462b (soft-fork demurrage). Activation parameters are not set at draft stage.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].bit = 4;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1512; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        consensus.DemurrageRatePeriod = 2016;
+        consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
+        consensus.DemurrageTargetDenominator = 52'560'000;
 
         ApplyDeploymentOptions(opts.dep_opts);
 
@@ -527,6 +564,17 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1815; // 90%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
 
+        // Deployment of BIP 462b (soft-fork demurrage). Activation parameters are not set at draft stage.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].bit = 4;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1815; // 90%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        consensus.DemurrageRatePeriod = 2016;
+        consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
+        consensus.DemurrageTargetDenominator = 52'560'000;
+
         ApplyDeploymentOptions(options.dep_opts);
 
         pchMessageStart = kernel::GetSignetMessageStart(consensus.signet_challenge);
@@ -613,6 +661,21 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0; // No activation delay
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 108; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 144; // Faster than normal for regtest (144 instead of 2016)
+
+        // Deployment of BIP 462b (soft-fork demurrage). Activation parameters are not set at draft stage.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].bit = 4;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 108; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 144;
+        // Regtest halves the subsidy every 150 blocks, so the mainnet target is met by
+        // the subsidy for thousands of blocks. A higher target (1/2,000 of the scheduled
+        // supply per block) and rate periods matching the version bits period make
+        // charges non-zero from the second rate period after activation at a multiple of 144.
+        consensus.DemurrageRatePeriod = 144;
+        consensus.DemurrageTargetNumerator = 1;
+        consensus.DemurrageTargetDenominator = 2000;
 
         consensus.nMinimumChainWork = uint256{};
         consensus.defaultAssumeValid = uint256{};

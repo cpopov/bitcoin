@@ -43,6 +43,7 @@ add_executable(test_bitcoin
   crypto_tests.cpp
   cuckoocache_tests.cpp
   dbwrapper_tests.cpp
+  demurrage_tests.cpp
   denialofservice_tests.cpp
   descriptor_tests.cpp
   disconnected_transactions.cpp

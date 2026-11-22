@@ -194,6 +194,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   bip324.cpp
   blockencodings.cpp
   blockfilter.cpp
+  consensus/demurrage.cpp
   consensus/tx_verify.cpp
   dbwrapper.cpp
   deploymentstatus.cpp

@@ -80,6 +80,7 @@ private:
     const bool spendsCoinbase;      //!< keep track of transactions that spend a coinbase
     const int64_t sigOpCost;        //!< Total sigop cost
     mutable CAmount m_modified_fee; //!< Used for determining the priority of the transaction for mining in a block
+    mutable CAmount m_demurrage_charge{0}; //!< BIP 462b: charge of the inputs at the evaluation height, deducted from m_modified_fee
     mutable LockPoints lockPoints;  //!< Track the height and time at which tx was final
 
 public:
@@ -125,6 +126,15 @@ public:
     void UpdateModifiedFee(CAmount fee_diff) const
     {
         m_modified_fee = SaturatingAdd(m_modified_fee, fee_diff);
+    }
+
+    CAmount GetDemurrageCharge() const { return m_demurrage_charge; }
+
+    // BIP 462b: replace the demurrage charge deducted from the modified fee.
+    void UpdateDemurrageCharge(CAmount charge) const
+    {
+        UpdateModifiedFee(m_demurrage_charge - charge);
+        m_demurrage_charge = charge;
     }
 
     // Update the LockPoints after a reorg

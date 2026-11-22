@@ -359,6 +359,15 @@ public:
     void ApplyDelta(const Txid& hash, CAmount &nFeeDelta) const EXCLUSIVE_LOCKS_REQUIRED(cs);
     void ClearPrioritisation(const Txid& hash) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
+    /**
+     * BIP 462b policy: the ACTIVATION_HEIGHT and evaluation height at which the
+     * demurrage charges of the entries were last computed, or nullopt if no
+     * charge applied then. Entries rank by modified fee, which excludes the charge.
+     */
+    std::optional<std::pair<int, int>> m_demurrage_evaluation GUARDED_BY(cs);
+    /** BIP 462b policy: replace the demurrage charge that an entry's modified fee excludes. */
+    void SetDemurrageCharge(txiter it, CAmount charge) EXCLUSIVE_LOCKS_REQUIRED(cs);
+
     struct delta_info {
         /** Whether this transaction is in the mempool. */
         const bool in_mempool;
@@ -664,7 +673,7 @@ public:
 
         using TxHandle = CTxMemPool::txiter;
 
-        TxHandle StageAddition(const CTransactionRef& tx, CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp);
+        TxHandle StageAddition(const CTransactionRef& tx, CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp, CAmount demurrage_charge = 0);
 
         void StageRemoval(CTxMemPool::txiter it);
 

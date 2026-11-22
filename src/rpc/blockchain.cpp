@@ -1336,6 +1336,17 @@ static void SoftForkDescPushBack(const CBlockIndex* blockindex, UniValue& softfo
     if (!DeploymentEnabled(chainman, id)) return;
     if (blockindex == nullptr) return;
 
+    // BIP 462b: -testactivationheight=demurrage@height overrides version bits,
+    // so report it as a deployment active from a fixed height.
+    if (const auto& forced_height{chainman.GetConsensus().DemurrageTestActivationHeight}; id == Consensus::DEPLOYMENT_DEMURRAGE && forced_height) {
+        UniValue rv(UniValue::VOBJ);
+        rv.pushKV("type", "buried");
+        rv.pushKV("active", DeploymentActiveAfter(blockindex, chainman, id));
+        rv.pushKV("height", *forced_height);
+        softforks.pushKV(DeploymentName(id), std::move(rv));
+        return;
+    }
+
     UniValue bip9(UniValue::VOBJ);
     BIP9Info info{chainman.m_versionbitscache.Info(*blockindex, chainman.GetConsensus(), id)};
     const auto& depparams{chainman.GetConsensus().vDeployments[id]};
@@ -1528,6 +1539,7 @@ UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& 
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_CSV);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_SEGWIT);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TESTDUMMY);
+    SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_DEMURRAGE);
     return softforks;
 }
 } // anon namespace

@@ -140,6 +140,8 @@ public:
     struct DeploymentOptions {
         std::unordered_map<Consensus::DeploymentPos, VersionBitsParameters> version_bits_parameters{};
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
+        /** BIP 462b: height from which the demurrage rules apply, regardless of version bits. */
+        std::optional<int> demurrage_activation_height{};
     };
 
     /**

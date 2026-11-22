@@ -7,9 +7,11 @@
 
 #include <chain.h>
 #include <chainparams.h>
+#include <coins.h>
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/tx_verify.h>
@@ -30,6 +32,7 @@
 #include <uint256.h>
 #include <util/check.h>
 #include <util/feefrac.h>
+#include <util/hasher.h>
 #include <util/log.h>
 #include <util/result.h>
 #include <util/time.h>
@@ -43,6 +46,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace node {
@@ -141,6 +145,28 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     assert(pindexPrev != nullptr);
     nHeight = pindexPrev->nHeight + 1;
 
+    // BIP 462b: the claim transaction is determined by the chain alone. It
+    // goes at index 1 once the other transactions have been selected.
+    ChainstateManager& chainman{m_chainstate.m_chainman};
+    const std::optional<int> demurrage_activation{chainman.DemurrageActivationHeight(pindexPrev)};
+    CTransactionRef claim_tx;
+    CAmount claim_fee{0};
+    if (demurrage_activation) {
+        std::vector<COutPoint> pool_inputs;
+        if (!chainman.GetDemurragePoolInputs(*pindexPrev, *demurrage_activation, pool_inputs)) {
+            throw std::runtime_error("Failed to find the demurrage pool inputs");
+        }
+        if (!pool_inputs.empty()) {
+            CAmount pool_value{0};
+            for (const COutPoint& outpoint : pool_inputs) {
+                pool_value += Assert(m_chainstate.CoinsTip().GetCoin(outpoint))->out.nValue;
+            }
+            claim_tx = MakeTransactionRef(demurrage::BuildClaimTransaction(pool_inputs, pool_value));
+            claim_fee = demurrage::PoolPayout(pool_value);
+            nBlockWeight += GetTransactionWeight(*claim_tx);
+        }
+    }
+
     pblock->nVersion = m_chainstate.m_chainman.m_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
     // -regtest only: allow overriding block.nVersion with
     // -blockversion=N to test forking scenarios
@@ -160,6 +186,21 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
 
     const auto time_1{SteadyClock::now()};
 
+    // BIP 462b: the block owes the charge of every input it spends, except the
+    // claim transaction's, and the coinbase pays it as the contribution.
+    CAmount demurrage_contribution{0};
+    if (demurrage_activation) {
+        demurrage_contribution = GetBlockDemurrageCharge(std::span{pblock->vtx}.subspan(1), m_chainstate.CoinsTip(),
+                                                         chainman.DemurrageSchedule(*demurrage_activation), nHeight);
+        if (claim_tx) {
+            pblock->vtx.insert(pblock->vtx.begin() + 1, claim_tx);
+            pblocktemplate->vTxFees.insert(pblocktemplate->vTxFees.begin(), claim_fee);
+            pblocktemplate->vTxSigOpsCost.insert(pblocktemplate->vTxSigOpsCost.begin(), GetLegacySigOpCount(*claim_tx) * WITNESS_SCALE_FACTOR);
+            ++nBlockTx;
+            nFees += claim_fee;
+        }
+    }
+
     m_last_block_num_txs = nBlockTx;
     m_last_block_weight = nBlockWeight;
 
@@ -178,10 +219,16 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // Add an output that spends the full coinbase reward.
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
-    // Block subsidy + fees
+    // Block subsidy + fees, less the demurrage contribution
     const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
-    coinbaseTx.vout[0].nValue = block_reward;
-    coinbase_tx.block_reward_remaining = block_reward;
+    if (demurrage_contribution > block_reward) {
+        throw std::runtime_error(strprintf("Demurrage contribution %d exceeds the block reward %d", demurrage_contribution, block_reward));
+    }
+    coinbaseTx.vout[0].nValue = block_reward - demurrage_contribution;
+    coinbase_tx.block_reward_remaining = block_reward - demurrage_contribution;
+    if (demurrage_contribution > 0) {
+        coinbaseTx.vout.emplace_back(demurrage_contribution, demurrage::PoolScript());
+    }
 
     // Start the coinbase scriptSig with the block height as required by BIP34.
     // Mining clients are expected to append extra data to this prefix, so
@@ -214,6 +261,9 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         // element of 32 bytes.
         Assert(witness_stack.size() == 1 && witness_stack[0].size() == 32);
         coinbase_tx.witness = uint256(witness_stack[0]);
+    }
+    if (demurrage_contribution > 0) {
+        coinbase_tx.required_outputs.push_back(final_coinbase->vout.at(1));
     }
     if (const int witness_index = GetWitnessCommitmentIndex(*pblock); witness_index != NO_WITNESS_COMMITMENT) {
         Assert(witness_index >= 0 && static_cast<size_t>(witness_index) < final_coinbase->vout.size());
@@ -344,6 +394,61 @@ void BlockAssembler::addChunks()
         chunk_feerate = m_mempool->GetBlockBuilderChunk(selected_transactions);
         chunk_feerate_vsize = ToFeePerVSize(chunk_feerate);
     }
+}
+
+CAmount GetBlockDemurrageCharge(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
+                                demurrage::IndexSchedule& schedule, int height)
+{
+    std::unordered_set<Txid, SaltedTxidHasher> earlier_txids;
+    CAmount charge{0};
+    for (const CTransactionRef& tx : txs) {
+        for (const CTxIn& txin : tx->vin) {
+            // An output created in the same block has no charge.
+            if (earlier_txids.contains(txin.prevout.hash)) continue;
+            const Coin& coin{coins.AccessCoin(txin.prevout)};
+            if (coin.IsSpent()) continue; // Block validation will reject it.
+            charge += schedule.ChargeFor(coin.out.nValue, coin.nHeight, height);
+        }
+        earlier_txids.insert(tx->GetHash());
+    }
+    return charge;
+}
+
+void UpdateDemurrageContribution(CBlock& block, ChainstateManager& chainman)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* prev{chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock)};
+    if (!prev) return;
+    const auto activation{chainman.DemurrageActivationHeight(prev)};
+    if (!activation) return;
+    std::vector<COutPoint> pool_inputs;
+    if (!chainman.GetDemurragePoolInputs(*prev, *activation, pool_inputs)) {
+        throw std::runtime_error("Failed to find the demurrage pool inputs");
+    }
+    const size_t first_charged{pool_inputs.empty() ? size_t{1} : size_t{2}};
+    const CAmount charge{block.vtx.size() > first_charged ?
+        GetBlockDemurrageCharge(std::span{block.vtx}.subspan(first_charged), chainman.ActiveChainstate().CoinsTip(),
+                                chainman.DemurrageSchedule(*activation), prev->nHeight + 1) :
+        CAmount{0}};
+
+    CMutableTransaction coinbase{*block.vtx.at(0)};
+    // Return any previous contribution to the first output.
+    for (auto it{coinbase.vout.begin()}; it != coinbase.vout.end();) {
+        if (demurrage::IsPoolScript(it->scriptPubKey)) {
+            coinbase.vout[0].nValue += it->nValue;
+            it = coinbase.vout.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (charge > 0) {
+        if (coinbase.vout[0].nValue < charge) {
+            throw std::runtime_error(strprintf("Demurrage charge %d exceeds the coinbase output %d", charge, coinbase.vout[0].nValue));
+        }
+        coinbase.vout[0].nValue -= charge;
+        coinbase.vout.insert(coinbase.vout.begin() + 1, CTxOut{charge, demurrage::PoolScript()});
+    }
+    block.vtx[0] = MakeTransactionRef(std::move(coinbase));
 }
 
 void AddMerkleRootAndCoinbase(CBlock& block, CTransactionRef coinbase, uint32_t version, uint32_t timestamp, uint32_t nonce)

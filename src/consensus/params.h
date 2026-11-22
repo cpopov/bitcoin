@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace Consensus {
@@ -37,6 +38,7 @@ constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_
 
 enum DeploymentPos : uint16_t {
     DEPLOYMENT_TESTDUMMY,
+    DEPLOYMENT_DEMURRAGE, // Deployment of BIP 462b (soft-fork demurrage).
     // NOTE: Also add new deployments to VersionBitsDeploymentInfo in deploymentinfo.cpp
     // Removing an entry may require bumping MinBIP9WarningHeight.
     MAX_VERSION_BITS_DEPLOYMENTS
@@ -112,6 +114,21 @@ struct Params {
      * This prevents us from warning about the CSV, segwit and taproot activations. */
     int MinBIP9WarningHeight;
     std::array<BIP9Deployment,MAX_VERSION_BITS_DEPLOYMENTS> vDeployments;
+    /**
+     * BIP 462b (soft-fork demurrage). The demurrage rate is set for each rate
+     * period of DemurrageRatePeriod blocks, so that the block subsidy plus the
+     * demurrage meets a target of DemurrageTargetNumerator /
+     * DemurrageTargetDenominator of the scheduled supply per block (0.30% per
+     * year on mainnet).
+     */
+    int DemurrageRatePeriod{2016};
+    uint64_t DemurrageTargetNumerator{3};
+    uint64_t DemurrageTargetDenominator{52'560'000};
+    /**
+     * Test-only (-testactivationheight=demurrage@height): if set, the BIP 462b
+     * rules apply from this height, whatever the version bits state.
+     */
+    std::optional<int> DemurrageTestActivationHeight;
     /** Proof of work parameters */
     uint256 powLimit;
     bool fPowAllowMinDifficultyBlocks;

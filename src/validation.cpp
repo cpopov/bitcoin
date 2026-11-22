@@ -13,6 +13,7 @@
 #include <clientversion.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
@@ -385,8 +386,61 @@ void Chainstate::MaybeUpdateMempoolForReorg(
 
     // We also need to remove any now-immature transactions
     m_mempool->removeForReorg(m_chain, filter_final_and_mature);
+    // The re-added transactions' children now spend unconfirmed outputs, and
+    // the evaluation height may have moved back.
+    UpdateMempoolDemurrageCharges(/*connected_block=*/nullptr);
     // Re-limit mempool size, in case we added any transactions
     LimitMempoolSize(*m_mempool, this->CoinsTip());
+}
+
+void Chainstate::UpdateMempoolDemurrageCharges(const CBlock* connected_block)
+{
+    if (!m_mempool) return;
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_mempool->cs);
+
+    const CBlockIndex* tip{m_chain.Tip()};
+    std::optional<std::pair<int, int>> evaluation;
+    if (tip) {
+        if (const auto activation{m_chainman.DemurrageActivationHeight(tip)}) {
+            evaluation.emplace(*activation, demurrage::EvaluationHeight(tip->nHeight + 1));
+        }
+    }
+    // Without a charge then or now, every entry's charge is zero.
+    if (!evaluation && !m_mempool->m_demurrage_evaluation) return;
+    const bool update_all{connected_block == nullptr || evaluation != m_mempool->m_demurrage_evaluation};
+    m_mempool->m_demurrage_evaluation = evaluation;
+    if (m_mempool->size() == 0) return;
+
+    std::vector<CTxMemPool::txiter> entries;
+    if (update_all) {
+        entries.reserve(m_mempool->mapTx.size());
+        for (auto it{m_mempool->mapTx.begin()}; it != m_mempool->mapTx.end(); ++it) entries.push_back(it);
+    } else {
+        // Only the entries spending outputs of the connected block now have
+        // confirmed inputs that they did not have before.
+        for (const auto& tx : connected_block->vtx) {
+            for (uint32_t n{0}; n < tx->vout.size(); ++n) {
+                if (const auto spender{m_mempool->mapNextTx.find(COutPoint{tx->GetHash(), n})}; spender != m_mempool->mapNextTx.end()) {
+                    entries.push_back(spender->second);
+                }
+            }
+        }
+    }
+
+    demurrage::IndexSchedule* schedule{evaluation ? &m_chainman.DemurrageSchedule(evaluation->first) : nullptr};
+    for (const CTxMemPool::txiter it : entries) {
+        CAmount charge{0};
+        if (schedule) {
+            for (const CTxIn& txin : it->GetTx().vin) {
+                if (m_mempool->exists(txin.prevout.hash)) continue;
+                const Coin& coin{CoinsTip().AccessCoin(txin.prevout)};
+                if (coin.IsSpent()) continue;
+                charge += schedule->ChargeFor(coin.out.nValue, coin.nHeight, evaluation->second);
+            }
+        }
+        m_mempool->SetDemurrageCharge(it, charge);
+    }
 }
 
 /**
@@ -793,6 +847,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     if (tx.IsCoinBase())
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
 
+    // BIP 462b policy: pool outputs are only created and spent in blocks.
+    if (std::ranges::any_of(tx.vout, [](const CTxOut& txout) { return demurrage::IsPoolScript(txout.scriptPubKey); })) {
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "demurrage-pool-output");
+    }
+
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
     if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes, m_pool.m_opts.permit_bare_multisig, m_pool.m_opts.dust_relay_feerate, reason)) {
@@ -883,6 +942,25 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return false; // state filled in by CheckTxInputs
     }
 
+    // BIP 462b policy: transactions rank by net fee, their fee less the charge
+    // of their confirmed inputs at the evaluation height. An input spending an
+    // unconfirmed output is assumed to confirm in the same block, so it has no
+    // charge.
+    CAmount demurrage_charge{0};
+    const CBlockIndex* tip{Assert(m_active_chainstate.m_chain.Tip())};
+    if (const auto demurrage_activation{m_active_chainstate.m_chainman.DemurrageActivationHeight(tip)}) {
+        auto& schedule{m_active_chainstate.m_chainman.DemurrageSchedule(*demurrage_activation)};
+        const int evaluation_height{demurrage::EvaluationHeight(tip->nHeight + 1)};
+        for (const CTxIn& txin : tx.vin) {
+            const Coin& coin{m_view.AccessCoin(txin.prevout)};
+            if (coin.nHeight == MEMPOOL_HEIGHT) continue;
+            if (demurrage::IsPoolScript(coin.out.scriptPubKey) && static_cast<int>(coin.nHeight) >= *demurrage_activation) {
+                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "demurrage-pool-spend");
+            }
+            demurrage_charge += schedule.ChargeFor(coin.out.nValue, coin.nHeight, evaluation_height);
+        }
+    }
+
     if (m_pool.m_opts.require_standard) {
         state = ValidateInputsStandardness(tx, m_view);
         if (state.IsInvalid()) {
@@ -914,16 +992,18 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     if (!m_subpackage.m_changeset) {
         m_subpackage.m_changeset = m_pool.GetChangeSet();
     }
-    ws.m_tx_handle = m_subpackage.m_changeset->StageAddition(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence, fSpendsCoinbase, nSigOpsCost, lock_points.value());
+    ws.m_tx_handle = m_subpackage.m_changeset->StageAddition(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence, fSpendsCoinbase, nSigOpsCost, lock_points.value(), demurrage_charge);
 
-    // ws.m_modified_fees includes any fee deltas from PrioritiseTransaction
+    // ws.m_modified_fees includes any fee deltas from PrioritiseTransaction,
+    // less the demurrage charge (BIP 462b)
     ws.m_modified_fees = ws.m_tx_handle->GetModifiedFee();
 
     ws.m_vsize = ws.m_tx_handle->GetTxSize();
 
-    // Enforces 0-fee for dust transactions, no incentive to be mined alone
+    // Enforces 0-fee for dust transactions, no incentive to be mined alone.
+    // The demurrage charge is not a fee the transaction pays, so it does not count.
     if (m_pool.m_opts.require_standard) {
-        if (!PreCheckEphemeralTx(*ptx, m_pool.m_opts.dust_relay_feerate, ws.m_base_fees, ws.m_modified_fees, state)) {
+        if (!PreCheckEphemeralTx(*ptx, m_pool.m_opts.dust_relay_feerate, ws.m_base_fees, ws.m_modified_fees + demurrage_charge, state)) {
             return false; // state filled in by PreCheckEphemeralTx
         }
     }
@@ -2557,6 +2637,30 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // Get the script flags for this block
     script_verify_flags flags{GetBlockScriptFlags(*pindex, m_chainman)};
 
+    // BIP 462b (soft-fork demurrage): find the pool inputs, which the claim
+    // transaction at index 1 must spend. Their coins are only read when that
+    // transaction is reached, because inputs are prefetched in block order.
+    const std::optional<int> demurrage_activation{m_chainman.DemurrageActivationHeight(pindex->pprev)};
+    demurrage::IndexSchedule* demurrage_schedule{nullptr};
+    std::vector<COutPoint> pool_inputs;
+    CAmount block_charge{0};
+    if (demurrage_activation) {
+        demurrage_schedule = &m_chainman.DemurrageSchedule(*demurrage_activation);
+        if (!m_chainman.GetDemurragePoolInputs(*pindex->pprev, *demurrage_activation, pool_inputs)) {
+            return FatalError(m_chainman.GetNotifications(), state, _("Failed to read a block to find the demurrage pool outputs."));
+        }
+        if (!pool_inputs.empty()) {
+            const auto spends_pool_input{[&](const CTxIn& txin) { return std::ranges::find(pool_inputs, txin.prevout) != pool_inputs.end(); }};
+            if (block.vtx.size() < 2 || std::ranges::none_of(block.vtx[1]->vin, spends_pool_input)) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-claim-missing",
+                              "the transaction at index 1 does not spend the demurrage pool inputs");
+            } else if (!std::ranges::equal(block.vtx[1]->vin, pool_inputs, {}, &CTxIn::prevout)) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-claim",
+                              "the transaction at index 1 does not spend exactly the demurrage pool inputs, in order");
+            }
+        }
+    }
+
     const auto time_2{SteadyClock::now()};
     m_chainman.time_forks += time_2 - time_1;
     LogDebug(BCLog::BENCH, "    - Fork checks: %.2fms [%.2fs (%.2fms/blk)]\n",
@@ -2600,6 +2704,32 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
         nInputs += tx.vin.size();
 
+        // BIP 462b: the claim transaction at index 1 is the only one that may
+        // spend pool outputs, and the only one besides the coinbase that may
+        // create an output with POOL_SCRIPT.
+        const bool is_claim{i == 1 && !pool_inputs.empty()};
+        if (is_claim) {
+            CAmount pool_value{0};
+            for (const CTxIn& txin : tx.vin) {
+                const Coin& coin{view.AccessCoin(txin.prevout)};
+                if (coin.IsSpent() || !demurrage::IsPoolScript(coin.out.scriptPubKey)) {
+                    return FatalError(m_chainman.GetNotifications(), state, _("A demurrage pool output is missing from the UTXO set."));
+                }
+                pool_value += coin.out.nValue;
+            }
+            const CTransaction claim{demurrage::BuildClaimTransaction(pool_inputs, pool_value)};
+            if (tx.GetWitnessHash() != claim.GetWitnessHash()) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-claim",
+                              strprintf("the transaction at index 1 is not the demurrage claim transaction %s", claim.GetHash().ToString()));
+                break;
+            }
+        } else if (demurrage_schedule && !tx.IsCoinBase() &&
+                   std::ranges::any_of(tx.vout, [](const CTxOut& txout) { return demurrage::IsPoolScript(txout.scriptPubKey); })) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-pool-create",
+                          "transaction " + tx.GetHash().ToString() + " creates a demurrage pool output");
+            break;
+        }
+
         if (!tx.IsCoinBase())
         {
             CAmount txfee = 0;
@@ -2630,6 +2760,30 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal",
                               "contains a non-BIP68-final transaction " + tx.GetHash().ToString());
                 break;
+            }
+
+            // BIP 462b: every input but the claim transaction's owes a charge,
+            // and none may spend a pool output.
+            if (demurrage_schedule && !is_claim) {
+                bool spends_pool{false};
+                for (const CTxIn& txin : tx.vin) {
+                    const Coin& coin{view.AccessCoin(txin.prevout)};
+                    if (demurrage::IsPoolScript(coin.out.scriptPubKey) && static_cast<int>(coin.nHeight) >= *demurrage_activation) {
+                        spends_pool = true;
+                        break;
+                    }
+                    block_charge += demurrage_schedule->ChargeFor(coin.out.nValue, coin.nHeight, pindex->nHeight);
+                }
+                if (spends_pool) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-pool-spend",
+                                  "transaction " + tx.GetHash().ToString() + " spends a demurrage pool output");
+                    break;
+                }
+                if (!MoneyRange(block_charge)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-charge-outofrange",
+                                  "accumulated demurrage charge in the block out of range");
+                    break;
+                }
             }
         }
 
@@ -2684,6 +2838,27 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
     }
+    // BIP 462b: the coinbase pays exactly the block charge into one pool output, the contribution.
+    if (demurrage_schedule && state.IsValid()) {
+        const auto& coinbase_outputs{block.vtx[0]->vout};
+        const auto num_pool_outputs{std::ranges::count_if(coinbase_outputs, [](const CTxOut& txout) { return demurrage::IsPoolScript(txout.scriptPubKey); })};
+        if (num_pool_outputs > 1) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-demurrage-multiple",
+                          strprintf("coinbase creates %d demurrage pool outputs", num_pool_outputs));
+        } else if (num_pool_outputs == 0 && block_charge > 0) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-demurrage-missing",
+                          strprintf("coinbase does not pay the demurrage charge (charge=%d)", block_charge));
+        } else if (num_pool_outputs == 1 && block_charge == 0) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-demurrage-unexpected",
+                          "coinbase creates a demurrage pool output but the block owes no charge");
+        } else if (num_pool_outputs == 1) {
+            const auto contribution{std::ranges::find_if(coinbase_outputs, [](const CTxOut& txout) { return demurrage::IsPoolScript(txout.scriptPubKey); })};
+            if (contribution->nValue != block_charge) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-demurrage-amount",
+                              strprintf("coinbase demurrage contribution is wrong (actual=%d vs charge=%d)", contribution->nValue, block_charge));
+            }
+        }
+    }
     if (control) {
         auto parallel_result = control->Complete();
         if (parallel_result.has_value() && state.IsValid()) {
@@ -2704,6 +2879,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     if (fJustCheck) {
         return true;
+    }
+
+    if (demurrage_activation) {
+        m_chainman.RecordDemurragePoolOutputs(*pindex, demurrage::FindBlockPoolOutputs(block));
     }
 
     if (!m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {
@@ -3158,6 +3337,7 @@ bool Chainstate::ConnectTip(
     // Update m_chain & related variables.
     m_chain.SetTip(*pindexNew);
     m_chainman.UpdateIBDStatus();
+    if (m_mempool) UpdateMempoolDemurrageCharges(block_to_connect.get());
     // Not fired while IBD is active. removeForBlock() above still runs.
     if (m_mempool && m_chainman.m_options.signals && !m_chainman.IsInitialBlockDownload()) {
         m_chainman.m_options.signals->MempoolTransactionsRemovedForBlock(block_to_connect, std::move(txs_removed_for_block), pindexNew->nHeight);
@@ -6495,4 +6675,66 @@ util::Result<void> ChainstateManager::ActivateBestChains()
         }
     }
     return {};
+}
+
+demurrage::IndexSchedule& ChainstateManager::DemurrageSchedule(int activation_height)
+{
+    AssertLockHeld(::cs_main);
+    if (!m_demurrage_schedule || m_demurrage_schedule->ActivationHeight() != activation_height) {
+        m_demurrage_schedule.emplace(GetConsensus(), activation_height);
+    }
+    return *m_demurrage_schedule;
+}
+
+void ChainstateManager::RecordDemurragePoolOutputs(const CBlockIndex& index, const demurrage::BlockPoolOutputs& outputs)
+{
+    AssertLockHeld(::cs_main);
+    // A block's pool inputs come from the previous block and the block
+    // COINBASE_MATURITY below it, so older entries are rarely needed again.
+    // Blocks whose entry was dropped are read from disk.
+    static constexpr size_t MAX_ENTRIES{4 * COINBASE_MATURITY};
+    if (m_demurrage_pool_outputs.size() >= MAX_ENTRIES) {
+        const int min_height{index.nHeight - COINBASE_MATURITY - 1};
+        std::erase_if(m_demurrage_pool_outputs, [&](const auto& entry) { return entry.first->nHeight < min_height; });
+    }
+    m_demurrage_pool_outputs.insert_or_assign(&index, outputs);
+}
+
+std::optional<demurrage::BlockPoolOutputs> ChainstateManager::GetDemurragePoolOutputs(const CBlockIndex& index)
+{
+    AssertLockHeld(::cs_main);
+    if (const auto it{m_demurrage_pool_outputs.find(&index)}; it != m_demurrage_pool_outputs.end()) {
+        return it->second;
+    }
+    // The block has been connected, so it passed validation: only its coinbase
+    // and its claim transaction can have created pool outputs.
+    CBlock block;
+    if (!m_blockman.ReadBlock(block, index)) {
+        LogError("Failed to read block %s to find its demurrage pool outputs", index.GetBlockHash().ToString());
+        return std::nullopt;
+    }
+    const demurrage::BlockPoolOutputs outputs{demurrage::FindBlockPoolOutputs(block)};
+    RecordDemurragePoolOutputs(index, outputs);
+    return outputs;
+}
+
+bool ChainstateManager::GetDemurragePoolInputs(const CBlockIndex& prev, int activation_height, std::vector<COutPoint>& pool_inputs)
+{
+    AssertLockHeld(::cs_main);
+    pool_inputs.clear();
+    const int height{prev.nHeight + 1};
+    // The carry: output 0 of the claim transaction of the previous block.
+    if (prev.nHeight >= activation_height) {
+        const auto outputs{GetDemurragePoolOutputs(prev)};
+        if (!outputs) return false;
+        if (outputs->carry) pool_inputs.push_back(*outputs->carry);
+    }
+    // The matured contribution: that of the block COINBASE_MATURITY blocks below.
+    if (const int matured_height{height - COINBASE_MATURITY}; matured_height >= activation_height) {
+        const CBlockIndex* matured{Assert(prev.GetAncestor(matured_height))};
+        const auto outputs{GetDemurragePoolOutputs(*matured)};
+        if (!outputs) return false;
+        if (outputs->contribution) pool_inputs.push_back(*outputs->contribution);
+    }
+    return true;
 }

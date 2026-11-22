@@ -12,6 +12,7 @@
 #include <checkqueue.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <cuckoocache.h>
 #include <deploymentstatus.h>
 #include <kernel/chain.h>
@@ -48,6 +49,7 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -893,6 +895,14 @@ protected:
         DisconnectedBlockTransactions& disconnectpool,
         bool fAddToMempool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
+    /**
+     * BIP 462b policy: recompute the demurrage charges of mempool entries at
+     * the evaluation height of the next block. Only the entries spending
+     * outputs of connected_block are recomputed if it is given and neither the
+     * evaluation height nor the activation height has changed.
+     */
+    void UpdateMempoolDemurrageCharges(const CBlock* connected_block) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+
     /** Check warning conditions and do some notifications on new chain tip set. */
     void UpdateTip(const CBlockIndex* pindexNew)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
@@ -1209,6 +1219,37 @@ public:
      * Track versionbit status
      */
     mutable VersionBitsCache m_versionbitscache;
+
+    /** BIP 462b: if the demurrage rules apply to the block after pindexPrev, ACTIVATION_HEIGHT. */
+    std::optional<int> DemurrageActivationHeight(const CBlockIndex* pindexPrev) const
+    {
+        return ::DemurrageActivationHeight(pindexPrev, GetConsensus(), m_versionbitscache);
+    }
+
+    /** BIP 462b: the demurrage index of a chain whose deployment activated at activation_height. */
+    demurrage::IndexSchedule& DemurrageSchedule(int activation_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * BIP 462b: the pool outputs created by a connected block at or above the
+     * activation height, from a cache of recent blocks or else from disk.
+     * nullopt if the block cannot be read.
+     */
+    std::optional<demurrage::BlockPoolOutputs> GetDemurragePoolOutputs(const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void RecordDemurragePoolOutputs(const CBlockIndex& index, const demurrage::BlockPoolOutputs& outputs) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * BIP 462b: the pool inputs of the block after prev, in claim order: the
+     * carry (output 0 of the claim transaction of prev), then the matured
+     * contribution (of the block COINBASE_MATURITY below the new block).
+     * Returns false if a block cannot be read.
+     */
+    bool GetDemurragePoolInputs(const CBlockIndex& prev, int activation_height, std::vector<COutPoint>& pool_inputs) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+private:
+    std::optional<demurrage::IndexSchedule> m_demurrage_schedule GUARDED_BY(::cs_main);
+    std::unordered_map<const CBlockIndex*, demurrage::BlockPoolOutputs> m_demurrage_pool_outputs GUARDED_BY(::cs_main);
+
+public:
 
     /** Check whether we are doing an initial block download (synchronizing from disk or network) */
     bool IsInitialBlockDownload() const noexcept;

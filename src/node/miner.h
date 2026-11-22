@@ -7,6 +7,7 @@
 #define BITCOIN_NODE_MINER_H
 
 #include <consensus/amount.h>
+#include <kernel/cs_main.h>
 #include <node/mining_types.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -18,16 +19,21 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 class CBlockIndex;
 class CChainParams;
+class CCoinsViewCache;
 class Chainstate;
 class ChainstateManager;
 
 namespace Consensus {
 struct Params;
 } // namespace Consensus
+namespace demurrage {
+class IndexSchedule;
+} // namespace demurrage
 namespace node {
 
 struct CBlockTemplate
@@ -117,6 +123,22 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
 
 /** Update an old GenerateCoinbaseCommitment from CreateNewBlock after the block txs have changed */
 void RegenerateCommitments(CBlock& block, ChainstateManager& chainman);
+
+/**
+ * BIP 462b: C(h), the demurrage charge of the inputs of txs, which must not
+ * include the claim transaction, in a block at height `height`. Inputs that
+ * spend outputs of earlier transactions in txs have no charge.
+ */
+CAmount GetBlockDemurrageCharge(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
+                                demurrage::IndexSchedule& schedule, int height);
+
+/**
+ * BIP 462b: after the transactions of a block on top of the active tip have
+ * changed, replace the coinbase's contribution with one that pays the block's
+ * demurrage charge out of the coinbase's first output. The block's claim
+ * transaction, if it needs one, must already be at index 1.
+ */
+void UpdateDemurrageContribution(CBlock& block, ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 /* Compute the block's merkle root, insert or replace the coinbase transaction and the merkle root into the block */
 void AddMerkleRootAndCoinbase(CBlock& block, CTransactionRef coinbase, uint32_t version, uint32_t timestamp, uint32_t nonce);

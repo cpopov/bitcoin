@@ -89,6 +89,9 @@ public:
     /** Get the BIP9 state for a given deployment for the block after pindexPrev. */
     bool IsActiveAfter(const CBlockIndex* pindexPrev, const Consensus::Params& params, Consensus::DeploymentPos pos) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
+    /** If a deployment is active for the block after pindexPrev, the height of the first block for which it is active. */
+    std::optional<int> ActivationHeight(const CBlockIndex* pindexPrev, const Consensus::Params& params, Consensus::DeploymentPos pos) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
     /** Determine what nVersion a new block should use */
     int32_t ComputeBlockVersion(const CBlockIndex* pindexPrev, const Consensus::Params& params) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 

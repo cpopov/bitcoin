@@ -702,6 +702,16 @@ void CTxMemPool::PrioritiseTransaction(const Txid& hash, const CAmount& nFeeDelt
     }
 }
 
+void CTxMemPool::SetDemurrageCharge(txiter it, CAmount charge)
+{
+    AssertLockHeld(cs);
+    Assume(!m_have_changeset);
+    if (it->GetDemurrageCharge() == charge) return;
+    it->UpdateDemurrageCharge(charge);
+    m_txgraph->SetTransactionFee(*it, it->GetModifiedFee());
+    ++nTransactionsUpdated;
+}
+
 void CTxMemPool::ApplyDelta(const Txid& hash, CAmount &nFeeDelta) const
 {
     AssertLockHeld(cs);
@@ -1050,7 +1060,7 @@ util::Result<std::pair<std::vector<FeeFrac>, std::vector<FeeFrac>>> CTxMemPool::
     return m_pool->m_txgraph->GetMainStagingDiagrams();
 }
 
-CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTransactionRef& tx, const CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp)
+CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTransactionRef& tx, const CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp, CAmount demurrage_charge)
 {
     LOCK(m_pool->cs);
     Assume(m_to_add.find(tx->GetHash()) == m_to_add.end());
@@ -1067,6 +1077,12 @@ CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTran
     m_pool->m_txgraph->AddTransaction(const_cast<CTxMemPoolEntry&>(*newit), feerate);
     if (delta) {
         newit->UpdateModifiedFee(delta);
+    }
+    if (demurrage_charge) {
+        // BIP 462b: rank by net fee, the fee less the demurrage charge.
+        newit->UpdateDemurrageCharge(demurrage_charge);
+    }
+    if (delta || demurrage_charge) {
         m_pool->m_txgraph->SetTransactionFee(*newit, newit->GetModifiedFee());
     }
 

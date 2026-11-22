@@ -262,6 +262,14 @@ bool VersionBitsCache::IsActiveAfter(const CBlockIndex* pindexPrev, const Consen
     return ThresholdState::ACTIVE == VersionBitsConditionChecker(params, pos).GetStateFor(pindexPrev, m_caches[pos]);
 }
 
+std::optional<int> VersionBitsCache::ActivationHeight(const CBlockIndex* pindexPrev, const Consensus::Params& params, Consensus::DeploymentPos pos)
+{
+    LOCK(m_mutex);
+    const VersionBitsConditionChecker checker(params, pos);
+    if (checker.GetStateFor(pindexPrev, m_caches[pos]) != ThresholdState::ACTIVE) return std::nullopt;
+    return checker.GetStateSinceHeightFor(pindexPrev, m_caches[pos]);
+}
+
 static int32_t ComputeBlockVersion(const CBlockIndex* pindexPrev, const Consensus::Params& params, std::array<ThresholdConditionCache, Consensus::MAX_VERSION_BITS_DEPLOYMENTS>& caches)
 {
     int32_t nVersion = VERSIONBITS_TOP_BITS;
