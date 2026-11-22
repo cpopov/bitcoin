@@ -129,6 +129,14 @@ std::string TxStateString(const T& state)
     return std::visit([](const auto& s) { return s.toString(); }, state);
 }
 
+/** BIP 462: a wallet transaction's debit, with its inputs valued at its reference height. */
+struct DemurrageDebit {
+    //! The transaction's reference height.
+    uint32_t ref_height;
+    //! The wallet's inputs, valued at the transaction's reference height.
+    CAmount debit;
+};
+
 /**
  * Cachable amount subdivided into avoid reuse and all balances
  */
@@ -235,6 +243,9 @@ public:
     mutable bool m_is_cache_empty{true};
     mutable bool fChangeCached;
     mutable CAmount nChangeCached;
+    //! BIP 462: the debit valued at the transaction's reference height, cached
+    //! for the block it is confirmed in (see CachedTxGetDemurrageDebit).
+    mutable std::optional<std::pair<uint256, std::optional<DemurrageDebit>>> m_cached_demurrage_debit;
 
     CWalletTx(CTransactionRef tx, const TxState& state) : m_state(state)
     {
@@ -364,6 +375,7 @@ public:
         fChangeCached = false;
         m_is_cache_empty = true;
         m_cached_from_me = std::nullopt;
+        m_cached_demurrage_debit = std::nullopt;
     }
 
     /** True if tx is a malleation of this, i.e. it has the exact same version, locktime,

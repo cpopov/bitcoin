@@ -248,6 +248,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "converttopsbt", 1, "permitsigdata"},
     { "converttopsbt", 2, "iswitness"},
     { "converttopsbt", 3, "psbt_version"},
+    { "getdemurrageinfo", 0, "height" },
     { "gettxout", 1, "n" },
     { "gettxout", 2, "include_mempool" },
     { "gettxoutproof", 0, "txids" },

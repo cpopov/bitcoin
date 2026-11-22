@@ -57,6 +57,7 @@
 #include <rpc/server.h>
 #include <sync.h>
 #include <txmempool.h>
+#include <undo.h>
 #include <uint256.h>
 #include <univalue.h>
 #include <util/btcsignals.h>
@@ -565,6 +566,40 @@ public:
     {
         LOCK(::cs_main);
         return Assert(chainman().ActiveChain()[height])->GetBlockHash();
+    }
+    int getDemurrageActivationHeight() override
+    {
+        return chainman().GetConsensus().DemurrageHeight;
+    }
+    std::optional<uint64_t> getDemurrageIndex(int height) override
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman().ActiveChain().Tip()};
+        if (!tip) return std::nullopt;
+        if (height == tip->nHeight + 1) {
+            const auto next{GetNextDemurrageBlockContext(chainman().m_blockman, *tip, chainman().GetConsensus())};
+            if (next) return next->index;
+            return demurrage::IsActive(height, chainman().GetConsensus()) ? std::nullopt : std::optional<uint64_t>{demurrage::INDEX_ONE};
+        }
+        return GetDemurrageIndex(chainman().m_blockman, *tip, height, chainman().GetConsensus());
+    }
+    std::optional<demurrage::InputValues> getDemurrageInputValues(const CTransaction& tx, const uint256& block_hash, int position_in_block) override
+    {
+        if (tx.IsCoinBase()) return std::nullopt;
+        LOCK(::cs_main);
+        if (block_hash.IsNull()) {
+            return GetMempoolDemurrageInputValues(chainman().ActiveChainstate(), m_node.mempool.get(), tx);
+        }
+        const CBlockIndex* block{chainman().m_blockman.LookupBlockIndex(block_hash)};
+        if (!block || !chainman().ActiveChain().Contains(*block) || position_in_block < 1) return std::nullopt;
+        if (!(block->nStatus & BLOCK_HAVE_UNDO)) return std::nullopt;
+        CBlockUndo undo;
+        if (!chainman().m_blockman.ReadBlockUndo(undo, *block)) return std::nullopt;
+        // vtxundo excludes the coinbase.
+        if (static_cast<size_t>(position_in_block) > undo.vtxundo.size()) return std::nullopt;
+        const std::vector<Coin>& coins{undo.vtxundo[position_in_block - 1].vprevout};
+        if (coins.size() != tx.vin.size()) return std::nullopt;
+        return GetDemurrageInputValues(chainman().m_blockman, *block, coins, chainman().GetConsensus());
     }
     bool haveBlockOnDisk(int height) override
     {

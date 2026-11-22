@@ -280,6 +280,14 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
                 input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
             }
             const CWalletTx& parent_tx = txo->GetWalletTx();
+            // BIP 462: value the input at its effective value at the wallet's last block.
+            if (const auto valuation{GetDemurrageValuation(wallet, {outpoint})}) {
+                const std::optional<CAmount> effective_value{GetEffectiveOutputValue(outpoint, *valuation)};
+                if (!effective_value) {
+                    return util::Error{strprintf(_("Pre-selected input %s was not found in the UTXO set or the mempool"), outpoint.ToString())};
+                }
+                txout.nValue = *effective_value;
+            }
             if (wallet.GetTxDepthInMainChain(parent_tx) == 0) {
                 if (parent_tx.GetTx()->version == TRUC_VERSION && coin_control.m_version != TRUC_VERSION) {
                     return util::Error{strprintf(_("Can't spend unconfirmed version 3 pre-selected input with a version %d tx"), coin_control.m_version)};
@@ -333,12 +341,23 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const bool can_grind_r = wallet.CanGrindR();
     std::vector<COutPoint> outpoints;
 
+    // BIP 462: coins are offered at their effective value at the wallet's last block.
+    std::vector<COutPoint> demurrage_outpoints;
+    demurrage_outpoints.reserve(wallet.GetTXOs().size());
+    for (const auto& [outpoint, txo] : wallet.GetTXOs()) demurrage_outpoints.push_back(outpoint);
+    const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(wallet, demurrage_outpoints)};
+
     std::set<Txid> trusted_parents;
     // Cache for whether each tx passes the tx level checks (first bool), and whether the transaction is "safe" (second bool)
     std::unordered_map<Txid, std::pair<bool, bool>, SaltedTxidHasher> tx_safe_cache;
     for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
         const CWalletTx& wtx = txo.GetWalletTx();
-        const CTxOut& output = txo.GetTxOut();
+        CTxOut output{txo.GetTxOut()};
+        if (demurrage_valuation) {
+            const std::optional<CAmount> effective_value{GetEffectiveOutputValue(outpoint, *demurrage_valuation)};
+            if (!effective_value) continue;
+            output.nValue = *effective_value;
+        }
 
         if (tx_safe_cache.contains(outpoint.hash) && !tx_safe_cache.at(outpoint.hash).first) {
             continue;
@@ -1402,6 +1421,19 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Give up if change keypool ran out and change is required
     if (scriptChange.empty() && change_pos) {
         return util::Error{error};
+    }
+
+    // BIP 462: coins were selected, and amounts computed, at their effective
+    // value at the wallet's last block. The transaction's reference height is
+    // the highest among its inputs, so express its outputs at that height.
+    std::vector<COutPoint> input_outpoints;
+    for (const CTxIn& txin : txNew.vin) input_outpoints.push_back(txin.prevout);
+    if (const auto valuation{GetDemurrageValuation(wallet, input_outpoints)}) {
+        std::optional<unsigned int> change_index;
+        if (change_pos) change_index = static_cast<unsigned int>(*change_pos);
+        if (!ConvertOutputsToRefHeight(txNew, *valuation, change_index)) {
+            return util::Error{_("Unable to value the transaction's inputs for BIP 462")};
+        }
     }
 
     if (sign && !wallet.SignTransaction(txNew)) {

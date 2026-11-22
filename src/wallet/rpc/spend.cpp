@@ -19,6 +19,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
+#include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -1502,6 +1503,11 @@ RPCMethod sendall()
             } else if (options.exists("inputs") && (options.exists("minconf") || options.exists("maxconf"))) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot combine minconf or maxconf with specific inputs.");
             } else if (options.exists("inputs")) {
+                // BIP 462: value the inputs at their effective value at the wallet's last block.
+                std::vector<COutPoint> input_outpoints;
+                input_outpoints.reserve(rawTx.vin.size());
+                for (const CTxIn& input : rawTx.vin) input_outpoints.push_back(input.prevout);
+                const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(*pwallet, input_outpoints)};
                 std::unordered_set<COutPoint, SaltedOutpointHasher> seen_inputs;
                 seen_inputs.reserve(rawTx.vin.size());
                 for (const CTxIn& input : rawTx.vin) {
@@ -1522,7 +1528,15 @@ RPCMethod sendall()
                             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Can't spend unconfirmed version %d pre-selected input with a version 3 tx", tx->GetTx()->version));
                         }
                     }
-                    total_input_value += tx->GetTx()->vout[input.prevout.n].nValue;
+                    CAmount input_value{tx->GetTx()->vout[input.prevout.n].nValue};
+                    if (demurrage_valuation) {
+                        const std::optional<CAmount> effective_value{GetEffectiveOutputValue(input.prevout, *demurrage_valuation)};
+                        if (!effective_value) {
+                            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Input not found. UTXO (%s:%d) is not in the UTXO set or the mempool.", input.prevout.hash.ToString(), input.prevout.n));
+                        }
+                        input_value = *effective_value;
+                    }
+                    total_input_value += input_value;
                 }
             } else {
                 CoinFilterParams coins_params;
@@ -1594,15 +1608,16 @@ RPCMethod sendall()
 
             const CAmount per_output_without_amount{remainder / (long)addresses_without_amount.size()};
 
-            bool gave_remaining_to_first{false};
-            for (CTxOut& out : rawTx.vout) {
+            std::optional<unsigned int> remainder_pos;
+            for (unsigned int pos{0}; pos < rawTx.vout.size(); ++pos) {
+                CTxOut& out{rawTx.vout[pos]};
                 CTxDestination dest;
                 ExtractDestination(out.scriptPubKey, dest);
                 if (addresses_without_amount.contains(dest)) {
                     out.nValue = per_output_without_amount;
-                    if (!gave_remaining_to_first) {
+                    if (!remainder_pos) {
                         out.nValue += remainder % addresses_without_amount.size();
-                        gave_remaining_to_first = true;
+                        remainder_pos = pos;
                     }
                     if (IsDust(out, pwallet->chain().relayDustFee())) {
                         // Dynamically generated output amount is dust
@@ -1613,6 +1628,17 @@ RPCMethod sendall()
                         // Specified output amount is dust
                         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Specified output amount to %s is below dust threshold.", EncodeDestination(dest)));
                     }
+                }
+            }
+
+            // BIP 462: so far, amounts are effective values at the wallet's last
+            // block. Express the outputs at the transaction's reference height, the
+            // highest among its inputs, so that each recipient receives that
+            // effective value and the fee is as estimated. Rounding is taken from
+            // the output that received the remainder.
+            if (const auto valuation{GetDemurrageValuation(*pwallet, outpoints_spent)}) {
+                if (!ConvertOutputsToRefHeight(rawTx, *valuation, remainder_pos)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Unable to value the transaction's inputs for BIP 462");
                 }
             }
 
