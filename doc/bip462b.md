@@ -1,7 +1,11 @@
 # BIP 462b reference implementation
 
-This branch implements the draft **BIP 462b, Soft-Fork Demurrage Security Budget**
-(version 0.1.0, `bip-0462b.md`). The demurrage is charged when an output is
+This branch implements the draft **BIP 462b, Soft-Fork Demurrage Security Budget**,
+version 0.1.0 (`bip-0462b.md`). Version 0.2.0 of the draft addresses the
+problems this implementation found in 0.1.0, listed below. It changes no mainnet
+consensus rule, but its policy and interfaces differ from this implementation in
+the ways listed under [Differences from draft 0.2.0](#differences-from-draft-020).
+The demurrage is charged when an output is
 spent. The block owes the charge, the coinbase pays it into a pool output, and a
 deterministic claim transaction at index 1 of every later block pays out
 `floor(P / 10,000)` of the pool as its fee.
@@ -36,8 +40,9 @@ build/test/functional/feature_demurrage.py
 | Version bit | 4 | 4 | `kernel/chainparams.cpp` |
 
 Regtest halves the subsidy every 150 blocks, so with the mainnet target the
-subsidy covers the target for about 2,000 blocks. The regtest target is
-therefore higher, and its rate periods match its 144-block version bits period.
+subsidy covers the target until height 2,448. The regtest target is therefore
+higher, and its rate periods match its 144-block version bits period. Draft
+0.2.0 adopts these regtest values.
 With activation at 432, the first rate period has a zero rate, as on mainnet
 before 2032. Charges begin at 576, with `r = 237,945,492,662,473`, about 0.024%
 per block. At that rate, evaluating charges up to 287 blocks ahead (the policy's
@@ -107,9 +112,9 @@ that spend old coins therefore need far larger fees than they would on mainnet.
   Inputs spending outputs of earlier transactions in the block have no charge.
   The contribution is coinbase output 1, before the witness commitment.
 
-## Problems found in the specification
+## Problems found in draft 0.1.0
 
-Each numeric claim in the draft was checked against an independent
+Draft 0.2.0 addresses each of these. Each numeric claim in draft 0.1.0 was checked against an independent
 arbitrary-precision implementation, in the unit tests and in Python. The rate
 table, the 19,284,730,634 rate at 1,260,000, the maximum rate 57,077,625,570,
 the index falls (0.41%, 1.21%, 2.19%), the 67-, 108- and 16-byte sizes and the
@@ -180,6 +185,27 @@ interfaces and wording.
     `-testactivationheight=demurrage@433` shifts every rate period. Also, the
     first 67-byte claim is clear of the proposed rule against 64-byte
     transactions (BIP 54), which the BIP could note.
+
+## Differences from draft 0.2.0
+
+- **Unconfirmed inputs.** This implementation charges an input that spends an
+  unconfirmed output nothing. Draft 0.2.0 charges it as if the output were
+  created in the next block, so that a child's net fee cannot fall when its
+  parent confirms alone.
+- **Before activation.** This implementation charges nothing until the
+  deployment is active for the next block. Draft 0.2.0 charges from lock-in,
+  when `ACTIVATION_HEIGHT` is known.
+- **`getblocktemplate`.** As in draft 0.2.0, the rule is required
+  (`!demurrage`), the claim transaction is the first entry of `transactions`,
+  and `coinbasevalue` excludes `C(h)`. But the template has no `charge` or
+  `demurrage_contribution` fields.
+- **Compact blocks.** Senders do not prefill the claim transaction, and nodes do
+  not check it before relaying a block ahead of validation.
+- **assumeutxo.** Draft 0.2.0 states how to find the pool inputs in a snapshot.
+  This implementation does not do so yet (see below).
+
+The no-eviction rule for recomputation, the fee rule for ephemeral dust and the
+regtest parameters already match draft 0.2.0.
 
 ## Not implemented
 

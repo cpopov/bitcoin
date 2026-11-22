@@ -103,9 +103,11 @@ BOOST_AUTO_TEST_CASE(mainnet_rates)
     BOOST_CHECK_EQUAL(PeriodRate(1'681'344, params), 47'740'674'579);
     BOOST_CHECK_EQUAL(PeriodRate(1'891'008, params), 52'418'249'448);
     // Once the subsidy has ended, the rate is the target. S_k * RATE_PERIOD * 3
-    // exceeds 2^63 here, so this needs the 128-bit intermediates.
-    BOOST_CHECK_EQUAL(PeriodRate(6'931'584, params), MAX_RATE);
-    BOOST_CHECK_EQUAL(PeriodRate(13'441'536, params), MAX_RATE);
+    // exceeds 2^63 here, so this needs the 128-bit intermediates. The subsidy
+    // ends at 6,930,000, so the period before 6,931,008 still has some.
+    BOOST_CHECK_EQUAL(PeriodRate(6'928'992, params), 57'077'625'332);
+    BOOST_CHECK_EQUAL(PeriodRate(6'931'008, params), MAX_RATE);
+    BOOST_CHECK_EQUAL(PeriodRate(13'440'672, params), MAX_RATE);
 
     // 0 <= r_k <= MAX_RATE. The rate rises as the subsidy halves, except that
     // rounding can lower it by one unit from one period to the next.
