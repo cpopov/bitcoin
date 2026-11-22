@@ -92,6 +92,9 @@ void CChainParams::ApplyDeploymentOptions(const DeploymentOptions& opts)
         case Consensus::BuriedDeployment::DEPLOYMENT_CSV:
             consensus.CSVHeight = int{height};
             break;
+        case Consensus::BuriedDeployment::DEPLOYMENT_DEMURRAGE:
+            consensus.DemurrageHeight = int{height};
+            break;
         }
     }
 
@@ -599,6 +602,13 @@ public:
         consensus.BIP66Height = 1;  // Always active unless overridden
         consensus.CSVHeight = 1;    // Always active unless overridden
         consensus.SegwitHeight = 0; // Always active unless overridden
+        // BIP 462: not active unless overridden with -testactivationheight=demurrage@<height>.
+        // Shorter rate period and a much higher target than mainnet, so that
+        // demurrage is non-zero while regtest's fast-halving subsidy still exists.
+        consensus.DemurrageHeight = std::numeric_limits<int>::max();
+        consensus.nDemurrageRatePeriod = 144;
+        consensus.nDemurrageTargetRateNum = 1; // 0.2% per block
+        consensus.nDemurrageTargetRateDen = 500;
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 24 * 60 * 60; // one day
