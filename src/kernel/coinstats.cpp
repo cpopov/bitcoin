@@ -47,7 +47,17 @@ template <typename T>
 static void TxOutSer(T& ss, const COutPoint& outpoint, const Coin& coin)
 {
     ss << outpoint;
-    ss << ((uint32_t{coin.nHeight} << 1) | uint32_t{coin.fCoinBase});
+    const uint32_t code{(uint32_t{coin.nHeight} << 1) | uint32_t{coin.fCoinBase}};
+    // BIP 462: commit to a coin's reference height when it differs from its
+    // height, flagged by bit 31 of the code, which is clear for every height
+    // below 2^30. UTXO sets without such coins (every UTXO set before
+    // activation) hash as before.
+    if (coin.nRefHeight != coin.nHeight) {
+        ss << (code | REF_HEIGHT_HASH_FLAG);
+        ss << uint32_t{coin.nRefHeight};
+    } else {
+        ss << code;
+    }
     ss << coin.out;
 }
 

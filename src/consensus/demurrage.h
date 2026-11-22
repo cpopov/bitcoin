@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <vector>
 
 namespace Consensus {
 struct Params;
@@ -142,6 +143,14 @@ struct BlockTotals {
 
 /** State after a post-activation block, given the state after its parent. */
 BlockState ComputeBlockState(const BlockState& prev, const BlockContext& ctx, const BlockTotals& totals);
+
+/** The values of a transaction's inputs, as consensus values them. */
+struct InputValues {
+    //! The transaction's reference height: the highest among the outputs it spends.
+    uint32_t ref_height{0};
+    //! Each input's value at the transaction's reference height, in input order.
+    std::vector<CAmount> values;
+};
 
 /** Returns I(h) for a height on the chain being validated, or nullopt if unknown. */
 using IndexLookup = std::function<std::optional<uint64_t>(int height)>;

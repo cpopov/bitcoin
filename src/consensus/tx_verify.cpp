@@ -8,6 +8,7 @@
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/validation.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <string>
 
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
@@ -167,12 +169,31 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
     return nSigOps;
 }
 
-bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee)
+bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee,
+                              const demurrage::TxContext* demurrage_ctx, uint32_t* ref_height_out)
 {
     // are the actual inputs available?
     if (!inputs.HaveInputs(tx)) {
         return state.Invalid(TxValidationResult::TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent",
                          strprintf("%s: inputs missing/spent", __func__));
+    }
+
+    // BIP 462: the transaction's reference height is the highest reference
+    // height among the outputs it spends, and every input is valued at it.
+    const bool demurrage_active{demurrage_ctx && nSpendHeight >= demurrage_ctx->activation_height};
+    std::optional<uint64_t> ref_index;
+    if (demurrage_active) {
+        Assume(demurrage_ctx->spend_height == nSpendHeight);
+        uint32_t ref_height{0};
+        for (const CTxIn& txin : tx.vin) {
+            ref_height = std::max(ref_height, inputs.AccessCoin(txin.prevout).nRefHeight);
+        }
+        if (ref_height_out) *ref_height_out = ref_height;
+        if (ref_height <= static_cast<uint32_t>(nSpendHeight)) ref_index = demurrage_ctx->index_at(static_cast<int>(ref_height));
+        if (!ref_index) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-refheight-unknown",
+                                 strprintf("no demurrage index at reference height %u", ref_height));
+        }
     }
 
     CAmount nValueIn = 0;
@@ -188,8 +209,21 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         }
 
         // Check for negative or overflow input values
-        nValueIn += coin.out.nValue;
-        if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn)) {
+        if (!MoneyRange(coin.out.nValue)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
+        }
+        CAmount input_value{coin.out.nValue};
+        if (demurrage_active) {
+            // input_value = v * I(ref_height) / I_created, with I_created = I(coin reference height)
+            const std::optional<uint64_t> coin_index{demurrage_ctx->index_at(static_cast<int>(coin.nRefHeight))};
+            if (!coin_index) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-refheight-unknown",
+                                     strprintf("no demurrage index for input %s", prevout.ToString()));
+            }
+            input_value = demurrage::EffectiveValue(coin.out.nValue, *coin_index, *ref_index);
+        }
+        nValueIn += input_value;
+        if (!MoneyRange(nValueIn)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
         }
     }

@@ -794,6 +794,16 @@ class CCoinsViewMemPool : public CCoinsViewBacked
      * (not base). Used to track the origin of a coin, see GetNonBaseCoins().
      */
     mutable std::unordered_set<COutPoint, SaltedOutpointHasher> m_non_base_coins;
+
+    /** BIP 462 reference heights of mempool and package transactions already
+     *  computed. A transaction's reference height depends only on the outputs
+     *  it spends, so entries never go stale. */
+    mutable std::unordered_map<Txid, uint32_t, SaltedTxidHasher> m_ref_heights;
+
+    /** BIP 462: reference height of an unconfirmed @p tx, the highest reference
+     *  height among the outputs it spends (looked up through mempool and package
+     *  ancestors without caching base coins). MEMPOOL_HEIGHT if an input is missing. */
+    uint32_t GetRefHeight(const CTransaction& tx) const;
 protected:
     const CTxMemPool& mempool;
 

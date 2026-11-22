@@ -140,6 +140,12 @@ static ChainstateLoadResult CompleteChainstateInitialization(
                                                          chainman.GetConsensus().SegwitHeight)};
     };
 
+    for (const auto& chainstate : chainman.m_chainstates) {
+        if (auto result{chainstate->RewindForDemurrage()}; !result) {
+            return {ChainstateLoadStatus::FAILURE, util::ErrorString(result)};
+        }
+    }
+
     // Now that chainstates are loaded and we're able to flush to
     // disk, rebalance the coins caches to desired levels based
     // on the condition of each chainstate.

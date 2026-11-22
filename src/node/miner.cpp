@@ -10,6 +10,7 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/tx_verify.h>
@@ -43,6 +44,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <numeric>
 #include <utility>
 
 namespace node {
@@ -179,7 +181,22 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees
-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    if (demurrage::IsActive(nHeight, chainparams.GetConsensus())) {
+        // BIP 462: the coinbase claims the subsidy, each transaction's fee at
+        // this block's index (fee_effective) and the demurrage dividend.
+        // Mempool fees are at each transaction's reference height, so recompute them.
+        const std::optional<demurrage::BlockContext> demurrage_block{
+            GetNextDemurrageBlockContext(m_chainstate.m_blockman, *pindexPrev, chainparams.GetConsensus())};
+        const std::vector<CTransactionRef> txs(pblock->vtx.begin() + 1, pblock->vtx.end());
+        const std::optional<std::vector<CAmount>> fees{GetDemurrageBlockFees(m_chainstate, txs)};
+        if (!demurrage_block || !fees) {
+            throw std::runtime_error("BIP 462 demurrage state of the chain tip is unavailable");
+        }
+        pblocktemplate->vTxFees = *fees;
+        nFees = std::accumulate(fees->begin(), fees->end(), CAmount{0});
+        block_reward = GetBlockSubsidy(nHeight, chainparams.GetConsensus()) + nFees + demurrage_block->dividend;
+    }
     coinbaseTx.vout[0].nValue = block_reward;
     coinbase_tx.block_reward_remaining = block_reward;
 

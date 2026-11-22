@@ -46,6 +46,11 @@ struct AssumeutxoData {
     //! The hash of the base block for this snapshot. Used to refer to assumeutxo data
     //! prior to having a loaded blockindex.
     uint256 blockhash;
+
+    //! BIP 462: the hash of the demurrage states that a snapshot whose base is at
+    //! or above ACTIVATION_HEIGHT carries (see node::DemurrageStatesHash). Null
+    //! for a base below ACTIVATION_HEIGHT.
+    uint256 demurrage_states_hash{};
 };
 
 /**

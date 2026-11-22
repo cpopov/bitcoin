@@ -16,6 +16,9 @@ class CBlockIndex;
 class CCoinsViewCache;
 class CTransaction;
 class TxValidationState;
+namespace demurrage {
+struct TxContext;
+} // namespace demurrage
 
 /** Transaction validation functions */
 
@@ -23,10 +26,18 @@ namespace Consensus {
 /**
  * Check whether all inputs of this transaction are valid (no double spends and amounts)
  * This does not modify the UTXO set. This does not check scripts and sigs.
- * @param[out] txfee Set to the transaction fee if successful.
+ * @param[out] txfee Set to the transaction fee if successful. When BIP 462
+ *                   applies, this is the fee at the transaction's reference
+ *                   height, fee(tx) = sum(input values) - sum(output values).
+ * @param[in] demurrage_ctx If set and BIP 462 is active at nSpendHeight, the
+ *                   transaction's reference height is the highest reference
+ *                   height of the coins it spends, and every input is valued
+ *                   at the demurrage index of that height.
+ * @param[out] ref_height_out If BIP 462 applies, set to the transaction's reference height.
  * Preconditions: tx.IsCoinBase() is false.
  */
-[[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee);
+[[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee,
+                                 const demurrage::TxContext* demurrage_ctx = nullptr, uint32_t* ref_height_out = nullptr);
 } // namespace Consensus
 
 /** Auxiliary functions for transaction validation (ideally should not be exposed) */

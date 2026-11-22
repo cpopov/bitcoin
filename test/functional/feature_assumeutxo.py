@@ -95,7 +95,8 @@ class AssumeutxoTest(BitcoinTestFramework):
         assert_raises_rpc_error(parsing_error_code, "Unable to parse metadata: Invalid UTXO set snapshot magic bytes. Please check if this is indeed a snapshot file or if you are using an outdated snapshot format.", node.loadtxoutset, bad_snapshot_path)
 
         self.log.info("  - snapshot file with unsupported version")
-        for version in [0, 1, 3]:
+        # Version 3 is supported: it carries the BIP 462 demurrage states.
+        for version in [0, 1, 4]:
             with open(bad_snapshot_path, 'wb') as f:
                 f.write(valid_snapshot_contents[:5] + version.to_bytes(2, "little") + valid_snapshot_contents[7:])
             assert_raises_rpc_error(parsing_error_code, f"Unable to parse metadata: Version of snapshot {version} does not match any of the supported versions.", node.loadtxoutset, bad_snapshot_path)
