@@ -142,6 +142,8 @@ public:
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
         /** BIP 462b: height from which the demurrage rules apply, regardless of version bits. */
         std::optional<int> demurrage_activation_height{};
+        /** BIP 462b: height from which the demurrage_charges deployment is active, regardless of version bits. */
+        std::optional<int> demurrage_charges_height{};
     };
 
     /**

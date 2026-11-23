@@ -286,7 +286,9 @@ private:
 
     static TxMempoolInfo GetInfo(CTxMemPool::indexed_transaction_set::const_iterator it)
     {
-        return TxMempoolInfo{it->GetSharedTx(), it->GetTime(), it->GetFee(), it->GetTxSize(), it->GetModifiedFee() - it->GetFee()};
+        // The fee delta is the prioritisation alone. The BIP 462b policy charge
+        // is recomputed when a transaction is loaded, so it must not be saved with it.
+        return TxMempoolInfo{it->GetSharedTx(), it->GetTime(), it->GetFee(), it->GetTxSize(), it->GetModifiedFee() - it->GetFee() + it->GetDemurrageCharge()};
     }
 
     // Helper to remove all transactions that conflict with a given
@@ -360,13 +362,13 @@ public:
     void ClearPrioritisation(const Txid& hash) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
     /**
-     * BIP 462b policy: the ACTIVATION_HEIGHT and evaluation height at which the
-     * demurrage charges of the entries were last computed, or nullopt if no
-     * charge applied then. Entries rank by modified fee, which excludes the charge.
+     * BIP 462b policy: the CHARGE_HEIGHT from which the policy charges of the
+     * entries were last computed, or nullopt if it was not known then, so that
+     * no charge applied. Entries rank by modified fee, which excludes the charge.
      */
-    std::optional<std::pair<int, int>> m_demurrage_evaluation GUARDED_BY(cs);
-    /** BIP 462b policy: replace the demurrage charge that an entry's modified fee excludes. */
-    void SetDemurrageCharge(txiter it, CAmount charge) EXCLUSIVE_LOCKS_REQUIRED(cs);
+    std::optional<int> m_demurrage_charge_height GUARDED_BY(cs);
+    /** BIP 462b policy: replace the policy charge that an entry's modified fee excludes. */
+    void SetDemurrageCharge(txiter it, const demurrage::PolicyCharge& charge) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
     struct delta_info {
         /** Whether this transaction is in the mempool. */
@@ -673,7 +675,9 @@ public:
 
         using TxHandle = CTxMemPool::txiter;
 
-        TxHandle StageAddition(const CTransactionRef& tx, CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp, CAmount demurrage_charge = 0);
+        /** demurrage_inputs and demurrage_charge are the BIP 462b policy inputs (one per input) and policy charge. */
+        TxHandle StageAddition(const CTransactionRef& tx, CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp,
+                               std::vector<demurrage::PolicyInput> demurrage_inputs = {}, const demurrage::PolicyCharge& demurrage_charge = {});
 
         void StageRemoval(CTxMemPool::txiter it);
 

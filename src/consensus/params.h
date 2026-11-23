@@ -38,7 +38,8 @@ constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_
 
 enum DeploymentPos : uint16_t {
     DEPLOYMENT_TESTDUMMY,
-    DEPLOYMENT_DEMURRAGE, // Deployment of BIP 462b (soft-fork demurrage).
+    DEPLOYMENT_DEMURRAGE, // BIP 462b (soft-fork demurrage): enforcement, from ACTIVATION_HEIGHT.
+    DEPLOYMENT_DEMURRAGE_CHARGES, // BIP 462b: the index starts to fall once this is also active, at CHARGE_HEIGHT.
     // NOTE: Also add new deployments to VersionBitsDeploymentInfo in deploymentinfo.cpp
     // Removing an entry may require bumping MinBIP9WarningHeight.
     MAX_VERSION_BITS_DEPLOYMENTS
@@ -129,6 +130,12 @@ struct Params {
      * rules apply from this height, whatever the version bits state.
      */
     std::optional<int> DemurrageTestActivationHeight;
+    /**
+     * Test-only (-testactivationheight=demurrage_charges@height): if set, the
+     * demurrage_charges deployment is active from this height, whatever the
+     * version bits state. It defaults to DemurrageTestActivationHeight.
+     */
+    std::optional<int> DemurrageTestChargesHeight;
     /** Proof of work parameters */
     uint256 powLimit;
     bool fPowAllowMinDifficultyBlocks;

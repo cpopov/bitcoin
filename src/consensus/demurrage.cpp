@@ -195,9 +195,32 @@ CMutableTransaction BuildClaimTransaction(std::span<const COutPoint> pool_inputs
     return tx;
 }
 
-int EvaluationHeight(int next_height)
+PolicyCharge EvaluatePolicyCharge(IndexSchedule& schedule, std::span<const PolicyInput> inputs, int next_height)
 {
-    return (next_height + 2 * CHARGE_MARGIN - 1) / CHARGE_MARGIN * CHARGE_MARGIN;
+    const auto charge_at{[&](int height) {
+        CAmount charge{0};
+        for (const PolicyInput& input : inputs) {
+            // An output of an unconfirmed transaction cannot be created before the next block.
+            charge += schedule.ChargeFor(input.value, std::min(input.created_height, next_height), height);
+        }
+        return charge;
+    }};
+    const CAmount base{charge_at(next_height)};
+    const auto within_tolerance{[&](int height) { return charge_at(height) - base <= CHARGE_TOLERANCE; }};
+
+    // charge_at() does not fall as the height rises, so the heights within the
+    // tolerance form a range that starts at next_height.
+    int low{next_height};
+    int high{next_height + CHARGE_MARGIN};
+    if (within_tolerance(high)) {
+        low = high;
+    } else {
+        while (high - low > 1) {
+            const int middle{low + (high - low) / 2};
+            (within_tolerance(middle) ? low : high) = middle;
+        }
+    }
+    return {.evaluation_height = low, .charge = charge_at(low)};
 }
 
 } // namespace demurrage

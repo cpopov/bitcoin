@@ -10,6 +10,7 @@
 #include <script/script.h>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -63,16 +64,17 @@ CAmount Charge(CAmount value, uint64_t index_created, uint64_t index_spent);
 CAmount PoolPayout(CAmount pool);
 
 /**
- * The demurrage index I(h) of a chain whose deployment activated at
- * activation_height. I(h) = INDEX_ONE for every h < activation_height. Values
- * are computed incrementally and cached. Not thread-safe: the owner must
- * serialise access.
+ * The demurrage index I(h) of a chain on which the index starts to fall at
+ * activation_height (CHARGE_HEIGHT). I(h) = INDEX_ONE for every
+ * h < activation_height. Values are computed incrementally and cached. Not
+ * thread-safe: the owner must serialise access.
  */
 class IndexSchedule
 {
 public:
     IndexSchedule(const Consensus::Params& params, int activation_height);
 
+    /** CHARGE_HEIGHT. */
     int ActivationHeight() const { return m_activation_height; }
     /** I(h). */
     uint64_t Index(int height);
@@ -103,6 +105,23 @@ struct BlockPoolOutputs {
     std::optional<COutPoint> carry;
     /** The coinbase's pool output, if any: the block's contribution. */
     std::optional<COutPoint> contribution;
+
+    friend bool operator==(const BlockPoolOutputs&, const BlockPoolOutputs&) = default;
+
+    // An absent outpoint is stored as the null outpoint, which no output has.
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        s << carry.value_or(COutPoint{}) << contribution.value_or(COutPoint{});
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        COutPoint carry_in, contribution_in;
+        s >> carry_in >> contribution_in;
+        carry = carry_in.IsNull() ? std::nullopt : std::optional{carry_in};
+        contribution = contribution_in.IsNull() ? std::nullopt : std::optional{contribution_in};
+    }
 };
 
 /**
@@ -121,12 +140,40 @@ BlockPoolOutputs FindBlockPoolOutputs(const CBlock& block);
  */
 CMutableTransaction BuildClaimTransaction(std::span<const COutPoint> pool_inputs, CAmount pool_value);
 
-/**
- * Relay and mining policy: the evaluation height E, the smallest multiple of
- * CHARGE_MARGIN that is at least next_height + CHARGE_MARGIN.
- */
+/** Relay and mining policy: the most blocks ahead that a charge is evaluated. */
 inline constexpr int CHARGE_MARGIN{144};
-int EvaluationHeight(int next_height);
+/** Relay and mining policy: the most by which a transaction's charge is overstated, in satoshis. */
+inline constexpr CAmount CHARGE_TOLERANCE{1'000};
+/** The created height of an output of an unconfirmed transaction. */
+inline constexpr int UNCONFIRMED_HEIGHT{std::numeric_limits<int>::max()};
+/** The evaluation height of a transaction that no charge applies to. */
+inline constexpr int NO_EVALUATION_HEIGHT{std::numeric_limits<int>::max()};
+
+/** An input of a transaction, as the policy charge sees it. */
+struct PolicyInput {
+    /** The value of the output that the input spends. */
+    CAmount value{0};
+    /** The height of the block that created that output, or UNCONFIRMED_HEIGHT. */
+    int created_height{UNCONFIRMED_HEIGHT};
+};
+
+/** A transaction's policy charge, charge_at(E_tx), and its evaluation height E_tx. */
+struct PolicyCharge {
+    int evaluation_height{NO_EVALUATION_HEIGHT};
+    CAmount charge{0};
+
+    friend bool operator==(const PolicyCharge&, const PolicyCharge&) = default;
+};
+
+/**
+ * Relay and mining policy: E_tx is the greatest e such that
+ * next_height <= e <= next_height + CHARGE_MARGIN and
+ * charge_at(e) - charge_at(next_height) <= CHARGE_TOLERANCE, where charge_at(e)
+ * is the sum of charge(v, c, e) over the inputs. An input that spends an output
+ * of an unconfirmed transaction is charged as if that output were created in
+ * the next block (c = next_height).
+ */
+PolicyCharge EvaluatePolicyCharge(IndexSchedule& schedule, std::span<const PolicyInput> inputs, int next_height);
 
 } // namespace demurrage
 

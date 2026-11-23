@@ -14,11 +14,19 @@ const std::array<VBDeploymentInfo,Consensus::MAX_VERSION_BITS_DEPLOYMENTS> Versi
         .gbt_optional_rule = true,
     },
     VBDeploymentInfo{
-        // BIP 462b: optional while signalling and until blocks can owe a
-        // charge. getblocktemplate requires it from the first rate period with
-        // a non-zero rate, when coinbases must pay the demurrage contribution.
+        // BIP 462b: always optional. Nodes signal for it whatever mining
+        // software uses them, so its signalling measures enforcement.
         .name = "demurrage",
         .gbt_optional_rule = true,
+    },
+    VBDeploymentInfo{
+        // BIP 462b: nodes signal for it only on behalf of clients that declare
+        // it, so its signalling measures block builders that are ready for
+        // contributions and claim transactions. Once it is active,
+        // getblocktemplate lists it as optional until the first rate period
+        // with a non-zero rate, and as required from then.
+        .name = "demurrage_charges",
+        .gbt_optional_rule = false,
     },
 };
 

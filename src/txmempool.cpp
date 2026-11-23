@@ -702,12 +702,13 @@ void CTxMemPool::PrioritiseTransaction(const Txid& hash, const CAmount& nFeeDelt
     }
 }
 
-void CTxMemPool::SetDemurrageCharge(txiter it, CAmount charge)
+void CTxMemPool::SetDemurrageCharge(txiter it, const demurrage::PolicyCharge& charge)
 {
     AssertLockHeld(cs);
     Assume(!m_have_changeset);
-    if (it->GetDemurrageCharge() == charge) return;
+    const bool fee_changed{it->GetDemurrageCharge() != charge.charge};
     it->UpdateDemurrageCharge(charge);
+    if (!fee_changed) return;
     m_txgraph->SetTransactionFee(*it, it->GetModifiedFee());
     ++nTransactionsUpdated;
 }
@@ -1060,7 +1061,7 @@ util::Result<std::pair<std::vector<FeeFrac>, std::vector<FeeFrac>>> CTxMemPool::
     return m_pool->m_txgraph->GetMainStagingDiagrams();
 }
 
-CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTransactionRef& tx, const CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp, CAmount demurrage_charge)
+CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTransactionRef& tx, const CAmount fee, int64_t time, unsigned int entry_height, uint64_t entry_sequence, bool spends_coinbase, int64_t sigops_cost, LockPoints lp, std::vector<demurrage::PolicyInput> demurrage_inputs, const demurrage::PolicyCharge& demurrage_charge)
 {
     LOCK(m_pool->cs);
     Assume(m_to_add.find(tx->GetHash()) == m_to_add.end());
@@ -1078,11 +1079,10 @@ CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTran
     if (delta) {
         newit->UpdateModifiedFee(delta);
     }
-    if (demurrage_charge) {
-        // BIP 462b: rank by net fee, the fee less the demurrage charge.
-        newit->UpdateDemurrageCharge(demurrage_charge);
-    }
-    if (delta || demurrage_charge) {
+    // BIP 462b: rank by net fee, the fee less the policy charge.
+    if (demurrage_inputs.size() == tx->vin.size()) newit->SetDemurrageInputs(std::move(demurrage_inputs));
+    newit->SetDemurrageChargeAtAcceptance(demurrage_charge);
+    if (delta || demurrage_charge.charge) {
         m_pool->m_txgraph->SetTransactionFee(*newit, newit->GetModifiedFee());
     }
 

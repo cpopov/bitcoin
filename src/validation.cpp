@@ -400,53 +400,54 @@ void Chainstate::UpdateMempoolDemurrageCharges(const CBlock* connected_block)
     AssertLockHeld(m_mempool->cs);
 
     const CBlockIndex* tip{m_chain.Tip()};
-    std::optional<std::pair<int, int>> evaluation;
-    if (tip) {
-        // Charges are computed once ACTIVATION_HEIGHT is known, from lock-in.
-        if (const auto activation{m_chainman.DemurrageKnownActivationHeight(tip)}) {
-            evaluation.emplace(*activation, demurrage::EvaluationHeight(tip->nHeight + 1));
-        }
-    }
+    // Policy charges are computed once CHARGE_HEIGHT is known.
+    const std::optional<int> charge_height{tip ? m_chainman.DemurrageKnownChargeHeight(tip) : std::nullopt};
     // Without a charge then or now, every entry's charge is zero.
-    if (!evaluation && !m_mempool->m_demurrage_evaluation) return;
-    const bool update_all{connected_block == nullptr || evaluation != m_mempool->m_demurrage_evaluation};
-    m_mempool->m_demurrage_evaluation = evaluation;
+    if (!charge_height && !m_mempool->m_demurrage_charge_height) return;
+    const bool update_all{connected_block == nullptr || charge_height != m_mempool->m_demurrage_charge_height};
+    m_mempool->m_demurrage_charge_height = charge_height;
     if (m_mempool->size() == 0) return;
 
-    std::vector<CTxMemPool::txiter> entries;
-    if (update_all) {
-        entries.reserve(m_mempool->mapTx.size());
-        for (auto it{m_mempool->mapTx.begin()}; it != m_mempool->mapTx.end(); ++it) entries.push_back(it);
-    } else {
-        // Only the entries spending outputs of the connected block now have
-        // confirmed inputs that they did not have before.
+    const int next_height{tip->nHeight + 1};
+    if (connected_block && !update_all) {
+        // The inputs that spend outputs of the connected block now spend
+        // outputs created at its height.
         for (const auto& tx : connected_block->vtx) {
             for (uint32_t n{0}; n < tx->vout.size(); ++n) {
-                if (const auto spender{m_mempool->mapNextTx.find(COutPoint{tx->GetHash(), n})}; spender != m_mempool->mapNextTx.end()) {
-                    entries.push_back(spender->second);
+                const COutPoint outpoint{tx->GetHash(), n};
+                const auto spender{m_mempool->mapNextTx.find(outpoint)};
+                if (spender == m_mempool->mapNextTx.end()) continue;
+                const auto& vin{spender->second->GetTx().vin};
+                for (size_t i{0}; i < vin.size(); ++i) {
+                    if (vin[i].prevout == outpoint) spender->second->SetDemurrageInputHeight(i, tip->nHeight);
                 }
             }
         }
     }
 
-    demurrage::IndexSchedule* schedule{evaluation ? &m_chainman.DemurrageSchedule(evaluation->first) : nullptr};
-    for (const CTxMemPool::txiter it : entries) {
-        CAmount charge{0};
-        if (schedule) {
-            // As in PreChecks, an output of an unconfirmed transaction is
-            // charged as if it were created in the next block.
-            const int next_height{tip->nHeight + 1};
-            for (const CTxIn& txin : it->GetTx().vin) {
+    demurrage::IndexSchedule* schedule{charge_height ? &m_chainman.DemurrageSchedule(*charge_height) : nullptr};
+    for (auto it{m_mempool->mapTx.begin()}; it != m_mempool->mapTx.end(); ++it) {
+        if (update_all) {
+            // Look every input up again: after a reorganisation, any of them
+            // may have been confirmed or returned to the mempool.
+            const auto& vin{it->GetTx().vin};
+            std::vector<demurrage::PolicyInput> inputs;
+            inputs.reserve(vin.size());
+            for (const CTxIn& txin : vin) {
                 if (const CTransactionRef parent{m_mempool->get(txin.prevout.hash)}) {
-                    charge += schedule->ChargeFor(parent->vout.at(txin.prevout.n).nValue, next_height, evaluation->second);
-                    continue;
+                    inputs.push_back({.value = parent->vout.at(txin.prevout.n).nValue, .created_height = demurrage::UNCONFIRMED_HEIGHT});
+                } else if (const Coin& coin{CoinsTip().AccessCoin(txin.prevout)}; !coin.IsSpent()) {
+                    inputs.push_back({.value = coin.out.nValue, .created_height = static_cast<int>(coin.nHeight)});
+                } else {
+                    inputs.emplace_back();
                 }
-                const Coin& coin{CoinsTip().AccessCoin(txin.prevout)};
-                if (coin.IsSpent()) continue;
-                charge += schedule->ChargeFor(coin.out.nValue, coin.nHeight, evaluation->second);
             }
+            it->SetDemurrageInputs(std::move(inputs));
+        } else if (it->GetDemurrageEvaluationHeight() >= next_height) {
+            // The policy charge still covers the next block.
+            continue;
         }
-        m_mempool->SetDemurrageCharge(it, charge);
+        m_mempool->SetDemurrageCharge(it, schedule ? demurrage::EvaluatePolicyCharge(*schedule, it->GetDemurrageInputs(), next_height) : demurrage::PolicyCharge{});
     }
 }
 
@@ -949,27 +950,29 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return false; // state filled in by CheckTxInputs
     }
 
-    // BIP 462b policy: transactions rank by net fee, their fee less the charge
-    // of their inputs at the evaluation height. An input spending an output of
-    // an unconfirmed transaction is charged as if that output were created in
-    // the next block, the earliest it can confirm. This is the most the input
-    // can owe, so the net fee cannot fall when the parent confirms. Charges are
-    // computed once ACTIVATION_HEIGHT is known, from lock-in: the evaluation
-    // height can lie beyond it.
-    CAmount demurrage_charge{0};
-    const CBlockIndex* tip{Assert(m_active_chainstate.m_chain.Tip())};
-    if (const auto demurrage_activation{m_active_chainstate.m_chainman.DemurrageKnownActivationHeight(tip)}) {
-        auto& schedule{m_active_chainstate.m_chainman.DemurrageSchedule(*demurrage_activation)};
-        const int next_height{tip->nHeight + 1};
-        const int evaluation_height{demurrage::EvaluationHeight(next_height)};
+    // BIP 462b policy: transactions rank by net fee, their fee less their
+    // policy charge, which is the charge of their inputs at an evaluation
+    // height of their own. An input spending an output of an unconfirmed
+    // transaction is charged as if that output were created in the next block,
+    // the earliest it can confirm. Charges are computed once CHARGE_HEIGHT is
+    // known: an evaluation height can lie beyond it.
+    std::vector<demurrage::PolicyInput> demurrage_inputs;
+    demurrage::PolicyCharge demurrage_charge;
+    {
+        ChainstateManager& chainman{m_active_chainstate.m_chainman};
+        const CBlockIndex* tip{Assert(m_active_chainstate.m_chain.Tip())};
+        const std::optional<int> demurrage_activation{chainman.DemurrageKnownActivationHeight(tip)};
+        demurrage_inputs.reserve(tx.vin.size());
         for (const CTxIn& txin : tx.vin) {
             const Coin& coin{m_view.AccessCoin(txin.prevout)};
             const bool unconfirmed{coin.nHeight == MEMPOOL_HEIGHT};
-            if (!unconfirmed && demurrage::IsPoolScript(coin.out.scriptPubKey) && static_cast<int>(coin.nHeight) >= *demurrage_activation) {
+            if (demurrage_activation && !unconfirmed && demurrage::IsPoolScript(coin.out.scriptPubKey) && static_cast<int>(coin.nHeight) >= *demurrage_activation) {
                 return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "demurrage-pool-spend");
             }
-            const int created_height{unconfirmed ? next_height : static_cast<int>(coin.nHeight)};
-            demurrage_charge += schedule.ChargeFor(coin.out.nValue, created_height, evaluation_height);
+            demurrage_inputs.push_back({.value = coin.out.nValue, .created_height = unconfirmed ? demurrage::UNCONFIRMED_HEIGHT : static_cast<int>(coin.nHeight)});
+        }
+        if (const auto charge_height{chainman.DemurrageKnownChargeHeight(tip)}) {
+            demurrage_charge = demurrage::EvaluatePolicyCharge(chainman.DemurrageSchedule(*charge_height), demurrage_inputs, tip->nHeight + 1);
         }
     }
 
@@ -1004,7 +1007,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     if (!m_subpackage.m_changeset) {
         m_subpackage.m_changeset = m_pool.GetChangeSet();
     }
-    ws.m_tx_handle = m_subpackage.m_changeset->StageAddition(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence, fSpendsCoinbase, nSigOpsCost, lock_points.value(), demurrage_charge);
+    ws.m_tx_handle = m_subpackage.m_changeset->StageAddition(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence, fSpendsCoinbase, nSigOpsCost, lock_points.value(), std::move(demurrage_inputs), demurrage_charge);
 
     // ws.m_modified_fees includes any fee deltas from PrioritiseTransaction,
     // less the demurrage charge (BIP 462b)
@@ -1015,7 +1018,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Enforces 0-fee for dust transactions, no incentive to be mined alone.
     // The demurrage charge is not a fee the transaction pays, so it does not count.
     if (m_pool.m_opts.require_standard) {
-        if (!PreCheckEphemeralTx(*ptx, m_pool.m_opts.dust_relay_feerate, ws.m_base_fees, ws.m_modified_fees + demurrage_charge, state)) {
+        if (!PreCheckEphemeralTx(*ptx, m_pool.m_opts.dust_relay_feerate, ws.m_base_fees, ws.m_modified_fees + demurrage_charge.charge, state)) {
             return false; // state filled in by PreCheckEphemeralTx
         }
     }
@@ -1083,7 +1086,9 @@ bool MemPoolAccept::ReplacementChecks(Workspace& ws)
     // Check if it's economically rational to mine this transaction rather than the ones it
     // replaces and pays for its own relay fees. Enforce Rules #3 and #4.
     for (CTxMemPool::txiter it : all_conflicts) {
-        m_subpackage.m_conflicting_fees += it->GetModifiedFee();
+        // BIP 462b policy: a policy charge grows as its transaction waits, so the
+        // fee to beat is the greater of the net fee now and at acceptance.
+        m_subpackage.m_conflicting_fees += it->GetModifiedFeeForReplacement();
         m_subpackage.m_conflicting_size += it->GetTxSize();
     }
 
@@ -1166,7 +1171,9 @@ bool MemPoolAccept::PackageRBFChecks(const std::vector<CTransactionRef>& txns,
 
     for (CTxMemPool::txiter it : all_conflicts) {
         m_subpackage.m_changeset->StageRemoval(it);
-        m_subpackage.m_conflicting_fees += it->GetModifiedFee();
+        // BIP 462b policy: a policy charge grows as its transaction waits, so the
+        // fee to beat is the greater of the net fee now and at acceptance.
+        m_subpackage.m_conflicting_fees += it->GetModifiedFeeForReplacement();
         m_subpackage.m_conflicting_size += it->GetTxSize();
     }
 
@@ -2653,11 +2660,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // transaction at index 1 must spend. Their coins are only read when that
     // transaction is reached, because inputs are prefetched in block order.
     const std::optional<int> demurrage_activation{m_chainman.DemurrageActivationHeight(pindex->pprev)};
-    demurrage::IndexSchedule* demurrage_schedule{nullptr};
+    // The index falls from CHARGE_HEIGHT. Until then no input owes a charge,
+    // and the rules below apply with a block charge of zero.
+    const std::optional<int> demurrage_charge_height{m_chainman.DemurrageChargeHeight(pindex->pprev)};
+    demurrage::IndexSchedule* demurrage_schedule{demurrage_charge_height ? &m_chainman.DemurrageSchedule(*demurrage_charge_height) : nullptr};
     std::vector<COutPoint> pool_inputs;
     CAmount block_charge{0};
     if (demurrage_activation) {
-        demurrage_schedule = &m_chainman.DemurrageSchedule(*demurrage_activation);
         if (!m_chainman.GetDemurragePoolInputs(*pindex->pprev, *demurrage_activation, pool_inputs)) {
             return FatalError(m_chainman.GetNotifications(), state, _("Failed to read a block to find the demurrage pool outputs."));
         }
@@ -2735,7 +2744,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                               strprintf("the transaction at index 1 is not the demurrage claim transaction %s", claim.GetHash().ToString()));
                 break;
             }
-        } else if (demurrage_schedule && !tx.IsCoinBase() &&
+        } else if (demurrage_activation && !tx.IsCoinBase() &&
                    std::ranges::any_of(tx.vout, [](const CTxOut& txout) { return demurrage::IsPoolScript(txout.scriptPubKey); })) {
             state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-pool-create",
                           "transaction " + tx.GetHash().ToString() + " creates a demurrage pool output");
@@ -2776,7 +2785,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
             // BIP 462b: every input but the claim transaction's owes a charge,
             // and none may spend a pool output.
-            if (demurrage_schedule && !is_claim) {
+            if (demurrage_activation && !is_claim) {
                 bool spends_pool{false};
                 for (const CTxIn& txin : tx.vin) {
                     const Coin& coin{view.AccessCoin(txin.prevout)};
@@ -2784,7 +2793,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                         spends_pool = true;
                         break;
                     }
-                    block_charge += demurrage_schedule->ChargeFor(coin.out.nValue, coin.nHeight, pindex->nHeight);
+                    if (demurrage_schedule) block_charge += demurrage_schedule->ChargeFor(coin.out.nValue, coin.nHeight, pindex->nHeight);
                 }
                 if (spends_pool) {
                     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-pool-spend",
@@ -2851,7 +2860,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
     }
     // BIP 462b: the coinbase pays exactly the block charge into one pool output, the contribution.
-    if (demurrage_schedule && state.IsValid()) {
+    if (demurrage_activation && state.IsValid()) {
         const auto& coinbase_outputs{block.vtx[0]->vout};
         const auto num_pool_outputs{std::ranges::count_if(coinbase_outputs, [](const CTxOut& txout) { return demurrage::IsPoolScript(txout.scriptPubKey); })};
         if (num_pool_outputs > 1) {
@@ -4631,7 +4640,10 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
-    if (!IsInitialBlockDownload() && ActiveTip() == pindex->pprev && m_options.signals) {
+    // BIP 462b: a block without the claim transaction that its pool inputs
+    // require is invalid, and nodes that do not enforce BIP 462b would accept
+    // it, so it is not announced here.
+    if (!IsInitialBlockDownload() && ActiveTip() == pindex->pprev && m_options.signals && HasExpectedDemurrageClaim(block, *pindex->pprev)) {
         m_options.signals->NewPoWValidBlock(pindex, pblock);
     }
 
@@ -6689,13 +6701,31 @@ util::Result<void> ChainstateManager::ActivateBestChains()
     return {};
 }
 
-demurrage::IndexSchedule& ChainstateManager::DemurrageSchedule(int activation_height)
+demurrage::IndexSchedule& ChainstateManager::DemurrageSchedule(int charge_height)
 {
     AssertLockHeld(::cs_main);
-    if (!m_demurrage_schedule || m_demurrage_schedule->ActivationHeight() != activation_height) {
-        m_demurrage_schedule.emplace(GetConsensus(), activation_height);
+    if (!m_demurrage_schedule || m_demurrage_schedule->ActivationHeight() != charge_height) {
+        m_demurrage_schedule.emplace(GetConsensus(), charge_height);
     }
     return *m_demurrage_schedule;
+}
+
+bool ChainstateManager::HasExpectedDemurrageClaim(const CBlock& block, const CBlockIndex& prev)
+{
+    AssertLockHeld(::cs_main);
+    const auto activation{DemurrageActivationHeight(&prev)};
+    if (!activation) return true;
+    std::vector<COutPoint> pool_inputs;
+    if (!GetDemurragePoolInputs(prev, *activation, pool_inputs)) return true;
+    if (pool_inputs.empty()) return true;
+    if (block.vtx.size() < 2) return false;
+    CAmount pool_value{0};
+    for (const COutPoint& outpoint : pool_inputs) {
+        const auto coin{ActiveChainstate().CoinsTip().GetCoin(outpoint)};
+        if (!coin) return true;
+        pool_value += coin->out.nValue;
+    }
+    return block.vtx[1]->GetWitnessHash() == CTransaction{demurrage::BuildClaimTransaction(pool_inputs, pool_value)}.GetWitnessHash();
 }
 
 void ChainstateManager::RecordDemurragePoolOutputs(const CBlockIndex& index, const demurrage::BlockPoolOutputs& outputs)
@@ -6710,6 +6740,9 @@ void ChainstateManager::RecordDemurragePoolOutputs(const CBlockIndex& index, con
         std::erase_if(m_demurrage_pool_outputs, [&](const auto& entry) { return entry.first->nHeight < min_height; });
     }
     m_demurrage_pool_outputs.insert_or_assign(&index, outputs);
+    // Keep the record with the block index, so that the pool inputs of later
+    // blocks can be found once this block has been pruned.
+    m_blockman.m_block_tree_db->WriteDemurragePoolOutputs(index.GetBlockHash(), outputs);
 }
 
 std::optional<demurrage::BlockPoolOutputs> ChainstateManager::GetDemurragePoolOutputs(const CBlockIndex& index)
@@ -6718,14 +6751,20 @@ std::optional<demurrage::BlockPoolOutputs> ChainstateManager::GetDemurragePoolOu
     if (const auto it{m_demurrage_pool_outputs.find(&index)}; it != m_demurrage_pool_outputs.end()) {
         return it->second;
     }
-    // The block has been connected, so it passed validation: only its coinbase
-    // and its claim transaction can have created pool outputs.
+    demurrage::BlockPoolOutputs outputs;
+    if (m_blockman.m_block_tree_db->ReadDemurragePoolOutputs(index.GetBlockHash(), outputs)) {
+        m_demurrage_pool_outputs.insert_or_assign(&index, outputs);
+        return outputs;
+    }
+    // There is no record of a block that was connected before records were
+    // kept. It passed validation, so only its coinbase and its claim
+    // transaction can have created pool outputs.
     CBlock block;
     if (!m_blockman.ReadBlock(block, index)) {
         LogError("Failed to read block %s to find its demurrage pool outputs", index.GetBlockHash().ToString());
         return std::nullopt;
     }
-    const demurrage::BlockPoolOutputs outputs{demurrage::FindBlockPoolOutputs(block)};
+    outputs = demurrage::FindBlockPoolOutputs(block);
     RecordDemurragePoolOutputs(index, outputs);
     return outputs;
 }

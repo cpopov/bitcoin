@@ -8,6 +8,7 @@
 
 #include <common/args.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <index/txospenderindex.h>
@@ -502,10 +503,13 @@ static std::vector<RPCResult> MempoolEntryDescription()
         RPCResult{RPCResult::Type::NUM, "ancestorsize", "virtual transaction size of in-mempool ancestors (including this one)"},
         RPCResult{RPCResult::Type::NUM, "chunkweight", "sigops-adjusted weight (as defined in BIP 141 and modified by '-bytespersigop') of this transaction's chunk"},
         RPCResult{RPCResult::Type::STR_HEX, "wtxid", "hash of serialized transaction, including witness data"},
+        RPCResult{RPCResult::Type::NUM, "chargeheight", /*optional=*/true, "BIP 462b evaluation height: the block height at which the policy charge was evaluated. Only once the height at which charges begin is known"},
         RPCResult{RPCResult::Type::OBJ, "fees", "",
             {
                 RPCResult{RPCResult::Type::STR_AMOUNT, "base", "transaction fee, denominated in " + CURRENCY_UNIT},
-                RPCResult{RPCResult::Type::STR_AMOUNT, "modified", "transaction fee with fee deltas used for mining priority, denominated in " + CURRENCY_UNIT},
+                RPCResult{RPCResult::Type::STR_AMOUNT, "modified", "transaction fee with fee deltas used for mining priority, less the BIP 462b policy charge, denominated in " + CURRENCY_UNIT},
+                RPCResult{RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b policy charge: the demurrage charge of the transaction's inputs at chargeheight, denominated in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
+                RPCResult{RPCResult::Type::STR_AMOUNT, "net", /*optional=*/true, "BIP 462b net fee: the transaction fee less the policy charge, denominated in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
                 RPCResult{RPCResult::Type::STR_AMOUNT, "ancestor", "transaction fees of in-mempool ancestors (including this one) with fee deltas used for mining priority, denominated in " + CURRENCY_UNIT},
                 RPCResult{RPCResult::Type::STR_AMOUNT, "descendant", "transaction fees of in-mempool descendants (including this one) with fee deltas used for mining priority, denominated in " + CURRENCY_UNIT},
                 RPCResult{RPCResult::Type::STR_AMOUNT, "chunk", "transaction fees of chunk, denominated in " + CURRENCY_UNIT},
@@ -593,6 +597,12 @@ static void entryToJSON(const CTxMemPool& pool, UniValue& info, const CTxMemPool
     UniValue fees(UniValue::VOBJ);
     fees.pushKV("base", ValueFromAmount(e.GetFee()));
     fees.pushKV("modified", ValueFromAmount(e.GetModifiedFee()));
+    const bool has_demurrage_charge{e.GetDemurrageEvaluationHeight() != demurrage::NO_EVALUATION_HEIGHT};
+    if (has_demurrage_charge) {
+        info.pushKV("chargeheight", e.GetDemurrageEvaluationHeight());
+        fees.pushKV("charge", ValueFromAmount(e.GetDemurrageCharge()));
+        fees.pushKV("net", ValueFromAmount(e.GetFee() - e.GetDemurrageCharge()));
+    }
     fees.pushKV("ancestor", ValueFromAmount(ancestor_fees));
     fees.pushKV("descendant", ValueFromAmount(descendant_fees));
     fees.pushKV("chunk", ValueFromAmount(feerate.fee));

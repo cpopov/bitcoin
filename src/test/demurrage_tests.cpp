@@ -9,15 +9,18 @@
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
+#include <random.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/solver.h>
 #include <serialize.h>
+#include <streams.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -270,20 +273,99 @@ BOOST_AUTO_TEST_CASE(claim_transaction)
     BOOST_CHECK_EQUAL(::GetSerializeSize(CTxOut{1, PoolScript()}), 16U);
 }
 
-BOOST_AUTO_TEST_CASE(evaluation_height)
+BOOST_AUTO_TEST_CASE(policy_charge)
 {
-    // The smallest multiple of 144 that is at least the next block's height plus 144.
-    BOOST_CHECK_EQUAL(EvaluationHeight(1), 288);
-    BOOST_CHECK_EQUAL(EvaluationHeight(143), 288);
-    BOOST_CHECK_EQUAL(EvaluationHeight(144), 288);
-    BOOST_CHECK_EQUAL(EvaluationHeight(145), 432);
-    BOOST_CHECK_EQUAL(EvaluationHeight(1'260'000), 1'260'144);
-    BOOST_CHECK_EQUAL(EvaluationHeight(1'260'001), 1'260'288);
-    for (int next_height{1}; next_height < 1000; ++next_height) {
-        const int evaluation{EvaluationHeight(next_height)};
-        BOOST_CHECK_EQUAL(evaluation % CHARGE_MARGIN, 0);
-        BOOST_CHECK_GE(evaluation, next_height + CHARGE_MARGIN);
-        BOOST_CHECK_LT(evaluation, next_height + 2 * CHARGE_MARGIN);
+    // The mainnet evaluation heights of the BIP's test vectors: one input of
+    // value v created at height c, when the next block's height is n.
+    const auto& params{MainParams()};
+    IndexSchedule schedule{params, 1'260'000};
+    struct Vector {
+        CAmount value;
+        int created_height;
+        int next_height;
+        int margin;
+        CAmount charge_at_next;
+        CAmount policy_charge;
+    };
+    const std::vector<Vector> vectors{
+        // The rate of 2032-2036.
+        {1 * COIN, 1'269'000, 1'270'000, 144, 1'930, 2'208},
+        {10 * COIN, 1'269'000, 1'270'000, 51, 19'297, 20'281},
+        {100 * COIN, 1'269'000, 1'270'000, 5, 192'961, 193'926},
+        {1000 * COIN, 1'269'000, 1'270'000, 0, 1'929'606, 1'929'606},
+        // An output of an unconfirmed transaction is charged from the next block.
+        {10 * COIN, UNCONFIRMED_HEIGHT, 1'270'000, 51, 0, 985},
+        // The full target rate.
+        {1 * COIN, 6'939'000, 6'940'000, 144, 5'708, 6'530},
+        {10 * COIN, 6'939'000, 6'940'000, 17, 57'076, 58'047},
+        {100 * COIN, 6'939'000, 6'940'000, 1, 570'760, 571'331},
+        {1000 * COIN, 6'939'000, 6'940'000, 0, 5'707'600, 5'707'600},
+        {10 * COIN, UNCONFIRMED_HEIGHT, 6'940'000, 17, 0, 971},
+    };
+    for (const Vector& v : vectors) {
+        const std::vector<PolicyInput> inputs{{.value = v.value, .created_height = v.created_height}};
+        const PolicyCharge policy{EvaluatePolicyCharge(schedule, inputs, v.next_height)};
+        BOOST_CHECK_EQUAL(policy.evaluation_height, v.next_height + v.margin);
+        BOOST_CHECK_EQUAL(policy.charge, v.policy_charge);
+        BOOST_CHECK_EQUAL(schedule.ChargeFor(v.value, std::min(v.created_height, v.next_height), v.next_height), v.charge_at_next);
+    }
+
+    // While the rate is zero, every transaction is evaluated CHARGE_MARGIN blocks ahead, at no charge.
+    {
+        const std::vector<PolicyInput> inputs{{.value = 1000 * COIN, .created_height = 100}};
+        const PolicyCharge policy{EvaluatePolicyCharge(schedule, inputs, 1'000'000)};
+        BOOST_CHECK_EQUAL(policy.evaluation_height, 1'000'000 + CHARGE_MARGIN);
+        BOOST_CHECK_EQUAL(policy.charge, 0);
+    }
+    // A transaction without inputs to charge is not a special case.
+    BOOST_CHECK(EvaluatePolicyCharge(schedule, {}, 1'270'000) == (PolicyCharge{.evaluation_height = 1'270'000 + CHARGE_MARGIN, .charge = 0}));
+    // By default no charge applies, and no evaluation height either.
+    BOOST_CHECK(PolicyCharge{} == (PolicyCharge{.evaluation_height = NO_EVALUATION_HEIGHT, .charge = 0}));
+
+    // On regtest, with several inputs: the evaluation height is the greatest
+    // height within the margin at which the charge is within the tolerance of
+    // the charge at the next block's height.
+    const Consensus::Params regtest{RegTestParams()};
+    IndexSchedule regtest_schedule{regtest, 432};
+    FastRandomContext rng{/*fDeterministic=*/true};
+    for (int i{0}; i < 200; ++i) {
+        const int next_height{600 + static_cast<int>(rng.randrange(600))};
+        std::vector<PolicyInput> inputs;
+        for (int j{0}, n{1 + static_cast<int>(rng.randrange(4))}; j < n; ++j) {
+            inputs.push_back({.value = static_cast<CAmount>(rng.randrange(1) ? rng.randrange(50 * COIN) : rng.randrange(2'000'000)),
+                              .created_height = rng.randbool() ? UNCONFIRMED_HEIGHT : static_cast<int>(rng.randrange(next_height))});
+        }
+        const auto charge_at{[&](int height) {
+            CAmount charge{0};
+            for (const PolicyInput& input : inputs) charge += regtest_schedule.ChargeFor(input.value, std::min(input.created_height, next_height), height);
+            return charge;
+        }};
+        int expected{next_height};
+        while (expected < next_height + CHARGE_MARGIN && charge_at(expected + 1) - charge_at(next_height) <= CHARGE_TOLERANCE) ++expected;
+        const PolicyCharge policy{EvaluatePolicyCharge(regtest_schedule, inputs, next_height)};
+        BOOST_CHECK_EQUAL(policy.evaluation_height, expected);
+        BOOST_CHECK_EQUAL(policy.charge, charge_at(expected));
+        BOOST_CHECK_LE(policy.charge - charge_at(next_height), CHARGE_TOLERANCE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(pool_outputs_serialization)
+{
+    // The records of a block's pool outputs that are kept with the block index.
+    const COutPoint carry{Txid::FromUint256(uint256::ONE), 0};
+    const COutPoint contribution{Txid::FromUint256(uint256{2}), 1};
+    for (const BlockPoolOutputs& outputs : {
+             BlockPoolOutputs{},
+             BlockPoolOutputs{.carry = carry, .contribution = std::nullopt},
+             BlockPoolOutputs{.carry = std::nullopt, .contribution = contribution},
+             BlockPoolOutputs{.carry = carry, .contribution = contribution},
+         }) {
+        DataStream stream;
+        stream << outputs;
+        BOOST_CHECK_EQUAL(stream.size(), 72U);
+        BlockPoolOutputs read;
+        stream >> read;
+        BOOST_CHECK(read == outputs);
     }
 }
 

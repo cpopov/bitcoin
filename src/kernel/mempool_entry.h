@@ -6,20 +6,25 @@
 #define BITCOIN_KERNEL_MEMPOOL_ENTRY_H
 
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <consensus/validation.h>
 #include <core_memusage.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
 #include <primitives/transaction.h>
 #include <txgraph.h>
+#include <util/check.h>
 #include <util/overflow.h>
 #include <util/time.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <set>
+#include <utility>
+#include <vector>
 
 class CBlockIndex;
 
@@ -80,7 +85,13 @@ private:
     const bool spendsCoinbase;      //!< keep track of transactions that spend a coinbase
     const int64_t sigOpCost;        //!< Total sigop cost
     mutable CAmount m_modified_fee; //!< Used for determining the priority of the transaction for mining in a block
-    mutable CAmount m_demurrage_charge{0}; //!< BIP 462b: charge of the inputs at the evaluation height, deducted from m_modified_fee
+    //! BIP 462b policy: the transaction's policy charge, which m_modified_fee excludes, and its evaluation height E_tx.
+    mutable demurrage::PolicyCharge m_demurrage_charge;
+    //! BIP 462b policy: the policy charge when the transaction was accepted. Replacements are compared against it.
+    mutable CAmount m_demurrage_charge_at_acceptance{0};
+    //! BIP 462b policy: the value and created height of the output that each input spends, kept to re-evaluate the
+    //! charge without looking the outputs up again. Its size never changes, so nUsageSize can include it.
+    mutable std::vector<demurrage::PolicyInput> m_demurrage_inputs;
     mutable LockPoints lockPoints;  //!< Track the height and time at which tx was final
 
 public:
@@ -92,13 +103,14 @@ public:
         : tx{tx},
           nFee{fee},
           nTxWeight{GetTransactionWeight(*tx)},
-          nUsageSize{RecursiveDynamicUsage(tx)},
+          nUsageSize{RecursiveDynamicUsage(tx) + memusage::MallocUsage(tx->vin.size() * sizeof(demurrage::PolicyInput))},
           nTime{time},
           entry_sequence{entry_sequence},
           entryHeight{entry_height},
           spendsCoinbase{spends_coinbase},
           sigOpCost{sigops_cost},
           m_modified_fee{nFee},
+          m_demurrage_inputs(tx->vin.size()),
           lockPoints{lp} {}
 
     CTxMemPoolEntry& operator=(const CTxMemPoolEntry&) = delete;
@@ -128,13 +140,47 @@ public:
         m_modified_fee = SaturatingAdd(m_modified_fee, fee_diff);
     }
 
-    CAmount GetDemurrageCharge() const { return m_demurrage_charge; }
+    /** BIP 462b policy: the policy charge that GetModifiedFee() excludes. */
+    CAmount GetDemurrageCharge() const { return m_demurrage_charge.charge; }
+    /** BIP 462b policy: E_tx, the height the policy charge was evaluated at, or demurrage::NO_EVALUATION_HEIGHT. */
+    int GetDemurrageEvaluationHeight() const { return m_demurrage_charge.evaluation_height; }
+    const std::vector<demurrage::PolicyInput>& GetDemurrageInputs() const { return m_demurrage_inputs; }
 
-    // BIP 462b: replace the demurrage charge deducted from the modified fee.
-    void UpdateDemurrageCharge(CAmount charge) const
+    /**
+     * BIP 462b policy: the modified fee to require of a replacement. A policy
+     * charge grows as its transaction waits, so this is the greater of the
+     * modified fee now and what it would be with the charge at acceptance.
+     */
+    CAmount GetModifiedFeeForReplacement() const
     {
-        UpdateModifiedFee(m_demurrage_charge - charge);
+        return SaturatingAdd(m_modified_fee, std::max<CAmount>(0, m_demurrage_charge.charge - m_demurrage_charge_at_acceptance));
+    }
+
+    // BIP 462b policy: replace the policy charge that the modified fee excludes.
+    void UpdateDemurrageCharge(const demurrage::PolicyCharge& charge) const
+    {
+        UpdateModifiedFee(m_demurrage_charge.charge - charge.charge);
         m_demurrage_charge = charge;
+    }
+
+    // BIP 462b policy: record the policy charge of a transaction that is being accepted.
+    void SetDemurrageChargeAtAcceptance(const demurrage::PolicyCharge& charge) const
+    {
+        UpdateDemurrageCharge(charge);
+        m_demurrage_charge_at_acceptance = charge.charge;
+    }
+
+    // BIP 462b policy: replace the recorded inputs, one per input of the transaction.
+    void SetDemurrageInputs(std::vector<demurrage::PolicyInput> inputs) const
+    {
+        Assume(inputs.size() == m_demurrage_inputs.size());
+        if (inputs.size() == m_demurrage_inputs.size()) m_demurrage_inputs = std::move(inputs);
+    }
+
+    // BIP 462b policy: the output that an input spends has confirmed at a height.
+    void SetDemurrageInputHeight(size_t input, int created_height) const
+    {
+        if (input < m_demurrage_inputs.size()) m_demurrage_inputs[input].created_height = created_height;
     }
 
     // Update the LockPoints after a reorg

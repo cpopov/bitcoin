@@ -192,9 +192,19 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     CAmount demurrage_contribution{0};
     if (demurrage_activation) {
         auto& charges{pblocktemplate->vTxDemurrageCharges};
-        charges = GetDemurrageCharges(std::span{pblock->vtx}.subspan(1), m_chainstate.CoinsTip(),
-                                      chainman.DemurrageSchedule(*demurrage_activation), nHeight);
+        // No input owes a charge until the index starts to fall at CHARGE_HEIGHT.
+        const std::optional<int> charge_height{chainman.DemurrageChargeHeight(pindexPrev)};
+        charges = charge_height ?
+            GetDemurrageCharges(std::span{pblock->vtx}.subspan(1), m_chainstate.CoinsTip(), chainman.DemurrageSchedule(*charge_height), nHeight) :
+            std::vector<CAmount>(pblock->vtx.size() - 1, 0);
         demurrage_contribution = std::accumulate(charges.begin(), charges.end(), CAmount{0});
+        // The coinbase pays the contribution out of the subsidy and the fees. A
+        // transaction whose charge exceeds its fee can only have been selected
+        // because it was prioritised. If the block cannot fund it, leave it out.
+        const CAmount subsidy_and_payout{claim_fee + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+        while (demurrage_contribution > nFees + subsidy_and_payout) {
+            demurrage_contribution -= RemoveUnfundedTransaction(charges);
+        }
         pblocktemplate->demurrage_contribution = demurrage_contribution;
         if (claim_tx) {
             pblock->vtx.insert(pblock->vtx.begin() + 1, claim_tx);
@@ -226,9 +236,7 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees, less the demurrage contribution
     const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
-    if (demurrage_contribution > block_reward) {
-        throw std::runtime_error(strprintf("Demurrage contribution %d exceeds the block reward %d", demurrage_contribution, block_reward));
-    }
+    Assert(demurrage_contribution <= block_reward);
     coinbaseTx.vout[0].nValue = block_reward - demurrage_contribution;
     coinbase_tx.block_reward_remaining = block_reward - demurrage_contribution;
     if (demurrage_contribution > 0) {
@@ -401,6 +409,52 @@ void BlockAssembler::addChunks()
     }
 }
 
+CAmount BlockAssembler::RemoveUnfundedTransaction(std::vector<CAmount>& charges)
+{
+    CBlock& block{pblocktemplate->block};
+    auto& fees{pblocktemplate->vTxFees};
+    auto& sigops{pblocktemplate->vTxSigOpsCost};
+    // Transaction i of the template is block.vtx[i + 1]: the claim transaction is not in the block yet.
+    Assert(charges.size() == fees.size() && fees.size() == sigops.size() && fees.size() + 1 == block.vtx.size());
+
+    // The transaction that costs the block the most.
+    size_t worst{0};
+    for (size_t i{1}; i < charges.size(); ++i) {
+        if (charges[i] - fees[i] > charges[worst] - fees[worst]) worst = i;
+    }
+    // The contribution exceeds the fees, so some transaction's charge exceeds its fee.
+    Assert(!charges.empty() && charges[worst] > fees[worst]);
+
+    // Remove it, and the later transactions that spend its outputs or theirs.
+    std::unordered_set<Txid, SaltedTxidHasher> removed;
+    CAmount removed_charge{0};
+    size_t kept{0};
+    for (size_t i{0}; i < charges.size(); ++i) {
+        const CTransactionRef tx{block.vtx[i + 1]};
+        const bool remove{i == worst || std::ranges::any_of(tx->vin, [&](const CTxIn& txin) { return removed.contains(txin.prevout.hash); })};
+        if (remove) {
+            LogWarning("Leaving transaction %s out of the block template: its demurrage charge %d exceeds what the block can fund", tx->GetHash().ToString(), charges[i]);
+            removed.insert(tx->GetHash());
+            removed_charge += charges[i];
+            nFees -= fees[i];
+            nBlockWeight -= GetTransactionWeight(*tx);
+            nBlockSigOpsCost -= sigops[i];
+            --nBlockTx;
+            continue;
+        }
+        block.vtx[kept + 1] = tx;
+        charges[kept] = charges[i];
+        fees[kept] = fees[i];
+        sigops[kept] = sigops[i];
+        ++kept;
+    }
+    block.vtx.resize(kept + 1);
+    charges.resize(kept);
+    fees.resize(kept);
+    sigops.resize(kept);
+    return removed_charge;
+}
+
 std::vector<CAmount> GetDemurrageCharges(std::span<const CTransactionRef> txs, const CCoinsViewCache& coins,
                                          demurrage::IndexSchedule& schedule, int height)
 {
@@ -441,9 +495,10 @@ void UpdateDemurrageContribution(CBlock& block, ChainstateManager& chainman)
         throw std::runtime_error("Failed to find the demurrage pool inputs");
     }
     const size_t first_charged{pool_inputs.empty() ? size_t{1} : size_t{2}};
-    const CAmount charge{block.vtx.size() > first_charged ?
+    const std::optional<int> charge_height{chainman.DemurrageChargeHeight(prev)};
+    const CAmount charge{charge_height && block.vtx.size() > first_charged ?
         GetBlockDemurrageCharge(std::span{block.vtx}.subspan(first_charged), chainman.ActiveChainstate().CoinsTip(),
-                                chainman.DemurrageSchedule(*activation), prev->nHeight + 1) :
+                                chainman.DemurrageSchedule(*charge_height), prev->nHeight + 1) :
         CAmount{0}};
 
     CMutableTransaction coinbase{*block.vtx.at(0)};

@@ -60,6 +60,7 @@ static constexpr uint8_t DB_BLOCK_INDEX{'b'};
 static constexpr uint8_t DB_FLAG{'F'};
 static constexpr uint8_t DB_REINDEX_FLAG{'R'};
 static constexpr uint8_t DB_LAST_BLOCK{'l'};
+static constexpr uint8_t DB_DEMURRAGE_POOL_OUTPUTS{'d'};
 // Keys used in previous version that might still be found in the DB:
 // BlockTreeDB::DB_TXINDEX_BLOCK{'T'};
 // BlockTreeDB::DB_TXINDEX{'t'}
@@ -82,6 +83,16 @@ void BlockTreeDB::WriteReindexing(bool fReindexing)
 void BlockTreeDB::ReadReindexing(bool& fReindexing)
 {
     fReindexing = Exists(DB_REINDEX_FLAG);
+}
+
+void BlockTreeDB::WriteDemurragePoolOutputs(const uint256& block_hash, const demurrage::BlockPoolOutputs& outputs)
+{
+    Write(std::make_pair(DB_DEMURRAGE_POOL_OUTPUTS, block_hash), outputs);
+}
+
+bool BlockTreeDB::ReadDemurragePoolOutputs(const uint256& block_hash, demurrage::BlockPoolOutputs& outputs)
+{
+    return Read(std::make_pair(DB_DEMURRAGE_POOL_OUTPUTS, block_hash), outputs);
 }
 
 bool BlockTreeDB::ReadLastBlockFile(int& nFile)

@@ -6,6 +6,7 @@
 #include <chainparams.h>
 #include <common/system.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/validation.h>
 #include <crypto/sha256.h>
 #include <crypto/siphash.h>
@@ -18,18 +19,31 @@
 
 #include <unordered_map>
 
+/**
+ * BIP 462b: whether the transaction at index 1 has the form of a claim
+ * transaction, with one output that pays POOL_SCRIPT. A claim transaction is
+ * never in a mempool, so it is prefilled, as the coinbase is.
+ */
+static bool HasClaimTransaction(const CBlock& block)
+{
+    return block.vtx.size() > 1 && block.vtx[1]->vout.size() == 1 && demurrage::IsPoolScript(block.vtx[1]->vout[0].scriptPubKey);
+}
+
 CBlockHeaderAndShortTxIDs::CBlockHeaderAndShortTxIDs(const CBlock& block, uint64_t nonce)
     : nonce(nonce),
-      shorttxids(block.vtx.size() - 1),
-      prefilledtxn(1),
+      prefilledtxn(HasClaimTransaction(block) ? 2 : 1),
       header(block)
 {
     FillShortTxIDSelector();
     // TODO: Use our mempool prior to block acceptance to predictively fill more than just the coinbase
-    prefilledtxn[0] = {0, block.vtx[0]};
-    for (size_t i = 1; i < block.vtx.size(); i++) {
+    // A prefilled transaction's index is its offset from the one before it.
+    for (size_t i = 0; i < prefilledtxn.size(); i++) {
+        prefilledtxn[i] = {0, block.vtx[i]};
+    }
+    shorttxids.resize(block.vtx.size() - prefilledtxn.size());
+    for (size_t i = prefilledtxn.size(); i < block.vtx.size(); i++) {
         const CTransaction& tx = *block.vtx[i];
-        shorttxids[i - 1] = GetShortID(tx.GetWitnessHash());
+        shorttxids[i - prefilledtxn.size()] = GetShortID(tx.GetWitnessHash());
     }
 }
 

@@ -651,16 +651,20 @@ static std::string gbt_rule_value(const std::string& name, bool gbt_optional_rul
 static GlobalMutex g_demurrage_rule_warning_mutex;
 static std::optional<NodeClock::time_point> g_last_demurrage_rule_warning GUARDED_BY(g_demurrage_rule_warning_mutex);
 
-/** BIP 462b: warn, at most once an hour, that templates will require the demurrage rule. */
-static void WarnDemurrageRuleRequired(int required_height)
+/**
+ * BIP 462b: warn, at most once an hour, that templates will require the
+ * demurrage_charges rule, and from which height if that is known.
+ */
+static void WarnDemurrageRuleRequired(std::optional<int> required_height)
 {
     LOCK(g_demurrage_rule_warning_mutex);
     const auto now{NodeClock::now()};
     if (g_last_demurrage_rule_warning && now - *g_last_demurrage_rule_warning < 1h) return;
     g_last_demurrage_rule_warning = now;
+    const std::string from{required_height ? strprintf("from height %d, when", *required_height) : std::string{"once"}};
     LogWarning("getblocktemplate client does not declare support for the '%s' rule (BIP 462b). "
-               "Templates will require it from height %d, when blocks begin to owe a demurrage contribution.",
-               DeploymentName(Consensus::DEPLOYMENT_DEMURRAGE), required_height);
+               "Templates will require it %s blocks begin to owe a demurrage contribution.",
+               DeploymentName(Consensus::DEPLOYMENT_DEMURRAGE_CHARGES), from);
 }
 
 static RPCMethod getblocktemplate()
@@ -1039,8 +1043,9 @@ static RPCMethod getblocktemplate()
     }
 
     const std::string demurrage_rule{DeploymentName(Consensus::DEPLOYMENT_DEMURRAGE)};
+    const std::string charges_rule{DeploymentName(Consensus::DEPLOYMENT_DEMURRAGE_CHARGES)};
     for (const auto& [name, info] : gbtstatus.active) {
-        if (name == demurrage_rule) continue; // See below.
+        if (name == demurrage_rule || name == charges_rule) continue; // See below.
         aRules.push_back(gbt_rule_value(name, info.gbt_optional_rule));
         if (!info.gbt_optional_rule && !setClientRules.contains(name)) {
             // Not supported by the client; make sure it's safe to proceed
@@ -1048,19 +1053,27 @@ static RPCMethod getblocktemplate()
         }
     }
 
-    // BIP 462b: the rule is optional from activation, while no block can owe a
-    // charge and a client that ignores it can use the template as it is. It is
-    // required from the first rate period with a non-zero rate. This also
-    // covers a deployment forced active with -testactivationheight.
-    if (const auto activation{chainman.DemurrageActivationHeight(pindexPrev)}) {
-        const std::optional<int> required_height{chainman.DemurrageSchedule(*activation).FirstChargeHeight()};
-        const bool required{required_height && pindexPrev->nHeight + 1 >= *required_height};
-        aRules.push_back(gbt_rule_value(demurrage_rule, /*gbt_optional_rule=*/!required));
-        if (!setClientRules.contains(demurrage_rule)) {
+    // BIP 462b: demurrage is optional at every height. demurrage_charges is
+    // optional while no block can owe a charge, because a client that ignores
+    // it can use the template as it is, and required from the first rate
+    // period with a non-zero rate. This also covers deployments forced active
+    // with -testactivationheight.
+    if (chainman.DemurrageActivationHeight(pindexPrev)) {
+        aRules.push_back(gbt_rule_value(demurrage_rule, /*gbt_optional_rule=*/true));
+        const auto first_charge_height{[&](std::optional<int> charge_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+            return charge_height ? chainman.DemurrageSchedule(*charge_height).FirstChargeHeight() : std::nullopt;
+        }};
+        bool required{false};
+        if (const auto charge_height{chainman.DemurrageChargeHeight(pindexPrev)}) {
+            const std::optional<int> required_height{first_charge_height(charge_height)};
+            required = required_height && pindexPrev->nHeight + 1 >= *required_height;
+            aRules.push_back(gbt_rule_value(charges_rule, /*gbt_optional_rule=*/!required));
+        }
+        if (!setClientRules.contains(charges_rule)) {
             if (required) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Support for '%s' rule requires explicit client support", demurrage_rule));
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Support for '%s' rule requires explicit client support", charges_rule));
             }
-            if (required_height) WarnDemurrageRuleRequired(*required_height);
+            WarnDemurrageRuleRequired(first_charge_height(chainman.DemurrageKnownChargeHeight(pindexPrev)));
         }
     }
 

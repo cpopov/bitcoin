@@ -1230,6 +1230,8 @@ static RPCMethod gettxout()
                     {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
                 }},
                 {RPCResult::Type::BOOL, "coinbase", "Coinbase or not"},
+                {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b demurrage charge that the output would owe if it were spent in the next block, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
+                {RPCResult::Type::STR_AMOUNT, "effective_value", /*optional=*/true, "BIP 462b effective value: the value less that charge, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
             }},
         },
         RPCExamples{
@@ -1278,6 +1280,13 @@ static RPCMethod gettxout()
     ScriptToUniv(coin->out.scriptPubKey, /*out=*/o, /*include_hex=*/true, /*include_address=*/true);
     ret.pushKV("scriptPubKey", std::move(o));
     ret.pushKV("coinbase", coin->IsCoinBase());
+    if (const auto charge_height{chainman.DemurrageKnownChargeHeight(pindex)}) {
+        // An output of an unconfirmed transaction owes nothing in the next block.
+        const CAmount charge{coin->nHeight == MEMPOOL_HEIGHT ? 0 :
+            chainman.DemurrageSchedule(*charge_height).ChargeFor(coin->out.nValue, coin->nHeight, pindex->nHeight + 1)};
+        ret.pushKV("charge", ValueFromAmount(charge));
+        ret.pushKV("effective_value", ValueFromAmount(coin->out.nValue - charge));
+    }
 
     return ret;
 },
@@ -1338,7 +1347,7 @@ static void SoftForkDescPushBack(const CBlockIndex* blockindex, UniValue& softfo
 
     // BIP 462b: -testactivationheight=demurrage@height overrides version bits,
     // so report it as a deployment active from a fixed height.
-    if (const auto& forced_height{chainman.GetConsensus().DemurrageTestActivationHeight}; id == Consensus::DEPLOYMENT_DEMURRAGE && forced_height) {
+    if (const auto forced_height{DemurrageTestHeight(chainman.GetConsensus(), id)}) {
         UniValue rv(UniValue::VOBJ);
         rv.pushKV("type", "buried");
         rv.pushKV("active", DeploymentActiveAfter(blockindex, chainman, id));
@@ -1540,6 +1549,7 @@ UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& 
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_SEGWIT);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TESTDUMMY);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_DEMURRAGE);
+    SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_DEMURRAGE_CHARGES);
     return softforks;
 }
 } // anon namespace

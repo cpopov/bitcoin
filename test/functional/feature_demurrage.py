@@ -4,22 +4,28 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test BIP 462b (soft-fork demurrage).
 
-node0 enforces BIP 462b from ACTIVATION_HEIGHT (-testactivationheight).
+node0 enforces BIP 462b. Its two deployments are forced with
+-testactivationheight: demurrage gives ACTIVATION_HEIGHT, from which the rules
+are enforced, and demurrage_charges gives CHARGE_HEIGHT, at which the index
+starts.
 node1 does not enforce it, so it validates blocks with the existing rules
 only. node1 accepting every block that node0 accepts, including their claim
 transactions and contributions, shows that the rules are a soft fork.
 
-The test keeps its own model of the rate, the index, the charges and the
-pool, written from the BIP, and checks every block of node0's chain from
-activation against it.
+The test keeps its own model of the rate, the index, the charges, the pool and
+the policy charge, written from the BIP, and checks every block of node0's
+chain from activation, and node0's mempool entries, against it.
 
 On regtest the rate period is 144 blocks and the target 1/2,000 of the
-scheduled supply per block, so with activation at 432 the first rate period
+scheduled supply per block, so with CHARGE_HEIGHT at 432 the first rate period
 has a zero rate and charges begin at 576.
 
-node2 has a chain of its own, on which the deployment activates through
-version bits signalling. It tests the getblocktemplate rule while the
-deployment is signalling, locked in and active.
+node2 has a chain of its own, on which the deployments activate through
+version bits signalling, at different heights. It tests the getblocktemplate
+rules while each deployment is signalling, locked in and active.
+
+node3 is a pruned node that enforces BIP 462b. It syncs node0's chain late in
+the test.
 """
 from decimal import Decimal
 
@@ -30,13 +36,20 @@ from test_framework.blocktools import (
 )
 from test_framework.messages import (
     COIN,
+    CInv,
     COutPoint,
     CTransaction,
     CTxIn,
     CTxInWitness,
     CTxOut,
+    HeaderAndShortIDs,
+    MSG_CMPCT_BLOCK,
+    msg_getdata,
+    msg_getheaders,
+    msg_sendcmpct,
     tx_from_hex,
 )
+from test_framework.p2p import P2PInterface
 from test_framework.script import CScript, OP_TRUE
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -46,7 +59,8 @@ from test_framework.util import (
 )
 from test_framework.wallet import MiniWallet
 
-ACTIVATION_HEIGHT = 432
+ACTIVATION_HEIGHT = 288
+CHARGE_HEIGHT = 432
 FIRST_CHARGED_HEIGHT = 576
 RATE_PERIOD = 144
 TARGET_NUMERATOR, TARGET_DENOMINATOR = 1, 2000
@@ -54,14 +68,26 @@ HALVING_INTERVAL = 150
 INDEX_ONE = 10**18
 POOL_DIVISOR = 10_000
 CHARGE_MARGIN = 144
+CHARGE_TOLERANCE = 1000
 COINBASE_MATURITY = 100
+MIN_BLOCKS_TO_KEEP = 288
 POOL_SCRIPT = bytes.fromhex("04706f6f6c7551")
 POOL_SCRIPT_HEX = POOL_SCRIPT.hex()
 DEMURRAGE_BIT = 4
+CHARGES_BIT = 3
 UNDECLARED = {"rules": ["segwit"]}
-DECLARED = {"rules": ["segwit", "demurrage"]}
-RULE_REQUIRED_ERROR = "Support for 'demurrage' rule requires explicit client support"
+DECLARED = {"rules": ["segwit", "demurrage", "demurrage_charges"]}
+RULE_REQUIRED_ERROR = "Support for 'demurrage_charges' rule requires explicit client support"
 RULE_WARNING = f"Templates will require it from height {FIRST_CHARGED_HEIGHT}"
+# Outputs whose charge grows slowly enough for the policy charge to be evaluated ahead.
+SMALL_COINS = {
+    "full_margin": 20_000,
+    "medium_margin": 100_000,
+    "short_margin": 1_000_000,
+    "parent": 1_000_000,
+    "replaced": 1_000_000,
+    "restart": 100_000,
+}
 
 
 def to_sat(btc):
@@ -93,26 +119,26 @@ def period_rate(start):
 
 
 class IndexSchedule:
-    def __init__(self, activation_height):
-        self.activation_height = activation_height
+    def __init__(self, charge_height):
+        self.charge_height = charge_height
         self.index = []
         self.rates = []
 
     def rate_at(self, height):
-        if height < self.activation_height:
+        if height < self.charge_height:
             return 0
-        k = (height - self.activation_height) // RATE_PERIOD
+        k = (height - self.charge_height) // RATE_PERIOD
         while len(self.rates) <= k:
-            self.rates.append(period_rate(self.activation_height + len(self.rates) * RATE_PERIOD))
+            self.rates.append(period_rate(self.charge_height + len(self.rates) * RATE_PERIOD))
         return self.rates[k]
 
     def index_at(self, height):
-        if height < self.activation_height:
+        if height < self.charge_height:
             return INDEX_ONE
-        offset = height - self.activation_height
+        offset = height - self.charge_height
         while len(self.index) <= offset:
             previous = self.index[-1] if self.index else INDEX_ONE
-            rate = self.rate_at(self.activation_height + len(self.index))
+            rate = self.rate_at(self.charge_height + len(self.index))
             self.index.append(max(1, previous * (INDEX_ONE - rate) // INDEX_ONE))
         return self.index[offset]
 
@@ -122,8 +148,19 @@ class IndexSchedule:
         return value - value * self.index_at(spent) // self.index_at(created)
 
 
-def evaluation_height(next_height):
-    return (next_height + 2 * CHARGE_MARGIN - 1) // CHARGE_MARGIN * CHARGE_MARGIN
+def policy_charge(schedule, coins, next_height):
+    """(E_tx, charge_at(E_tx)) of a transaction that spends coins [(value, height)].
+
+    A height of None is an output of an unconfirmed transaction, which is
+    charged as if it were created in the next block."""
+    def charge_at(height):
+        return sum(schedule.charge(value, next_height if created is None else created, height) for value, created in coins)
+
+    base = charge_at(next_height)
+    evaluation = next_height
+    while evaluation < next_height + CHARGE_MARGIN and charge_at(evaluation + 1) - base <= CHARGE_TOLERANCE:
+        evaluation += 1
+    return evaluation, charge_at(evaluation)
 
 
 def prevout_txid(txin):
@@ -141,18 +178,33 @@ def build_claim(pool_inputs):
     return tx
 
 
+class CompactBlockPeer(P2PInterface):
+    """A peer that records the blocks announced to it with a compact block."""
+    def __init__(self):
+        super().__init__()
+        self.compact_blocks = {}
+
+    def on_cmpctblock(self, message):
+        self.compact_blocks[message.header_and_shortids.header.hash_int] = HeaderAndShortIDs(message.header_and_shortids)
+
+
 class DemurrageTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 3
+        self.num_nodes = 4
         self.setup_clean_chain = True
+        enforcing = [
+            f"-testactivationheight=demurrage@{ACTIVATION_HEIGHT}",
+            f"-testactivationheight=demurrage_charges@{CHARGE_HEIGHT}",
+        ]
         self.extra_args = [
-            [f"-testactivationheight=demurrage@{ACTIVATION_HEIGHT}"],
+            enforcing,
             [],  # node1 does not enforce BIP 462b
-            ["-vbparams=demurrage:0:9999999999"],  # node2 activates through signalling
+            ["-vbparams=demurrage:0:9999999999", "-vbparams=demurrage_charges:0:9999999999"],  # node2 activates through signalling
+            enforcing + ["-prune=1", "-fastprune"],
         ]
 
     def setup_network(self):
-        # node2 stays on a chain of its own.
+        # node2 stays on a chain of its own, and node3 joins later.
         self.setup_nodes()
         self.connect_nodes(0, 1)
         self.sync_all()
@@ -227,6 +279,9 @@ class DemurrageTest(BitcoinTestFramework):
             self.verify_block(blockhash)
         return self.pool.get(node.getbestblockhash())
 
+    def next_height(self):
+        return self.nodes[0].getblockcount() + 1
+
     def coin(self, txid, n):
         """(value, height) of a confirmed output on node0."""
         node = self.nodes[0]
@@ -234,40 +289,44 @@ class DemurrageTest(BitcoinTestFramework):
         assert txout is not None
         return to_sat(txout["value"]), node.getblockcount() - txout["confirmations"] + 1
 
-    def mempool_charge(self, coins):
-        """The charge at the evaluation height of the next block, for coins [(value, height)].
+    def policy(self, coins, next_height=None):
+        """(E_tx, policy charge) of a transaction that node0 evaluates for the next block."""
+        return policy_charge(self.schedule, coins, next_height or self.next_height())
 
-        A height of None is an output of an unconfirmed transaction, which is
-        charged as if it were created in the next block. node0's activation
-        height is forced, so it is known, and charges computed, at any height."""
-        next_height = self.nodes[0].getblockcount() + 1
-        evaluation = evaluation_height(next_height)
-        return sum(self.schedule.charge(value, next_height if height is None else height, evaluation) for value, height in coins)
+    def assert_policy(self, txid, evaluation, charge, *, fee_delta=0, node=None):
+        entry = (node or self.nodes[0]).getmempoolentry(txid)
+        fees = entry["fees"]
+        assert_equal(entry["chargeheight"], evaluation)
+        assert_equal(to_sat(fees["charge"]), charge)
+        assert_equal(to_sat(fees["net"]), to_sat(fees["base"]) - charge)
+        assert_equal(to_sat(fees["modified"]), to_sat(fees["base"]) - charge + fee_delta)
 
-    def assert_net_fee(self, txid, charge):
-        entry = self.nodes[0].getmempoolentry(txid)
-        assert_equal(to_sat(entry["fees"]["modified"]), to_sat(entry["fees"]["base"]) - charge)
+    def small_utxo(self, name):
+        return self.wallet.get_utxo(txid=self.small_coins[name][0], vout=self.small_coins[name][1])
 
     # ---- transactions and blocks ----
 
     def send_charged(self, wallet=None, utxo=None, extra_fee=20_000):
-        """Send a self-transfer from a confirmed coin that pays its charge at the evaluation height."""
+        """Send a self-transfer from a confirmed coin that pays its policy charge."""
         wallet = wallet or self.wallet
         utxo = utxo or wallet.get_utxo(confirmed_only=True)
-        charge = self.mempool_charge([(to_sat(utxo["value"]), utxo["height"])])
+        coin = (to_sat(utxo["value"]), utxo["height"])
+        evaluation, charge = self.policy([coin])
         tx = wallet.create_self_transfer(utxo_to_spend=utxo, fee=Decimal(charge + extra_fee) / COIN)
         wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=tx["hex"])
-        self.assert_net_fee(tx["txid"], charge)
-        tx["charge_at_evaluation"] = charge
+        self.assert_policy(tx["txid"], evaluation, charge)
+        tx["coin"] = coin
+        tx["policy"] = (evaluation, charge)
         return tx
 
     def send_child(self, parent, extra_fee=20_000):
-        """Send a child of a mempool transaction that pays its charge at the evaluation height."""
-        charge = self.mempool_charge([(to_sat(parent["new_utxo"]["value"]), None)])
+        """Send a child of a mempool transaction that pays its policy charge."""
+        coin = (to_sat(parent["new_utxo"]["value"]), None)
+        evaluation, charge = self.policy([coin])
         child = self.wallet.create_self_transfer(utxo_to_spend=parent["new_utxo"], fee=Decimal(charge + extra_fee) / COIN)
         self.wallet.sendrawtransaction(from_node=self.nodes[0], tx_hex=child["hex"])
-        self.assert_net_fee(child["txid"], charge)
-        child["charge_at_evaluation"] = charge
+        self.assert_policy(child["txid"], evaluation, charge)
+        child["policy"] = (evaluation, charge)
         return child
 
     def charges_and_fees(self, txs, height, claim):
@@ -321,8 +380,9 @@ class DemurrageTest(BitcoinTestFramework):
 
     def isolate(self):
         """Disconnect node1. node0 announces new blocks to high-bandwidth compact
-        block peers before validating them fully, so node1 must not see the
-        invalid blocks submitted to node0: it would accept them."""
+        block peers before validating them fully. It first checks the claim
+        transaction, but not the contribution, so node1 must not see the invalid
+        blocks submitted to node0: it would accept them."""
         if self.connected:
             self.disconnect_nodes(0, 1)
             self.connected = False
@@ -365,6 +425,13 @@ class DemurrageTest(BitcoinTestFramework):
         self.verify_chain()
         return blocks
 
+    def mine_without(self, txids=()):
+        """Mine a block on node0 that has only the given mempool transactions."""
+        self.rejoin()
+        blockhash = self.generateblock(self.nodes[0], self.wallet.get_descriptor(), list(txids))["hash"]
+        self.verify_chain()
+        return blockhash
+
     # ---- getblocktemplate ----
 
     def check_template(self, tmpl):
@@ -406,7 +473,7 @@ class DemurrageTest(BitcoinTestFramework):
     # ---- tests ----
 
     def run_test(self):
-        self.schedule = IndexSchedule(ACTIVATION_HEIGHT)
+        self.schedule = IndexSchedule(CHARGE_HEIGHT)
         self.pool = {}
         self.connected = True
         self.wallet = MiniWallet(self.nodes[0])
@@ -416,97 +483,176 @@ class DemurrageTest(BitcoinTestFramework):
         self.test_model()
         self.test_gbt_signalling()
         self.test_pre_activation()
+        self.test_enforcement_before_charges()
         self.test_zero_rate_period()
         self.test_charges()
+        self.test_evaluation_heights()
+        self.test_unconfirmed_inputs()
+        self.test_contributions()
         self.test_claims()
         self.test_presigned()
+        self.test_replacement()
+        self.test_unfunded_transaction()
+        self.test_restart()
+        self.test_compact_blocks()
         self.test_reorg()
+        self.test_pruned()
         self.test_soft_fork()
 
     def test_model(self):
         self.log.info("Check the regtest rates and the model against the BIP's formulas")
-        assert_equal(period_rate(ACTIVATION_HEIGHT), 0)
+        assert_equal(period_rate(CHARGE_HEIGHT), 0)
         assert_equal(period_rate(FIRST_CHARGED_HEIGHT), 237945492662473)
         assert_equal(self.schedule.index_at(FIRST_CHARGED_HEIGHT - 1), INDEX_ONE)
         assert_equal(self.schedule.index_at(FIRST_CHARGED_HEIGHT), 999762054507337527)
-        assert_equal(evaluation_height(577), 864)
+        # A large input's charge grows by more than CHARGE_TOLERANCE each block,
+        # so it is evaluated no further ahead than charges allow.
+        assert_equal(policy_charge(self.schedule, [(50 * COIN, 1)], CHARGE_HEIGHT), (FIRST_CHARGED_HEIGHT - 1, 0))
+        assert_equal(policy_charge(self.schedule, [(50 * COIN, 1)], FIRST_CHARGED_HEIGHT), (FIRST_CHARGED_HEIGHT, 1_189_728))
+        assert_equal(policy_charge(self.schedule, [(50 * COIN, None)], FIRST_CHARGED_HEIGHT), (FIRST_CHARGED_HEIGHT, 0))
+        # A small one is evaluated CHARGE_MARGIN blocks ahead.
+        assert_equal(policy_charge(self.schedule, [(1_000_000, 1)], CHARGE_HEIGHT), (FIRST_CHARGED_HEIGHT, 238))
+        evaluation, charge = policy_charge(self.schedule, [(20_000, 1)], FIRST_CHARGED_HEIGHT)
+        assert_equal(evaluation, FIRST_CHARGED_HEIGHT + CHARGE_MARGIN)
+        assert_greater_than(CHARGE_TOLERANCE, charge)
 
     def test_gbt_signalling(self):
         node2 = self.nodes[2]
-
-        def status_next():
-            return node2.getdeploymentinfo()["deployments"]["demurrage"]["bip9"]["status_next"]
-
         wallet2 = MiniWallet(node2)
+        # On node2's chain, demurrage_charges activates one period after demurrage.
+        activation_height, charge_height = 3 * RATE_PERIOD, 4 * RATE_PERIOD
+        assert_equal(charge_height, FIRST_CHARGED_HEIGHT)
+        schedule2 = IndexSchedule(charge_height)
+
+        def status_next(name):
+            return node2.getdeploymentinfo()["deployments"][name]["bip9"]["status_next"]
 
         def mine_to(height):
             self.generatetoaddress(node2, height - node2.getblockcount(), wallet2.get_address(), sync_fun=self.no_op)
 
-        self.log.info("getblocktemplate: nodes signal for the deployment whether or not the client declares the rule")
-        mine_to(RATE_PERIOD - 1)
-        # node2's own blocks signal, so the deployment locks in, then activates.
-        for status, period_end in (("started", 2 * RATE_PERIOD - 1), ("locked_in", 3 * RATE_PERIOD - 1)):
-            assert_equal(status_next(), status)
-            for request in (UNDECLARED, DECLARED):
-                tmpl = node2.getblocktemplate(request)
-                assert tmpl["version"] & (1 << DEMURRAGE_BIT)
-                assert_equal(tmpl["vbavailable"]["demurrage"], DEMURRAGE_BIT)
-                assert "demurrage" not in tmpl["rules"]
-                assert "demurrage_contribution" not in tmpl
-            if status == "locked_in":
-                self.log.info("From lock-in, ACTIVATION_HEIGHT is known, and the mempool charges at the evaluation height")
-                mine_to(node2.getblockcount() + 1)
-                # The evaluation height lies beyond activation, in the first rate period with a non-zero rate.
-                assert_equal(evaluation_height(node2.getblockcount() + 1), FIRST_CHARGED_HEIGHT)
-                wallet2.rescan_utxos()
-                utxo = next(u for u in wallet2.get_utxos(mark_as_spent=False, confirmed_only=True)
-                            if u["height"] <= node2.getblockcount() - COINBASE_MATURITY)
-                charge = self.schedule.charge(to_sat(utxo["value"]), utxo["height"], FIRST_CHARGED_HEIGHT)
-                assert_greater_than(charge, 0)
-                tx = wallet2.send_self_transfer(from_node=node2, utxo_to_spend=utxo, fee=Decimal(charge + 20_000) / COIN)
-                entry = node2.getmempoolentry(tx["txid"])
-                assert_equal(to_sat(entry["fees"]["modified"]), to_sat(entry["fees"]["base"]) - charge)
-            mine_to(period_end)
-        assert_equal(status_next(), "active")
-        assert_equal(node2.getblockcount() + 1, ACTIVATION_HEIGHT)
+        def mine_undeclared_to(height):
+            """Mine blocks as a client that does not declare demurrage_charges."""
+            while node2.getblockcount() < height:
+                tmpl = node2.getblocktemplate(UNDECLARED)
+                block = create_block(tmpl=tmpl, coinbase=create_coinbase(tmpl["height"], script_pubkey=wallet2.get_output_script()))
+                block.solve()
+                assert_equal(node2.submitblock(block.serialize().hex()), None)
 
-        self.log.info("From activation the rule is optional, and undeclared clients are warned at most once an hour")
+        def mine_empty():
+            self.generateblock(node2, wallet2.get_descriptor(), [], sync_fun=self.no_op)
+
+        def send(fee):
+            wallet2.rescan_utxos()
+            utxo = wallet2.get_utxo(confirmed_only=True)
+            assert_equal(utxo["value"], 50)
+            tx = wallet2.send_self_transfer(from_node=node2, utxo_to_spend=utxo, fee=fee)
+            tx["coin"] = (to_sat(utxo["value"]), utxo["height"])
+            return tx
+
+        def assert_policy(tx):
+            evaluation, charge = policy_charge(schedule2, [tx["coin"]], node2.getblockcount() + 1)
+            self.assert_policy(tx["txid"], evaluation, charge, node=node2)
+            return evaluation, charge
+
+        self.log.info("getblocktemplate: nodes signal for demurrage for every client, and for demurrage_charges only for clients that declare it")
+        mine_to(RATE_PERIOD - 1)
+        assert_equal(status_next("demurrage"), "started")
+        assert_equal(status_next("demurrage_charges"), "started")
+        for request, charges_bit in ((UNDECLARED, 0), (DECLARED, 1 << CHARGES_BIT)):
+            tmpl = node2.getblocktemplate(request)
+            assert tmpl["version"] & (1 << DEMURRAGE_BIT)
+            assert_equal(tmpl["version"] & (1 << CHARGES_BIT), charges_bit)
+            assert_equal(tmpl["vbavailable"]["demurrage"], DEMURRAGE_BIT)
+            assert_equal(tmpl["vbavailable"]["!demurrage_charges"], CHARGES_BIT)
+            assert not {"demurrage", "!demurrage", "demurrage_charges", "!demurrage_charges"} & set(tmpl["rules"])
+            assert "demurrage_contribution" not in tmpl
+
+        self.log.info("Blocks built by clients that do not declare demurrage_charges lock in demurrage alone")
+        mine_undeclared_to(2 * RATE_PERIOD - 1)
+        assert_equal(status_next("demurrage"), "locked_in")
+        assert_equal(status_next("demurrage_charges"), "started")
+        # ACTIVATION_HEIGHT is known, CHARGE_HEIGHT is not: there are no policy charges yet.
+        tx = send(Decimal("0.0001"))
+        entry = node2.getmempoolentry(tx["txid"])
+        assert "chargeheight" not in entry and "charge" not in entry["fees"] and "net" not in entry["fees"]
+        assert "charge" not in node2.gettxout(tx["txid"], 0)
+        tmpl = node2.getblocktemplate(UNDECLARED)
+        assert tmpl["version"] & (1 << DEMURRAGE_BIT) and not tmpl["version"] & (1 << CHARGES_BIT)
+
+        self.log.info("Blocks built by clients that declare it lock in demurrage_charges a period later")
+        mine_to(activation_height - 1)
+        assert_equal(status_next("demurrage"), "active")
+        assert_equal(status_next("demurrage_charges"), "locked_in")
+
+        self.log.info("From ACTIVATION_HEIGHT demurrage is an optional rule, and undeclared clients are warned at most once an hour")
         with node2.assert_debug_log([RULE_WARNING]):
             tmpl = node2.getblocktemplate(UNDECLARED)
         assert "demurrage" in tmpl["rules"] and "!demurrage" not in tmpl["rules"]
-        assert not tmpl["version"] & (1 << DEMURRAGE_BIT)
+        assert not {"demurrage_charges", "!demurrage_charges"} & set(tmpl["rules"])
+        assert_equal(tmpl["vbavailable"], {"!demurrage_charges": CHARGES_BIT})
+        assert not tmpl["version"] & ((1 << DEMURRAGE_BIT) | (1 << CHARGES_BIT))
         assert_equal(tmpl["demurrage_contribution"], 0)
         with node2.assert_debug_log([], unexpected_msgs=[RULE_WARNING]):
             node2.getblocktemplate(UNDECLARED)
-            node2.getblocktemplate(DECLARED)
-        mine_to(FIRST_CHARGED_HEIGHT - 2)
-        assert "demurrage" in node2.getblocktemplate(UNDECLARED)["rules"]
+            assert node2.getblocktemplate(DECLARED)["version"] & (1 << CHARGES_BIT)
 
-        self.log.info("From the first rate period with a non-zero rate, the rule is required")
-        mine_to(FIRST_CHARGED_HEIGHT - 1)
+        self.log.info("From the lock-in of both, CHARGE_HEIGHT is known, and the mempool computes policy charges")
+        tx = send(Decimal("0.0001"))
+        # No evaluation height reaches CHARGE_HEIGHT, at which this input's charge exceeds the tolerance.
+        assert_equal(assert_policy(tx), (charge_height - 1, 0))
+        txout = node2.gettxout(tx["txid"], 0)
+        assert_equal(txout["charge"], 0)
+        assert_equal(txout["effective_value"], txout["value"])
+        mine_to(charge_height - 2)
+
+        tx = send(Decimal("0.02"))
+        assert_equal(assert_policy(tx), (charge_height - 1, 0))
+        tmpl = node2.getblocktemplate(UNDECLARED)
+        assert not {"demurrage_charges", "!demurrage_charges"} & set(tmpl["rules"])
+        mine_empty()
+
+        self.log.info("At CHARGE_HEIGHT the rate is not zero here, so demurrage_charges is required at once")
+        assert_equal(node2.getblockcount() + 1, charge_height)
+        assert_equal(status_next("demurrage_charges"), "active")
+        # The policy charge was evaluated again, because the next block's height exceeds E_tx.
+        evaluation, charge = assert_policy(tx)
+        assert_equal(evaluation, charge_height)
+        assert_equal(charge, schedule2.charge(*tx["coin"], charge_height))
+        assert_greater_than(charge, 0)
         assert_raises_rpc_error(-8, RULE_REQUIRED_ERROR, node2.getblocktemplate, UNDECLARED)
-        assert "!demurrage" in node2.getblocktemplate(DECLARED)["rules"]
+        tmpl = node2.getblocktemplate(DECLARED)
+        assert "!demurrage_charges" in tmpl["rules"] and "demurrage" in tmpl["rules"]
+        assert_equal(tmpl["vbavailable"], {})
+        assert_equal(tmpl["demurrage_contribution"], charge)
+        mine_to(charge_height)
+        block = node2.getblock(node2.getbestblockhash(), 2)
+        assert_equal([tx["txid"]], [t["txid"] for t in block["tx"][1:]])
+        assert_equal([to_sat(txout["value"]) for txout in block["tx"][0]["vout"] if txout["scriptPubKey"]["hex"] == POOL_SCRIPT_HEX], [charge])
 
     def test_pre_activation(self):
         node0, node1 = self.nodes[:2]
         self.log.info("Before activation, POOL_SCRIPT outputs are ordinary outputs")
         self.generate(self.wallet, 200)
-        info = node0.getdeploymentinfo()["deployments"]["demurrage"]
-        assert_equal(info, {"type": "buried", "active": False, "height": ACTIVATION_HEIGHT})
-        assert "demurrage" not in node1.getdeploymentinfo()["deployments"]
+        deployments = node0.getdeploymentinfo()["deployments"]
+        assert_equal(deployments["demurrage"], {"type": "buried", "active": False, "height": ACTIVATION_HEIGHT})
+        assert_equal(deployments["demurrage_charges"], {"type": "buried", "active": False, "height": CHARGE_HEIGHT})
+        assert not {"demurrage", "demurrage_charges"} & set(node1.getdeploymentinfo()["deployments"])
 
         # Policy refuses transactions that create POOL_SCRIPT outputs.
         tx = self.pool_script_tx()
-        for node in self.nodes:
+        for node in self.nodes[:3]:
             assert_equal(node.testmempoolaccept([tx.serialize().hex()])[0]["reject-reason"], "demurrage-pool-output")
 
-        # Coins for the pre-signed transactions: two 10 BTC outputs.
-        funding_info = self.wallet.create_self_transfer_multi(num_outputs=3, fee_per_output=1000)
+        # Coins for the pre-signed transactions (two 10 BTC outputs), and small coins.
+        funding_info = self.wallet.create_self_transfer_multi(num_outputs=3 + len(SMALL_COINS), fee_per_output=1000)
         funding = funding_info["tx"]
         value_in = sum(txout.nValue for txout in funding.vout) + to_sat(funding_info["fee"])
         funding.vout[0] = CTxOut(10 * COIN, self.presigned_wallet.get_output_script())
         funding.vout[1] = CTxOut(10 * COIN, self.presigned_wallet.get_output_script())
-        funding.vout[2].nValue = value_in - 20 * COIN - 10_000
+        for n, value in enumerate(SMALL_COINS.values(), start=2):
+            funding.vout[n].nValue = value
+        funding.vout[-1].nValue = value_in - 20 * COIN - sum(SMALL_COINS.values()) - 10_000
+        self.small_coins = {name: (funding.txid_hex, n) for n, name in enumerate(SMALL_COINS, start=2)}
 
         # Consensus allows them before activation, in a transaction and in the coinbase.
         block = self.make_block([tx, funding], contributions=[5000])
@@ -520,23 +666,32 @@ class DemurrageTest(BitcoinTestFramework):
         self.presigned = [self.presigned_wallet.create_self_transfer(fee=Decimal("0.00001")) for _ in range(2)]
 
         self.generate(self.wallet, ACTIVATION_HEIGHT - 1 - node0.getblockcount())
-        assert_equal(node0.getdeploymentinfo()["deployments"]["demurrage"]["active"], True)
+        deployments = node0.getdeploymentinfo()["deployments"]
+        assert_equal(deployments["demurrage"]["active"], True)
+        assert_equal(deployments["demurrage_charges"]["active"], False)
 
-    def test_zero_rate_period(self):
+    def test_enforcement_before_charges(self):
         node0, node1 = self.nodes[:2]
-        self.log.info("Activation: the first rate period has a zero rate, so no block owes a charge")
-        # The mempool already evaluates charges at a height in the next rate period.
+        self.log.info("From ACTIVATION_HEIGHT the rules are enforced, and until CHARGE_HEIGHT no block owes a charge")
+        assert_equal(self.next_height(), ACTIVATION_HEIGHT)
+        # node0's CHARGE_HEIGHT is forced, so it is known, and policy charges are
+        # computed, at any height. Here no evaluation height passes CHARGE_HEIGHT.
         tx = self.send_charged()
-        assert_greater_than(tx["charge_at_evaluation"], 0)
+        assert_equal(tx["policy"], (ACTIVATION_HEIGHT + CHARGE_MARGIN, 0))
         self.mine()
         assert_equal(node0.getblockcount(), ACTIVATION_HEIGHT)
         assert_equal(self.pool[node0.getbestblockhash()]["charge"], 0)
 
-        self.log.info("getblocktemplate: the rule is optional until charges begin, and templates give charges")
-        tmpl = node0.getblocktemplate(UNDECLARED)
+        self.log.info("getblocktemplate: demurrage is an optional rule, and templates give charges")
+        with node0.assert_debug_log([RULE_WARNING]):
+            tmpl = node0.getblocktemplate(UNDECLARED)
         assert "demurrage" in tmpl["rules"] and "!demurrage" not in tmpl["rules"]
+        assert not {"demurrage_charges", "!demurrage_charges"} & set(tmpl["rules"])
         self.check_template(tmpl)
         assert_equal(tmpl["demurrage_contribution"], 0)
+        with node0.assert_debug_log([], unexpected_msgs=[RULE_WARNING]):
+            node0.getblocktemplate(UNDECLARED)
+            node0.getblocktemplate(DECLARED)
         # node1 does not enforce BIP 462b, so its templates have no BIP 462b fields.
         tmpl = node1.getblocktemplate(UNDECLARED)
         assert "demurrage" not in tmpl["rules"] and "demurrage_contribution" not in tmpl
@@ -557,75 +712,154 @@ class DemurrageTest(BitcoinTestFramework):
         self.sync_blocks()
         self.verify_chain()
 
-        self.mine(FIRST_CHARGED_HEIGHT - 1 - node0.getblockcount())
+        self.mine(CHARGE_HEIGHT - 1 - node0.getblockcount())
         assert all(entry["charge"] == 0 for entry in self.pool.values())
+        assert_equal(node0.getdeploymentinfo()["deployments"]["demurrage_charges"]["active"], True)
+
+    def test_zero_rate_period(self):
+        node0, node1 = self.nodes[:2]
+        self.log.info("From CHARGE_HEIGHT the first rate period has a zero rate, so no block owes a charge yet")
+        assert_equal(self.next_height(), CHARGE_HEIGHT)
+        tmpl = node0.getblocktemplate(UNDECLARED)
+        assert "demurrage_charges" in tmpl["rules"] and "!demurrage_charges" not in tmpl["rules"]
+        self.check_template(tmpl)
+
+        # A large input is evaluated up to the last block that owes nothing.
+        tx = self.send_charged()
+        assert_equal(tx["policy"], (FIRST_CHARGED_HEIGHT - 1, 0))
+        self.mine()
+
+        self.log.info("gettxout gives an output's charge in the next block, and its effective value")
+        utxo = self.wallet.get_utxo(mark_as_spent=False, confirmed_only=True)
+        txout = node0.gettxout(utxo["txid"], utxo["vout"])
+        assert_equal(txout["charge"], 0)
+        assert_equal(txout["effective_value"], utxo["value"])
+        assert "charge" not in node1.gettxout(utxo["txid"], utxo["vout"])
+
+        self.mine(FIRST_CHARGED_HEIGHT - 2 - node0.getblockcount())
+        assert all(entry["charge"] == 0 for entry in self.pool.values())
+        assert "demurrage_charges" in node0.getblocktemplate(UNDECLARED)["rules"]
+
+        # Its fee also covers the charges of the next few blocks.
+        self.first_charged = self.send_charged(extra_fee=5 * COIN)
+        assert_equal(self.first_charged["policy"], (FIRST_CHARGED_HEIGHT - 1, 0))
+        self.mine_without()
+        assert_equal(self.pool[node0.getbestblockhash()]["charge"], 0)
+
+        txout = node0.gettxout(utxo["txid"], utxo["vout"], include_mempool=False)
+        charge = self.schedule.charge(to_sat(utxo["value"]), utxo["height"], FIRST_CHARGED_HEIGHT)
+        assert_greater_than(charge, 0)
+        assert_equal(to_sat(txout["charge"]), charge)
+        assert_equal(to_sat(txout["effective_value"]), to_sat(utxo["value"]) - charge)
 
     def test_charges(self):
         node0 = self.nodes[0]
-        self.log.info("Charges: the mempool ranks by net fee at the evaluation height")
-        assert_equal(node0.getblockcount(), FIRST_CHARGED_HEIGHT - 1)
-        # Its fee also covers the larger charge at the next evaluation height.
-        tx = self.send_charged(extra_fee=5 * COIN)
-        coin = self.coin(prevout_txid(tx["tx"].vin[0]), tx["tx"].vin[0].prevout.n)
-        assert_equal(evaluation_height(FIRST_CHARGED_HEIGHT), 720)
-        self.assert_net_fee(tx["txid"], self.schedule.charge(*coin, 720))
+        self.log.info("Charges: the mempool ranks by net fee, the fee less the policy charge")
+        assert_equal(self.next_height(), FIRST_CHARGED_HEIGHT)
+        tx = self.first_charged
+        # It was evaluated again, because the next block's height exceeds its evaluation height.
+        charge = self.schedule.charge(*tx["coin"], FIRST_CHARGED_HEIGHT)
+        assert_greater_than(charge, 0)
+        self.assert_policy(tx["txid"], FIRST_CHARGED_HEIGHT, charge)
 
-        self.log.info("getblocktemplate: from the first rate period with a non-zero rate, the rule is required")
+        self.log.info("getblocktemplate: from the first rate period with a non-zero rate, demurrage_charges is required")
         assert_raises_rpc_error(-8, RULE_REQUIRED_ERROR, node0.getblocktemplate, UNDECLARED)
         tmpl = node0.getblocktemplate(DECLARED)
-        assert "!demurrage" in tmpl["rules"]
+        assert "!demurrage_charges" in tmpl["rules"] and "demurrage" in tmpl["rules"]
         assert_equal(tmpl["height"], FIRST_CHARGED_HEIGHT)
         self.check_template(tmpl)
-        assert_greater_than(tmpl["demurrage_contribution"], 0)
+        assert_equal(tmpl["demurrage_contribution"], charge)
 
-        # The evaluation height moves in steps of CHARGE_MARGIN, and charges are recomputed then.
-        self.rejoin()
-        self.generateblock(node0, self.wallet.get_descriptor(), [])
-        self.assert_net_fee(tx["txid"], self.schedule.charge(*coin, 864))
-        self.generateblock(node0, self.wallet.get_descriptor(), [])
-        self.assert_net_fee(tx["txid"], self.schedule.charge(*coin, 864))
-        self.verify_chain()
+        self.log.info("A large input has no margin: its policy charge is evaluated again every block")
+        for height in (FIRST_CHARGED_HEIGHT + 1, FIRST_CHARGED_HEIGHT + 2):
+            self.mine_without()
+            assert_equal(self.next_height(), height)
+            self.assert_policy(tx["txid"], height, self.schedule.charge(*tx["coin"], height))
 
         self.log.info("Block assembly pays C(h) into the coinbase contribution")
         self.mine()
         entry = self.pool[node0.getbestblockhash()]
-        assert_greater_than(entry["charge"], 0)
+        assert_equal(entry["charge"], self.schedule.charge(*tx["coin"], node0.getblockcount()))
+        assert_equal(node0.getrawmempool(), [])
         self.first_contribution_height = node0.getblockcount()
-
-        self.log.info("An input from an unconfirmed parent is charged as if the parent confirms in the next block")
         self.wallet.rescan_utxos()
-        parent = self.send_charged()
-        next_height = node0.getblockcount() + 1
-        # The evaluation height stays the same for the next two blocks.
-        assert_equal(evaluation_height(next_height + 2), evaluation_height(next_height))
-        child = self.send_child(parent)
-        assert_greater_than(child["charge_at_evaluation"], 0)
-        self.rejoin()
-        # A block without the parent leaves the child's charge as it was.
-        self.generateblock(node0, self.wallet.get_descriptor(), [])
-        self.assert_net_fee(child["txid"], child["charge_at_evaluation"])
 
-        self.log.info("When the parent confirms later than that, the child's charge falls")
-        self.generateblock(node0, self.wallet.get_descriptor(), [parent["txid"]])
-        self.verify_chain()
+    def test_evaluation_heights(self):
+        node0 = self.nodes[0]
+        self.log.info("Evaluation heights: up to CHARGE_MARGIN blocks ahead, but no further than costs CHARGE_TOLERANCE")
+        accepted = self.next_height()
+        sent = {name: self.send_charged(utxo=self.small_utxo(name), extra_fee=5000) for name in ("full_margin", "medium_margin", "short_margin")}
+        margins = {name: tx["policy"][0] - accepted for name, tx in sent.items()}
+        assert_equal(margins["full_margin"], CHARGE_MARGIN)
+        assert 1 < margins["short_margin"] < margins["medium_margin"] < CHARGE_MARGIN, margins
+        for tx in sent.values():
+            evaluation, charge = tx["policy"]
+            assert_greater_than(charge, self.schedule.charge(*tx["coin"], accepted))
+            assert charge - self.schedule.charge(*tx["coin"], accepted) <= CHARGE_TOLERANCE
+
+        self.log.info("A transaction is evaluated again when the next block's height exceeds its evaluation height")
+        short = sent["short_margin"]
+        while self.next_height() < short["policy"][0]:
+            self.mine_without()
+            for tx in sent.values():
+                self.assert_policy(tx["txid"], *tx["policy"])
+        self.mine_without()
+        assert_equal(self.next_height(), short["policy"][0] + 1)
+        evaluation, charge = self.policy([short["coin"]])
+        assert_greater_than(evaluation, short["policy"][0])
+        assert_greater_than(charge, short["policy"][1])
+        self.assert_policy(short["txid"], evaluation, charge)
+        # The others are not: they depend on when each transaction was accepted.
+        for name in ("full_margin", "medium_margin"):
+            self.assert_policy(sent[name]["txid"], *sent[name]["policy"])
+        self.mine()
+        assert_equal(node0.getrawmempool(), [])
+        self.wallet.rescan_utxos()
+
+    def test_unconfirmed_inputs(self):
+        node0 = self.nodes[0]
+        self.log.info("An input from an unconfirmed parent is charged as if the parent confirms in the next block")
+        accepted = self.next_height()
+        parent = self.send_charged(utxo=self.small_utxo("parent"), extra_fee=5000)
+        child = self.send_child(parent)
+        evaluation, charge = child["policy"]
+        assert_greater_than(evaluation, accepted + 2)
+        assert_greater_than(charge, 0)
+
+        self.log.info("Its net fee does not fall when the parent confirms, only when it is evaluated again")
+        self.mine_without()
+        self.mine_without([parent["txid"]])
+        child_coin = self.coin(parent["txid"], 0)
+        assert_equal(child_coin, (to_sat(parent["new_utxo"]["value"]), accepted + 1))
+        self.assert_policy(child["txid"], evaluation, charge)
+        # The parent confirmed later than assumed, so the child owes less than its policy charge.
+        assert_greater_than(charge, self.schedule.charge(*child_coin, evaluation))
+        while self.next_height() < evaluation:
+            self.mine_without()
+            self.assert_policy(child["txid"], evaluation, charge)
+        self.mine_without()
+        # From then on, the input is charged from the height at which its parent confirmed.
+        self.assert_policy(child["txid"], *self.policy([child_coin]))
+        self.mine()
+        assert child["txid"] in node0.getblock(node0.getbestblockhash())["tx"]
+        self.wallet.rescan_utxos()
+
+        self.log.info("A large input from an unconfirmed parent has no margin: it is charged once the parent confirms alone")
+        accepted = self.next_height()
+        parent = self.send_charged()
+        child = self.send_child(parent, extra_fee=COIN)
+        assert_equal(child["policy"], (accepted, 0))
+        self.mine_without([parent["txid"]])
         assert_greater_than(self.pool[node0.getbestblockhash()]["charge"], 0)
         child_coin = self.coin(parent["txid"], 0)
-        assert_equal(child_coin[1], next_height + 1)
-        self.assert_net_fee(child["txid"], self.mempool_charge([child_coin]))
-        assert_greater_than(child["charge_at_evaluation"], self.mempool_charge([child_coin]))
+        charge = self.schedule.charge(*child_coin, accepted + 1)
+        assert_greater_than(charge, CHARGE_TOLERANCE)
+        self.assert_policy(child["txid"], accepted + 1, charge)
         self.mine()
         assert child["txid"] in node0.getblock(node0.getbestblockhash())["tx"]
         self.wallet.rescan_utxos()
 
-        self.log.info("When the parent confirms in the next block, the child's charge stays the same")
-        parent = self.send_charged()
-        child = self.send_child(parent)
-        self.generateblock(node0, self.wallet.get_descriptor(), [parent["txid"]])
-        self.assert_net_fee(child["txid"], child["charge_at_evaluation"])
-        self.mine()
-        assert child["txid"] in node0.getblock(node0.getbestblockhash())["tx"]
-        self.wallet.rescan_utxos()
-
+    def test_contributions(self):
         self.log.info("Invalid: a missing contribution, or one that differs from C(h)")
         parent = self.wallet.create_self_transfer(fee=Decimal("1"))
         parent_utxo = parent["new_utxo"]
@@ -661,6 +895,7 @@ class DemurrageTest(BitcoinTestFramework):
         self.mine(self.first_contribution_height + COINBASE_MATURITY - 1 - node0.getblockcount())
         assert_equal(self.pool[node0.getbestblockhash()]["carry"], None)
         self.mine()
+        self.first_claim_height = node0.getblockcount()
         entry = self.pool[node0.getbestblockhash()]
         assert_equal(len(entry["pool_inputs"]), 1)
         first_contribution = self.pool[node0.getblockhash(self.first_contribution_height)]["contribution"]
@@ -690,8 +925,7 @@ class DemurrageTest(BitcoinTestFramework):
         self.check_template(tmpl)
         entries = {entry["txid"]: entry for entry in tmpl["transactions"]}
         # The child spends an output of an earlier transaction in the template,
-        # so in the block its input has no charge, unlike in the mempool.
-        assert_greater_than(child["charge_at_evaluation"], 0)
+        # so in the block its input has no charge.
         assert_equal(entries[child["txid"]]["charge"], 0)
         assert_greater_than(entries[parent["txid"]]["charge"], 0)
         self.submit(self.block_from_template(tmpl))
@@ -703,7 +937,7 @@ class DemurrageTest(BitcoinTestFramework):
         # carry and a matured contribution.
         num_inputs = set()
         while num_inputs != {1, 2} or len(self.expected_pool_inputs(node0.getbestblockhash(), node0.getblockcount() + 1)) < 2:
-            assert node0.getblockcount() < self.first_contribution_height + COINBASE_MATURITY + 20
+            assert node0.getblockcount() < self.first_contribution_height + 2 * COINBASE_MATURITY
             self.mine()
             entry = self.pool[node0.getbestblockhash()]
             assert entry["carry"] is not None
@@ -799,21 +1033,171 @@ class DemurrageTest(BitcoinTestFramework):
 
         self.log.info("A child rescues it by paying its charge (CPFP)")
         parent_input = rescued["tx"].vin[0]
-        parent_charge = self.mempool_charge([self.coin(prevout_txid(parent_input), parent_input.prevout.n)])
-        deficit = parent_charge - to_sat(rescued["fee"])
+        parent_coin = self.coin(prevout_txid(parent_input), parent_input.prevout.n)
+        parent_policy = self.policy([parent_coin])
+        deficit = parent_policy[1] - to_sat(rescued["fee"])
         assert_greater_than(deficit, 0)
-        # The child also pays its own input's charge, as if its parent confirmed in the next block.
-        child_charge = self.mempool_charge([(to_sat(rescued["new_utxo"]["value"]), None)])
-        child = self.presigned_wallet.create_self_transfer(utxo_to_spend=rescued["new_utxo"], fee=Decimal(deficit + child_charge + 100_000) / COIN)
+        # The child's own input is charged as if its parent confirmed in the next block.
+        child_policy = self.policy([(to_sat(rescued["new_utxo"]["value"]), None)])
+        child = self.presigned_wallet.create_self_transfer(utxo_to_spend=rescued["new_utxo"], fee=Decimal(deficit + child_policy[1] + 100_000) / COIN)
         result = node0.submitpackage([rescued["hex"], child["hex"]], maxfeerate=0)
         assert_equal(result["package_msg"], "success")
-        self.assert_net_fee(rescued["txid"], parent_charge)
-        self.assert_net_fee(child["txid"], child_charge)
-        assert_greater_than(0, to_sat(node0.getmempoolentry(rescued["txid"])["fees"]["modified"]))
+        self.assert_policy(rescued["txid"], *parent_policy)
+        self.assert_policy(child["txid"], *child_policy)
+        assert_greater_than(0, to_sat(node0.getmempoolentry(rescued["txid"])["fees"]["net"]))
         self.mine()
         block = node0.getblock(node0.getbestblockhash())
         assert rescued["txid"] in block["tx"] and child["txid"] in block["tx"]
         assert_equal(node0.getrawmempool(), [])
+
+    def test_replacement(self):
+        node0 = self.nodes[0]
+        self.log.info("Replacement: the fee to beat is the greater of a transaction's net fee now and when it was accepted")
+        self.wallet.rescan_utxos()
+        large = self.wallet.get_utxo(confirmed_only=True)
+        small = self.small_utxo("replaced")
+        coins = [(to_sat(utxo["value"]), utxo["height"]) for utxo in (large, small)]
+        net_fee = 100_000
+        evaluation, charge = self.policy(coins)
+        original = self.wallet.create_self_transfer_multi(utxos_to_spend=[large, small], fee_per_output=charge + net_fee)
+        self.wallet.sendrawtransaction(from_node=node0, tx_hex=original["hex"])
+        self.assert_policy(original["txid"], evaluation, charge)
+
+        # A block later its net fee is below zero.
+        self.mine_without()
+        evaluation, later_charge = self.policy(coins)
+        self.assert_policy(original["txid"], evaluation, later_charge)
+        assert_greater_than(later_charge - charge, net_fee)
+
+        # A transaction that spends only its small input owes a small charge, and
+        # without this rule would only have to beat the original's net fee now.
+        small_charge = self.policy([coins[1]])[1]
+        too_low = self.wallet.create_self_transfer(utxo_to_spend=small, fee=Decimal(small_charge + net_fee // 2) / COIN)
+        assert_raises_rpc_error(-26, "insufficient fee", node0.sendrawtransaction, too_low["hex"], 0)
+        replacement = self.wallet.create_self_transfer(utxo_to_spend=small, fee=Decimal(small_charge + net_fee + 10_000) / COIN)
+        node0.sendrawtransaction(replacement["hex"], 0)
+        assert_equal(node0.getrawmempool(), [replacement["txid"]])
+        # node1 compares fees, not net fees, and keeps the original until the block arrives.
+        self.mine()
+        assert replacement["txid"] in node0.getblock(node0.getbestblockhash())["tx"]
+        self.wallet.rescan_utxos()
+
+    def test_unfunded_transaction(self):
+        node0 = self.nodes[0]
+        self.log.info("Block assembly leaves out a prioritised transaction whose charge the block cannot fund")
+        utxos = [self.wallet.get_utxo(confirmed_only=True) for _ in range(6)]
+        charge = self.policy([(to_sat(utxo["value"]), utxo["height"]) for utxo in utxos])[1]
+        assert_greater_than(charge, 2 * block_subsidy(self.next_height()))
+        unfunded = self.wallet.create_self_transfer_multi(utxos_to_spend=utxos, fee_per_output=1000)
+        assert_raises_rpc_error(-26, "min relay fee not met", node0.sendrawtransaction, unfunded["hex"], 0)
+        node0.prioritisetransaction(txid=unfunded["txid"], fee_delta=charge + COIN)
+        self.wallet.sendrawtransaction(from_node=node0, tx_hex=unfunded["hex"])
+        child = self.wallet.create_self_transfer(utxo_to_spend=unfunded["new_utxos"][0], fee=Decimal("0.001"))
+        self.wallet.sendrawtransaction(from_node=node0, tx_hex=child["hex"])
+        funded = self.send_charged()
+        assert_equal(sorted(node0.getrawmempool()), sorted([unfunded["txid"], child["txid"], funded["txid"]]))
+
+        with node0.assert_debug_log([f"Leaving transaction {unfunded['txid']} out of the block template"]):
+            tmpl = node0.getblocktemplate(DECLARED)
+        # The template has the claim transaction and the transaction that pays its charge.
+        assert_equal([entry["txid"] for entry in tmpl["transactions"]][1:], [funded["txid"]])
+        self.check_template(tmpl)
+        self.submit(self.block_from_template(tmpl))
+        self.verify_chain()
+        self.mine()
+        assert_equal(sorted(node0.getrawmempool()), sorted([unfunded["txid"], child["txid"]]))
+
+        # A block with a conflicting transaction removes it from the mempool.
+        conflict = self.wallet.create_self_transfer(utxo_to_spend=utxos[0], fee=Decimal("10"))
+        self.submit(self.make_block([conflict["tx"]]))
+        self.sync_blocks()
+        self.verify_chain()
+        assert_equal(node0.getrawmempool(), [])
+        for txid, prioritised in node0.getprioritisedtransactions().items():
+            node0.prioritisetransaction(txid=txid, fee_delta=-prioritised["fee_delta"])
+        assert_equal(node0.getprioritisedtransactions(), {})
+        self.wallet.rescan_utxos()
+
+    def test_restart(self):
+        node0 = self.nodes[0]
+        self.log.info("Policy charges and prioritisation survive a restart unchanged")
+        large = self.send_charged(extra_fee=COIN)
+        small = self.send_charged(utxo=self.small_utxo("restart"), extra_fee=5000)
+        prioritised = self.send_charged()
+        fee_delta = 12_345
+        node0.prioritisetransaction(txid=prioritised["txid"], fee_delta=fee_delta)
+        assert_greater_than(large["policy"][1], 0)
+        assert_greater_than(small["policy"][0], self.next_height())
+        self.assert_policy(prioritised["txid"], *prioritised["policy"], fee_delta=fee_delta)
+        self.sync_mempools()
+
+        def mempool_state():
+            entries = node0.getrawmempool(verbose=True)
+            return {txid: (entry["chargeheight"], entry["fees"]) for txid, entry in entries.items()}, node0.getprioritisedtransactions()
+
+        before = mempool_state()
+        assert_equal(sorted(before[0]), sorted(tx["txid"] for tx in (large, small, prioritised)))
+        assert_equal(list(before[1]), [prioritised["txid"]])
+        assert_equal(before[1][prioritised["txid"]]["fee_delta"], fee_delta)
+        for _ in range(2):
+            self.restart_node(0)
+            self.wait_until(lambda: node0.getmempoolinfo()["loaded"])
+            assert_equal(mempool_state(), before)
+        self.connected = False
+        self.mine()
+        assert_equal(node0.getrawmempool(), [])
+        self.wallet.rescan_utxos()
+
+    def test_compact_blocks(self):
+        node0 = self.nodes[0]
+        self.log.info("Compact blocks prefill the claim transaction")
+        tx = self.send_charged()
+        self.mine()
+        tip = node0.getbestblockhash()
+        block = node0.getblock(tip)
+        assert_equal(block["tx"][2:], [tx["txid"]])
+        peer = node0.add_p2p_connection(CompactBlockPeer())
+        peer.send_and_ping(msg_getdata([CInv(MSG_CMPCT_BLOCK, int(tip, 16))]))
+        peer.wait_until(lambda: int(tip, 16) in peer.compact_blocks)
+        compact = peer.compact_blocks[int(tip, 16)]
+        assert_equal([prefilled.index for prefilled in compact.prefilled_txn], [0, 1])
+        assert_equal([prefilled.tx.txid_hex for prefilled in compact.prefilled_txn], block["tx"][:2])
+        assert_equal(len(compact.shortids), 1)
+
+        self.log.info("A new block is announced with a compact block before it is validated")
+        peer.send_and_ping(msg_sendcmpct(announce=True, version=2))
+        # node0 announces a block this way only to a peer that has the block's parent.
+        getheaders = msg_getheaders()
+        getheaders.locator.vHave = [int(tip, 16)]
+        peer.send_and_ping(getheaders)
+        self.wallet.rescan_utxos()
+        txs = [self.wallet.create_self_transfer(fee=Decimal("1"))["tx"]]
+        valid = self.make_block(txs)
+        self.submit(valid)
+        self.sync_blocks()
+        peer.wait_until(lambda: valid.hash_int in peer.compact_blocks)
+        assert_equal([prefilled.index for prefilled in peer.compact_blocks[valid.hash_int].prefilled_txn], [0, 1])
+
+        self.log.info("A block without the expected claim transaction is not announced")
+        self.wallet.rescan_utxos()
+        txs = [self.wallet.create_self_transfer(fee=Decimal("1"))["tx"]]
+        missing = self.make_block(txs, claim=False)
+        self.submit(missing, "bad-demurrage-claim-missing")
+        claim = build_claim(self.expected_pool_inputs(node0.getbestblockhash(), self.next_height()))
+        claim.vout[0].nValue -= 1
+        altered = self.make_block(txs, claim=claim)
+        self.submit(altered, "bad-demurrage-claim")
+        node0.syncwithvalidationinterfacequeue()
+        peer.sync_with_ping()
+        assert missing.hash_int not in peer.compact_blocks and altered.hash_int not in peer.compact_blocks
+
+        self.log.info("The check does not cover the contribution: a block with a wrong one is still announced")
+        self.make_block(txs)
+        wrong = self.make_block(txs, contributions=[self.last_block_charge + 1])
+        self.submit(wrong, "bad-cb-demurrage-amount")
+        peer.wait_until(lambda: wrong.hash_int in peer.compact_blocks)
+        node0.disconnect_p2ps()
+        self.wallet.rescan_utxos()
 
     def test_reorg(self):
         node0, node1 = self.nodes[:2]
@@ -831,10 +1215,10 @@ class DemurrageTest(BitcoinTestFramework):
         mempool = node0.getrawmempool()
         assert_equal(sorted(mempool), sorted(tx["txid"] for tx in sent))
         assert not set(claims) & set(mempool)
-        # Charges are recomputed for the new tip.
+        # Every policy charge is evaluated again for the new tip.
+        assert_equal(self.next_height(), fork_height + 1)
         for tx in sent:
-            txin = tx["tx"].vin[0]
-            self.assert_net_fee(tx["txid"], self.mempool_charge([self.coin(prevout_txid(txin), txin.prevout.n)]))
+            self.assert_policy(tx["txid"], *self.policy([tx["coin"]]))
 
         self.log.info("The new branch has its own contributions and claims, which node1 follows")
         self.generate(self.wallet, 4, sync_fun=self.no_op)
@@ -847,6 +1231,32 @@ class DemurrageTest(BitcoinTestFramework):
         assert_equal(node1.getbestblockhash(), node0.getbestblockhash())
         self.wallet.rescan_utxos()
         self.mine()
+
+    def test_pruned(self):
+        node0, node3 = self.nodes[0], self.nodes[3]
+        self.log.info("A pruned node finds a block's pool inputs without the blocks that created them")
+        # Extend the chain until blocks with claim transactions can be pruned.
+        self.mine(self.first_claim_height + 2 * MIN_BLOCKS_TO_KEEP - node0.getblockcount())
+        self.connect_nodes(0, 3)
+        self.sync_blocks([node0, node3])
+        tip = node3.getblockcount()
+        node3.pruneblockchain(tip - MIN_BLOCKS_TO_KEEP)
+        prune_height = node3.getblockchaininfo()["pruneheight"]
+        assert_greater_than(prune_height, self.first_claim_height + 1)
+        assert_raises_rpc_error(-1, "Block not available (pruned data)", node3.getblock, node3.getblockhash(prune_height - 1))
+        # A restart empties the cache of pool outputs.
+        self.restart_node(3)
+        # Connecting the first block that is stored needs the carry of the
+        # block below it, and the contribution of the block 100 below it.
+        assert_greater_than(len(self.pool[node0.getblockhash(prune_height)]["pool_inputs"]), 0)
+        with node3.assert_debug_log([], unexpected_msgs=["to find its demurrage pool outputs"]):
+            assert_equal(node3.verifychain(4, tip - prune_height + 1), True)
+        self.connect_nodes(0, 3)
+        self.send_charged()
+        self.mine()
+        self.sync_blocks([node0, node3])
+        assert_equal(node3.getbestblockhash(), node0.getbestblockhash())
+        self.disconnect_nodes(0, 3)
 
     def test_soft_fork(self):
         node0, node1 = self.nodes[:2]

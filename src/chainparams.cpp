@@ -42,6 +42,8 @@ static void HandleDeploymentArgs(const ArgsManager& args, CChainParams::Deployme
             options.activation_heights[*buried_deployment] = *height;
         } else if (deployment_name == "demurrage") {
             options.demurrage_activation_height = *height;
+        } else if (deployment_name == "demurrage_charges") {
+            options.demurrage_charges_height = *height;
         } else {
             throw std::runtime_error(strprintf("Invalid name (%s) for -testactivationheight=name@height.", arg));
         }

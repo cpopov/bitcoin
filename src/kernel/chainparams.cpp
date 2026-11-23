@@ -98,6 +98,10 @@ void CChainParams::ApplyDeploymentOptions(const DeploymentOptions& opts)
     if (opts.demurrage_activation_height) {
         consensus.DemurrageTestActivationHeight = *opts.demurrage_activation_height;
     }
+    if (opts.demurrage_charges_height || opts.demurrage_activation_height) {
+        // Forcing the rules alone starts the charges with them.
+        consensus.DemurrageTestChargesHeight = opts.demurrage_charges_height ? opts.demurrage_charges_height : opts.demurrage_activation_height;
+    }
 
     for (const auto& [deployment_pos, version_bits_params] : opts.version_bits_parameters) {
         consensus.vDeployments[deployment_pos].nStartTime = version_bits_params.start_time;
@@ -147,6 +151,13 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1815; // 90%
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        // Deployment of the charges of BIP 462b: the index starts to fall once both deployments are active.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].bit = 3;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].threshold = 1815; // 90%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].period = 2016;
         consensus.DemurrageRatePeriod = 2016;
         consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
         consensus.DemurrageTargetDenominator = 52'560'000;
@@ -289,6 +300,13 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1512; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        // Deployment of the charges of BIP 462b: the index starts to fall once both deployments are active.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].bit = 3;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].threshold = 1512; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].period = 2016;
         consensus.DemurrageRatePeriod = 2016;
         consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
         consensus.DemurrageTargetDenominator = 52'560'000;
@@ -408,6 +426,13 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1512; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        // Deployment of the charges of BIP 462b: the index starts to fall once both deployments are active.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].bit = 3;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].threshold = 1512; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].period = 2016;
         consensus.DemurrageRatePeriod = 2016;
         consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
         consensus.DemurrageTargetDenominator = 52'560'000;
@@ -571,6 +596,13 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 1815; // 90%
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 2016;
+        // Deployment of the charges of BIP 462b: the index starts to fall once both deployments are active.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].bit = 3;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].threshold = 1815; // 90%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].period = 2016;
         consensus.DemurrageRatePeriod = 2016;
         consensus.DemurrageTargetNumerator = 3; // 0.30% per year of 52,560 blocks
         consensus.DemurrageTargetDenominator = 52'560'000;
@@ -669,6 +701,13 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].min_activation_height = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].threshold = 108; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE].period = 144;
+        // Deployment of the charges of BIP 462b: the index starts to fall once both deployments are active.
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].bit = 3;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].min_activation_height = 0;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].threshold = 108; // 75%
+        consensus.vDeployments[Consensus::DEPLOYMENT_DEMURRAGE_CHARGES].period = 144;
         // Regtest halves the subsidy every 150 blocks, so the mainnet target is met by
         // the subsidy for thousands of blocks. A higher target (1/2,000 of the scheduled
         // supply per block) and rate periods matching the version bits period make

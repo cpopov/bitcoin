@@ -7,6 +7,7 @@
 
 #include <attributes.h>
 #include <chain.h>
+#include <consensus/demurrage.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <kernel/blockmanager_opts.h>
@@ -109,6 +110,9 @@ public:
     bool ReadFlag(const std::string& name, bool& fValue);
     bool LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** BIP 462b: the pool outputs that a connected block created, which outlive the block's data when it is pruned. */
+    void WriteDemurragePoolOutputs(const uint256& block_hash, const demurrage::BlockPoolOutputs& outputs);
+    bool ReadDemurragePoolOutputs(const uint256& block_hash, demurrage::BlockPoolOutputs& outputs);
 };
 } // namespace kernel
 

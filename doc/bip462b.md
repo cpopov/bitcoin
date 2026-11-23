@@ -1,25 +1,33 @@
 # BIP 462b reference implementation
 
-This branch implements version 0.3.0 of the draft **BIP 462b, Soft-Fork
+This branch implements version 0.4.0 of the draft **BIP 462b, Soft-Fork
 Demurrage Security Budget** (`bip-0462b.md`), except for the points listed under
-[Differences from draft 0.3.0](#differences-from-draft-030). It was first
+[Differences from draft 0.4.0](#differences-from-draft-040). It was first
 written against version 0.1.0. Versions 0.2.0 and 0.3.0 address the problems it
-found in 0.1.0, listed below, and change no mainnet consensus rule.
-The demurrage is charged when an output is
-spent. The block owes the charge, the coinbase pays it into a pool output, and a
-deterministic claim transaction at index 1 of every later block pays out
-`floor(P / 10,000)` of the pool as its fee.
+found in 0.1.0, listed below. Version 0.4.0 follows a review of 0.3.1 and of
+this branch. No version changes a mainnet consensus rule when both deployments
+activate together.
 
-The deployment is `demurrage`. It is defined on every network and is
-`NEVER_ACTIVE` everywhere, because the BIP sets no activation parameters at draft
-stage. On regtest it can be activated in two ways:
+The demurrage is charged when an output is spent. The block owes the charge, the
+coinbase pays it into a pool output, and a deterministic claim transaction at
+index 1 of every later block pays out `floor(P / 10,000)` of the pool as its
+fee.
 
-- `-testactivationheight=demurrage@<height>` applies the rules from a fixed
+There are two deployments. `demurrage` starts enforcement, at
+`ACTIVATION_HEIGHT`. `demurrage_charges` starts the index, at `CHARGE_HEIGHT`,
+the first height at which both are active. Both are defined on every network and
+are `NEVER_ACTIVE` everywhere, because the BIP sets no activation parameters at
+draft stage. On regtest they can be activated in two ways:
+
+- `-testactivationheight=demurrage@<height>` and
+  `-testactivationheight=demurrage_charges@<height>` apply each from a fixed
   height, whatever the version bits state. This is what most of the tests use.
-  The activation height is then known from the start, so the mempool computes
-  charges at the evaluation height even before it.
-- `-vbparams=demurrage:<start>:<timeout>[:<min_activation_height>]` activates it
-  through signalling. The regtest period is 144 blocks and the threshold 108.
+  Forcing `demurrage` alone starts charges at the same height. Both heights are
+  then known from the start, so the mempool computes policy charges even before
+  them.
+- `-vbparams=<deployment>:<start>:<timeout>[:<min_activation_height>]` activates
+  either through signalling. The regtest period is 144 blocks and the threshold
+  108.
 
 ## Building and testing
 
@@ -39,39 +47,52 @@ build/test/functional/feature_demurrage.py
 | `INDEX_ONE` | 10^18 | 10^18 | `demurrage::INDEX_ONE` |
 | `POOL_SCRIPT` | `0x04706f6f6c7551` | same | `demurrage::PoolScript()` |
 | `CHARGE_MARGIN` (policy) | 144 | 144 | `demurrage::CHARGE_MARGIN` |
-| Version bit | 4 | 4 | `kernel/chainparams.cpp` |
+| `CHARGE_TOLERANCE` (policy) | 1,000 satoshis | 1,000 satoshis | `demurrage::CHARGE_TOLERANCE` |
+| Version bit of `demurrage` | 4 | 4 | `kernel/chainparams.cpp` |
+| Version bit of `demurrage_charges` | 3 | 3 | `kernel/chainparams.cpp` |
+
+Both bits are below 5, the range in which Bitcoin Core warns about unknown
+deployments.
 
 Regtest halves the subsidy every 150 blocks, so with the mainnet target the
 subsidy covers the target until height 2,448. The regtest target is therefore
-higher, and its rate periods match its 144-block version bits period. Draft
-0.2.0 adopts these regtest values.
-With activation at 432, the first rate period has a zero rate, as on mainnet
-before 2032. Charges begin at 576, with `r = 237,945,492,662,473`, about 0.024%
-per block. At that rate, evaluating charges up to 287 blocks ahead (the policy's
-`E`) overstates them by several percent of input value. Regtest transactions
-that spend old coins therefore need far larger fees than they would on mainnet.
+higher, and its rate periods match its 144-block version bits period.
+With `CHARGE_HEIGHT` at 432, the first rate period has a zero rate, as on
+mainnet before 2032. Charges begin at 576, with `r = 237,945,492,662,473`, about
+0.024% per block. That is some 4,000 times the full mainnet rate, so the policy
+margins are much shorter than on mainnet. An input of up to about 29,000
+satoshis is evaluated 144 blocks ahead. One above about 0.042 BTC gains more
+than `CHARGE_TOLERANCE` in a single block, so it is evaluated at the next
+block's height and again every block. The mainnet equivalents at the full
+target rate are about 1.2 BTC and 175 BTC.
 
 ## Where each part of the specification is implemented
 
 | Spec section | Code |
 |---|---|
-| Parameters | `src/consensus/demurrage.h`; `src/consensus/params.h` (`DEPLOYMENT_DEMURRAGE`, `Demurrage*`); per-network values in `src/kernel/chainparams.cpp` |
+| Parameters | `src/consensus/demurrage.h`; `src/consensus/params.h` (`DEPLOYMENT_DEMURRAGE`, `DEPLOYMENT_DEMURRAGE_CHARGES`, `Demurrage*`); per-network values in `src/kernel/chainparams.cpp` |
 | Fixed-point arithmetic | `src/consensus/demurrage.cpp`: every product goes through `Wide`, which is `unsigned __int128`, or `arith_uint256` on compilers without it. `Narrow()` asserts that each result fits in 64 bits. |
 | Demurrage rate | `demurrage::ScheduledSubsidy`, `ScheduledSupply`, `PeriodRate` |
-| Demurrage index | `demurrage::NextIndex`, `demurrage::IndexSchedule::Index`, cached per activation height by `ChainstateManager::DemurrageSchedule` |
-| Demurrage charge | `demurrage::Charge`, `IndexSchedule::ChargeFor`; `C(h)` is summed in `Chainstate::ConnectBlock` from `Coin::nHeight` |
-| Pool outputs | `demurrage::IsPoolScript`; `ConnectBlock` rejects `bad-demurrage-pool-create` and `bad-demurrage-pool-spend` |
+| Demurrage index | `demurrage::NextIndex`, `demurrage::IndexSchedule::Index`, cached per `CHARGE_HEIGHT` by `ChainstateManager::DemurrageSchedule` |
+| Demurrage charge | `demurrage::Charge`, `IndexSchedule::ChargeFor`; `C(h)` is summed in `Chainstate::ConnectBlock` from `Coin::nHeight`, and is zero until `CHARGE_HEIGHT` |
+| Pool outputs | `demurrage::IsPoolScript`; `ConnectBlock` rejects `bad-demurrage-pool-create` and `bad-demurrage-pool-spend` from `ACTIVATION_HEIGHT` |
 | Coinbase contribution | `ConnectBlock`, after the transaction loop: `bad-cb-demurrage-missing`, `-amount`, `-multiple`, `-unexpected` |
-| Claim transaction | `demurrage::BuildClaimTransaction`; pool inputs from `ChainstateManager::GetDemurragePoolInputs`, which uses `GetDemurragePoolOutputs` and `RecordDemurragePoolOutputs` and `demurrage::FindBlockPoolOutputs`; `ConnectBlock` rejects `bad-demurrage-claim-missing` and `bad-demurrage-claim` |
+| Claim transaction | `demurrage::BuildClaimTransaction`; pool inputs from `ChainstateManager::GetDemurragePoolInputs`, which uses `GetDemurragePoolOutputs`, `RecordDemurragePoolOutputs` and `demurrage::FindBlockPoolOutputs`; `ConnectBlock` rejects `bad-demurrage-claim-missing` and `bad-demurrage-claim` |
 | Summary of new block rules | `Chainstate::ConnectBlock`, all three rules |
-| Deployment | `DEPLOYMENT_DEMURRAGE`, `deploymentinfo.cpp`, `DemurrageActivationHeight()` in `deploymentstatus.h`, `VersionBitsCache::ActivationHeight`, `-testactivationheight` in `chainparams.cpp`, `getdeploymentinfo` in `rpc/blockchain.cpp` |
-| Relay and mining policy: mining score | `CTxMemPoolEntry::m_demurrage_charge`, which `GetModifiedFee()` excludes; `ChangeSet::StageAddition`; `CTxMemPool::SetDemurrageCharge`; `MemPoolAccept::PreChecks`; `Chainstate::UpdateMempoolDemurrageCharges`, called from `ConnectTip` and `MaybeUpdateMempoolForReorg` |
-| Relay and mining policy: before activation | `DemurrageKnownActivationHeight()` in `deploymentstatus.h` and `VersionBitsCache::KnownActivationHeight` give `ACTIVATION_HEIGHT` from lock-in (the next period, or `min_activation_height` if later), or at any height when forced with `-testactivationheight`. `PreChecks` and `UpdateMempoolDemurrageCharges` use it. Consensus and block assembly use `DemurrageActivationHeight()`, which applies only from activation. |
-| Relay and mining policy: unconfirmed inputs | `MemPoolAccept::PreChecks` (coins at `MEMPOOL_HEIGHT`) and `Chainstate::UpdateMempoolDemurrageCharges` (parents found with `CTxMemPool::get`) charge an output of an unconfirmed transaction from the next block's height |
-| Relay and mining policy: relay | The existing fee checks (`CheckFeeRate`, package feerate, RBF, eviction) all read modified fees, so they use the net fee at `E` |
+| Deployment | `deploymentinfo.cpp`; in `deploymentstatus.h`, `DemurrageActivationHeight()` and `DemurrageChargeHeight()` (the later of the two activation heights); `VersionBitsCache::ActivationHeight`; `-testactivationheight` in `chainparams.cpp`; `getdeploymentinfo` in `rpc/blockchain.cpp` |
+| Relay and mining policy: mining score | `demurrage::EvaluatePolicyCharge` gives `E_tx` and the policy charge. `CTxMemPoolEntry` keeps them (`m_demurrage_charge`) with the value and created height of each input (`m_demurrage_inputs`), and `GetModifiedFee()` excludes the charge. `MemPoolAccept::PreChecks`, `ChangeSet::StageAddition`, `CTxMemPool::SetDemurrageCharge` |
+| Relay and mining policy: re-evaluation | `Chainstate::UpdateMempoolDemurrageCharges`, called from `ConnectTip` and `MaybeUpdateMempoolForReorg`. When a block connects, it evaluates again the entries whose `E_tx` is below the next block's height. After a reorganisation, or when `CHARGE_HEIGHT` changes, it looks up every input again and evaluates every entry. Nothing is evicted. |
+| Relay and mining policy: unconfirmed inputs | An input that spends a mempool output has the created height `demurrage::UNCONFIRMED_HEIGHT`, which `EvaluatePolicyCharge` reads as the next block's height. When a block confirms the output, `UpdateMempoolDemurrageCharges` records the block's height for the input (found through `mapNextTx`) and leaves the charge as it is until the entry is next evaluated. |
+| Relay and mining policy: before charges begin | `DemurrageKnownChargeHeight()` in `deploymentstatus.h` and `VersionBitsCache::KnownActivationHeight` give `CHARGE_HEIGHT` once each deployment is locked in or active, or at any height when forced with `-testactivationheight`. `PreChecks` and `UpdateMempoolDemurrageCharges` use it. Consensus and block assembly use `DemurrageChargeHeight()`, which applies only once both are active. |
+| Relay and mining policy: relay | The existing fee checks (`CheckFeeRate`, package feerate, eviction) all read modified fees, so they use the net fee |
+| Relay and mining policy: replacement | `CTxMemPoolEntry::GetModifiedFeeForReplacement()` adds back the growth of the policy charge since acceptance (`m_demurrage_charge_at_acceptance`). `MemPoolAccept::ReplacementChecks` and `PackageRBFChecks` sum it over the conflicts. |
+| Relay and mining policy: fee rules | The ephemeral dust check in `PreChecks` compares the fee, not the net fee |
 | Relay and mining policy: pool outputs | `PreChecks`: `demurrage-pool-output`, `demurrage-pool-spend`. Claim transactions from disconnected blocks fail the first check, so they are not returned to the mempool. |
-| Relay and mining policy: block assembly | `BlockAssembler::CreateNewBlock`, `node::GetDemurrageCharges`, `node::GetBlockDemurrageCharge`; `node::UpdateDemurrageContribution` for `generateblock`; the contribution is added to `CoinbaseTx::required_outputs` for IPC mining clients |
-| getblocktemplate | `getblocktemplate` in `rpc/mining.cpp`: the rule is listed as `demurrage` from activation and as `!demurrage` from `IndexSchedule::FirstChargeHeight()`, and `WarnDemurrageRuleRequired` logs the warning. `gbt_optional_rule` is `true` in `deploymentinfo.cpp`, so the version bit is set for every client while signalling. The `charge` and `demurrage_contribution` fields come from `CBlockTemplate::vTxDemurrageCharges` and `CBlockTemplate::demurrage_contribution`. |
+| Relay and mining policy: block assembly | `BlockAssembler::CreateNewBlock`, `node::GetDemurrageCharges`, `node::GetBlockDemurrageCharge`; `BlockAssembler::RemoveUnfundedTransaction` leaves out a transaction whose charge the block cannot fund, with its descendants; `node::UpdateDemurrageContribution` for `generateblock`; the contribution is added to `CoinbaseTx::required_outputs` for IPC mining clients |
+| Relay and mining policy: compact blocks | The `CBlockHeaderAndShortTxIDs` constructor in `blockencodings.cpp` prefills the transaction at index 1 when it is a claim transaction |
+| Relay and mining policy: checking before relay | `ChainstateManager::HasExpectedDemurrageClaim`, in `ChainstateManager::AcceptBlock` before `NewPoWValidBlock` is signalled |
+| getblocktemplate | `getblocktemplate` in `rpc/mining.cpp`, and `gbt_optional_rule` in `deploymentinfo.cpp`: `true` for `demurrage`, `false` for `demurrage_charges`. `WarnDemurrageRuleRequired` logs the warning. The `charge` and `demurrage_contribution` fields come from `CBlockTemplate::vTxDemurrageCharges` and `CBlockTemplate::demurrage_contribution`. |
+| Fees and interfaces: node interfaces | `getmempoolentry`, `getrawmempool` and the other RPCs that describe mempool entries give `chargeheight`, `fees.charge` and `fees.net` (`rpc/mempool.cpp`). `gettxout` gives `charge` and `effective_value` (`rpc/blockchain.cpp`). Each field appears once `CHARGE_HEIGHT` is known. |
 | Test vectors | `src/test/demurrage_tests.cpp`, `test/functional/feature_demurrage.py` |
 
 ### Reject reasons
@@ -93,10 +114,11 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 - **Finding the pool inputs.** The UTXO set is keyed by outpoint, so it cannot
   be searched by script. The carry is output 0 of the claim transaction of block
   `h − 1`. The matured contribution is the coinbase pool output of block
-  `h − 100`. Both blocks have passed validation, so only their coinbase and their
-  transaction at index 1 can have created a pool output. `ConnectBlock` records
-  each block's pool outputs in a cache of recent blocks, keyed by block index,
-  and on a miss reads the block from disk. Values come from the coins view.
+  `h − 100`. `ConnectBlock` records each block's two pool outpoints in the block
+  index database, under `'d'` and the block's hash (72 bytes a block), and in a
+  cache of recent blocks. A pruned node therefore does not need the blocks
+  themselves. A block connected before these records were kept has none, and is
+  read from disk once. Values come from the coins view.
 - **Input prefetching.** `ConnectBlock`'s parallel input fetcher expects coins
   to be read in block order. The claim's inputs are therefore compared as
   outpoints before the loop, and their coins are read only when the loop reaches
@@ -104,26 +126,80 @@ that spend old coins therefore need far larger fees than they would on mainnet.
 - **Order of checks.** The claim check runs before `CheckTxInputs`. An altered
   claim is reported as `bad-demurrage-claim`, even when its output exceeds its
   inputs. The contribution is checked after the existing `bad-cb-amount` check.
-- **Net fee as modified fee.** Charges are applied like a negative
+- **Net fee as modified fee.** Policy charges are applied like a negative
   `prioritisetransaction` delta. Cluster linearisation, block assembly, package
-  relay, RBF and mempool trimming then all rank by net fee without further
-  changes. `getmempoolentry` reports `fees.modified` as base fee + delta − charge.
-- **When charges are recomputed.** All mempool charges are recomputed when `E`
-  or the activation height changes, and after every reorg. When a block connects
-  without changing either, only the entries that spend its outputs are
-  recomputed, because their inputs have just confirmed. Those inputs were
-  charged as if confirmed in the next block at the time, so their charges can
-  only fall. Other entries keep that next-block height for their unconfirmed
-  inputs until `E` moves, which overstates the charge a little more with each
-  block.
+  relay and mempool trimming then all rank by net fee without further changes.
+  `getmempoolentry` reports `fees.modified` as base fee + delta − charge. The
+  saved mempool (`mempool.dat`) records the delta without the charge, which is
+  computed again when the transaction is loaded.
+- **Net fee at acceptance.** It is kept in memory only. After a restart it is
+  the net fee when the transaction was loaded.
+- **Finding `E_tx`.** `charge_at(e)` does not fall as `e` rises, so
+  `EvaluatePolicyCharge` finds `E_tx` by bisection: about ten evaluations of
+  `charge_at` for each transaction, and three when the full margin is within the
+  tolerance.
 - **Block assembly.** The claim's weight is reserved before transactions are
   selected. `C(h)` is computed exactly at the block's height from the coins tip.
   Inputs spending outputs of earlier transactions in the block have no charge.
-  The contribution is coinbase output 1, before the witness commitment.
+  The contribution is coinbase output 1, before the witness commitment. When the
+  contribution exceeds the subsidy, the fees and the payout, the assembler
+  removes the transaction with the greatest charge less fee, and its
+  descendants, until it does not, and logs each one. Only a transaction
+  prioritised by hand can cause this.
+- **Checking before relay.** The check covers blocks whose parent is the tip,
+  which are the only ones announced before validation. It passes a block whose
+  pool inputs it cannot find.
+
+## Defects found in the review of draft 0.3.1
+
+The review that led to draft 0.4.0 reproduced two defects of this branch on
+regtest, and found a third by reading. All three are fixed, and the functional
+test covers each.
+
+1. **Policy charges doubled at every restart.** The saved mempool recorded
+   `modified fee − fee` as the transaction's prioritisation, and that difference
+   included the charge. On loading, the charge was applied as a delta and then
+   computed again. A transaction with a 4.21 BTC charge had 8.41 BTC after one
+   restart, and was dropped after the second, leaving a prioritisation entry for
+   a transaction that no longer existed.
+2. **A pruned node shut down when it connected a block again.** The pool inputs
+   were found by reading blocks `h − 1` and `h − 100`. On a pruned node,
+   `verifychain 4 0` connects again the lowest blocks that are still stored. It
+   failed to read the pruned blocks below them and stopped the node. The pool
+   outpoints are now kept with the block index.
+3. **Block assembly threw when a block could not fund its contribution.** A
+   transaction prioritised by hand whose charge exceeded the block's subsidy and
+   fees made every `getblocktemplate` call fail until it left the mempool. The
+   assembler now leaves it out.
+
+## Observations on draft 0.4.0
+
+Found while implementing it.
+
+1. **Large inputs have no margin.** An input whose charge grows by more than
+   `CHARGE_TOLERANCE` a block (about 175 BTC at the full mainnet rate, any
+   coinbase output on regtest) is evaluated at the next block's height. A
+   transaction that spends it at the minimum relay feerate falls below that
+   feerate after one block. Its net fee then falls every block until it is
+   bumped. The same holds for a child of an unconfirmed parent: its policy
+   charge is zero, and it owes a block's decay as soon as its parent confirms
+   without it. The draft's Open Questions now ask whether a minimum margin is
+   needed.
+2. **Mempools of nodes that do not enforce the rules diverge.** Such a node
+   compares fees where an enforcing node compares net fees. In the functional
+   test, node1 keeps a transaction that node0 has replaced, until the block that
+   confirms the replacement arrives. This follows from any policy on net fees.
+3. **The check before relay does not cover the contribution**, as the draft
+   says. A block with the right claim transaction and a wrong contribution is
+   still announced to high-bandwidth compact block peers before it is rejected.
+   The functional test shows both cases, and still has to isolate its
+   non-enforcing node for the second.
 
 ## Problems found in draft 0.1.0
 
-Drafts 0.2.0 and 0.3.0 address each of these. Each numeric claim in draft 0.1.0 was checked against an independent
+Drafts 0.2.0 and 0.3.0 address each of these. The evaluation height `E` they
+refer to was one height for the whole mempool, which draft 0.4.0 replaced with a
+height for each transaction. Each numeric claim in draft 0.1.0 was checked against an independent
 arbitrary-precision implementation, in the unit tests and in Python. The rate
 table, the 19,284,730,634 rate at 1,260,000, the maximum rate 57,077,625,570,
 the index falls (0.41%, 1.21%, 2.19%), the 67-, 108- and 16-byte sizes and the
@@ -201,52 +277,62 @@ interfaces and wording.
 
 ## getblocktemplate
 
-This follows the draft's `getblocktemplate` section as of version 0.3.0.
+This follows the draft's `getblocktemplate` section as of version 0.4.0.
 
-- **Rule.** From activation the template lists the optional rule `demurrage`,
-  and a client that does not declare it gets a template as usual. From the first
-  rate period with a non-zero rate (1,260,000 on mainnet, or the activation
-  height if that is later; 576 on regtest with activation at 432) the template
-  lists `!demurrage`, and a client that does not declare it gets the error
-  `Support for 'demurrage' rule requires explicit client support`. This applies
-  whether the deployment activated through version bits or was forced with
-  `-testactivationheight`.
-- **Warning.** Between the two, each request from a client that does not
-  declare the rule logs a warning that templates will require it from that
-  height, at most once an hour.
-- **Signalling.** While the deployment is `started` or `locked_in`, the
-  template's version has the deployment's bit for every client, so signalling
-  counts upgraded nodes, not upgraded mining software.
-- **Fields.** While the deployment is active, each transaction has a `charge`,
-  its charge at the template's height, and the template has a
+- **`demurrage`.** While the deployment is `started` or `locked_in`, the
+  template's version has its bit for every client, so its signalling counts
+  upgraded nodes, not upgraded mining software. From `ACTIVATION_HEIGHT` the
+  template lists it as an optional rule.
+- **`demurrage_charges`.** While signalling, it is listed in `vbavailable` as
+  `!demurrage_charges`, and the template's version has its bit only for clients
+  that declare the rule. From `CHARGE_HEIGHT` the template lists it in `rules`:
+  as `demurrage_charges` while no block can owe a charge, and as
+  `!demurrage_charges` from the first rate period with a non-zero rate
+  (`IndexSchedule::FirstChargeHeight()`: 1,260,000 on mainnet, or
+  `CHARGE_HEIGHT` if that is later; 576 on regtest with `CHARGE_HEIGHT` at 432).
+  From then a client that does not declare it gets the error
+  `Support for 'demurrage_charges' rule requires explicit client support`. This
+  applies whether the deployments activated through version bits or were forced
+  with `-testactivationheight`.
+- **Warning.** From `ACTIVATION_HEIGHT` until the rule is required, each request
+  from a client that does not declare `demurrage_charges` logs a warning that
+  templates will require it, and from which height once `CHARGE_HEIGHT` is
+  known, at most once an hour.
+- **Fields.** From `ACTIVATION_HEIGHT`, each transaction has a `charge`, its
+  charge at the template's height, and the template has a
   `demurrage_contribution`, `C(h)`. The claim transaction is the first entry of
   `transactions`, with the payout as its `fee` and a `charge` of 0.
   `coinbasevalue` is `subsidy + fees − C(h)`, where fees include the payout.
   `default_witness_commitment` is still the witness commitment. The contribution
   is not one of the outputs it describes.
 
-## Differences from draft 0.3.0
+## Differences from draft 0.4.0
 
-- **Compact blocks.** Senders do not prefill the claim transaction, and nodes do
-  not check it before relaying a block ahead of validation.
+- **Compact blocks, receiving side.** A node does not build the claim
+  transaction of a compact block that lacks it. It requests it with
+  `getblocktxn`, as for any other missing transaction. Senders prefill it, so
+  this costs a round trip only for blocks relayed by nodes that do not implement
+  the BIP.
 - **assumeutxo.** The draft states how to find the pool inputs in a snapshot.
-  This implementation does not do so yet (see below).
-
-The charge of unconfirmed inputs, charges from lock-in, the `getblocktemplate`
-support, the no-eviction rule for recomputation, the fee rule for ephemeral
-dust and the regtest parameters match the draft.
-
-## Not implemented
-
+  This implementation does not do so. After a snapshot is loaded, the first
+  blocks need the claim of the base block and the contributions of the 100
+  blocks below it, of which there is no record, and `ConnectBlock` stops with a
+  fatal error. A fix is to write the records while loading the snapshot, using
+  the identities in problem 6 below.
+- **PSBT.** There is no per-input confirmation height field.
 - **Wallet.** The wallet does not add the charge to its fee. Once a wallet
-  transaction's charge at `E` exceeds its fee, the mempool rejects it with
+  transaction's policy charge exceeds its fee, the mempool rejects it with
   `min relay fee not met`. The wallet does not report effective balances.
-- **Stratum V2 and PSBT fields**: left by the draft to separate specifications.
-- **assumeutxo.** After a snapshot is loaded, the first blocks need the claim of
-  the base block and the contributions of the 100 blocks below it, which are not
-  on disk. `ConnectBlock` then stops with a fatal error. A fix is to record the
-  pool outputs while loading the snapshot, using the identities in problem 6.
 - **Fee estimation** still uses fees, not net fees.
+- **Node interfaces.** Only the mempool RPCs and `gettxout` report charges.
+  `scantxoutset`, `testmempoolaccept` and the REST interface do not.
+- **Stratum V2**: left by the draft to a separate specification.
+
+The two deployments, per-transaction evaluation heights, re-evaluation, the
+charge of unconfirmed inputs, charges from the lock-in of both deployments, the
+replacement rule, block assembly, compact block prefilling, the check before
+relay, the `getblocktemplate` support, the fee rule for ephemeral dust and the
+regtest parameters match the draft.
 
 ## Tests
 
@@ -257,41 +343,51 @@ dust and the regtest parameters match the draft.
   - every mainnet rate period below 1,260,000 (all zero), the first non-zero
     rate 19,284,730,634, the first period of each later era, and the bound;
   - the index over sequences of periods, including that it does not depend on
-    the activation height;
-  - charges: outputs created before activation, outputs created and spent in
-    the same block, rounding and `MAX_MONEY`;
+    the height at which it starts;
+  - charges: outputs created before `CHARGE_HEIGHT`, outputs created and spent
+    in the same block, rounding and `MAX_MONEY`;
   - claim transactions with one and with two inputs, their sizes and payouts;
-  - the evaluation height;
+  - policy charges: the draft's ten mainnet evaluation height vectors, the
+    zero-rate case, and 200 random sets of regtest inputs against a linear
+    search;
+  - the serialisation of a block's pool output record;
   - the regtest schedule;
   - the height from which `getblocktemplate` requires the rule, for several
-    activation heights.
+    values of `CHARGE_HEIGHT`.
 - `src/test/versionbits_tests.cpp`: `VersionBitsCache::KnownActivationHeight`
   while started, locked in and active, with and without a
   `min_activation_height`.
 - `test/functional/feature_demurrage.py`. node0 enforces the rules from height
-  432. node1 does not enforce them, and accepts every block node0 accepts,
-  claims and contributions included, which shows the rules are a soft fork. The
-  test keeps its own model of the rate, index, charges and pool, and checks
-  every block from activation against it. node2 has a chain of its own, on which
-  the deployment activates through signalling. It covers:
-  - on node2, the version bit for clients that do and do not declare the rule
-    while the deployment is `started` and `locked_in`; the optional rule and the
-    rate-limited warning from activation; and the required rule from 576;
-  - on node2, a mempool charge while the deployment is locked in, at an
-    evaluation height beyond activation;
-  - on node0, the same switch at 576 with a forced activation height, and every
+  288 and starts the index at 432. node1 does not enforce them, and accepts
+  every block node0 accepts, claims and contributions included, which shows the
+  rules are a soft fork. The test keeps its own model of the rate, index,
+  charges, pool and policy charge, and checks every block from activation, and
+  node0's mempool entries, against it. node2 has a chain of its own, on which
+  the deployments activate through signalling. node3 is pruned. It covers:
+  - on node2, both version bits for clients that do and do not declare
+    `demurrage_charges`. Blocks built without the declaration lock in
+    `demurrage` alone, and `demurrage_charges` follows a period later, so
+    `ACTIVATION_HEIGHT` is 432 and `CHARGE_HEIGHT` 576. The optional
+    `demurrage` rule and the rate-limited warning from 432, no policy charges
+    until both are locked in, and the required rule from 576;
+  - on node0, enforcement without charges from 288, the optional
+    `demurrage_charges` rule from 432 and the required one from 576, and every
     `getblocktemplate` field checked against the model: each transaction's
     `charge` (zero for an input from an earlier transaction in the template),
     `demurrage_contribution`, `coinbasevalue` and the claim transaction. A block
     built from the template alone is valid;
   - pre-activation `POOL_SCRIPT` outputs, in the coinbase and in a transaction,
     and spending one after activation;
-  - the zero-rate first period;
-  - net fees at the evaluation height, and their recomputation when `E` moves
-    and when a parent confirms;
+  - the zero-rate first period, and `gettxout`'s `charge` and `effective_value`
+    before and after charges begin;
+  - evaluation heights: inputs of 20,000, 100,000 and 1,000,000 satoshis and of
+    50 BTC get margins of 144 blocks, some tens, a few and none. Each
+    transaction is evaluated again only when the next block's height exceeds its
+    own evaluation height;
   - inputs from unconfirmed parents, charged as if the parent confirms in the
-    next block: the child's charge stays the same when the parent confirms in
-    that block, and falls when it confirms later, also in a CPFP package;
+    next block. The child's policy charge does not change when the parent
+    confirms, in that block or a later one, and from its next evaluation it is
+    charged from the parent's actual height;
   - contributions from block assembly and from `generateblock`;
   - an output created and spent in the same block;
   - claims with one and with two inputs, and their payouts;
@@ -300,6 +396,21 @@ dust and the regtest parameters match the draft.
   - the mempool policy for pool outputs on both kinds of node;
   - a pre-signed transaction whose fee is below its charge: mined at a loss in
     one case, rescued by CPFP through `submitpackage` in the other;
-  - a reorg, in which claim transactions are not returned to the mempool,
-    charges are recomputed, and the replacement claim has the same txid;
+  - replacement: a transaction whose net fee has fallen below zero cannot be
+    replaced for less than its net fee at acceptance;
+  - a prioritised transaction whose charge no block can fund, and its child,
+    are left out of the template, and the template is valid;
+  - two restarts, after which policy charges, net fees and prioritisation are
+    what they were;
+  - compact blocks that prefill the claim transaction; a block without the
+    expected claim transaction is not announced before validation, and one with
+    a wrong contribution still is;
+  - a reorg, in which claim transactions are not returned to the mempool, every
+    policy charge is evaluated again, and the replacement claim has the same
+    txid;
+  - on node3, `verifychain` at level 4 over blocks whose pool inputs were
+    created in pruned blocks;
   - a block that node1 accepts and node0 rejects.
+
+Each of the replacement, announcement and pruning cases was also run against a
+build with the corresponding change removed, and failed there.

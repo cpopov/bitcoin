@@ -896,10 +896,11 @@ protected:
         bool fAddToMempool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
     /**
-     * BIP 462b policy: recompute the demurrage charges of mempool entries at
-     * the evaluation height of the next block. Only the entries spending
-     * outputs of connected_block are recomputed if it is given and neither the
-     * evaluation height nor the activation height has changed.
+     * BIP 462b policy: re-evaluate the policy charges of the mempool entries
+     * whose evaluation height the next block's height exceeds. Inputs that
+     * spend outputs of connected_block are recorded as confirmed at its height.
+     * Every entry is re-evaluated, from the coins, if connected_block is null
+     * (after a reorganisation) or CHARGE_HEIGHT has become known or changed.
      */
     void UpdateMempoolDemurrageCharges(const CBlock* connected_block) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
@@ -1226,19 +1227,40 @@ public:
         return ::DemurrageActivationHeight(pindexPrev, GetConsensus(), m_versionbitscache);
     }
 
+    /** BIP 462b: if the demurrage index has started to fall by the block after pindexPrev, CHARGE_HEIGHT. */
+    std::optional<int> DemurrageChargeHeight(const CBlockIndex* pindexPrev) const
+    {
+        return ::DemurrageChargeHeight(pindexPrev, GetConsensus(), m_versionbitscache);
+    }
+
     /** BIP 462b policy: ACTIVATION_HEIGHT once it is known for the block after pindexPrev, from lock-in. */
     std::optional<int> DemurrageKnownActivationHeight(const CBlockIndex* pindexPrev) const
     {
         return ::DemurrageKnownActivationHeight(pindexPrev, GetConsensus(), m_versionbitscache);
     }
 
-    /** BIP 462b: the demurrage index of a chain whose deployment activated at activation_height. */
-    demurrage::IndexSchedule& DemurrageSchedule(int activation_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** BIP 462b policy: CHARGE_HEIGHT once it is known for the block after pindexPrev: each deployment is locked in or active. */
+    std::optional<int> DemurrageKnownChargeHeight(const CBlockIndex* pindexPrev) const
+    {
+        return ::DemurrageKnownChargeHeight(pindexPrev, GetConsensus(), m_versionbitscache);
+    }
+
+    /** BIP 462b: the demurrage index of a chain on which the index starts to fall at charge_height. */
+    demurrage::IndexSchedule& DemurrageSchedule(int charge_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * BIP 462b: whether a block on top of prev has the claim transaction that
+     * its pool inputs require at index 1. Blocks are checked with this before
+     * they are announced ahead of full validation. Returns true if the check
+     * cannot be made.
+     */
+    bool HasExpectedDemurrageClaim(const CBlock& block, const CBlockIndex& prev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
      * BIP 462b: the pool outputs created by a connected block at or above the
-     * activation height, from a cache of recent blocks or else from disk.
-     * nullopt if the block cannot be read.
+     * activation height: from a cache of recent blocks, else from the record
+     * kept in the block index database, else from the block on disk. nullopt
+     * if none of them has it.
      */
     std::optional<demurrage::BlockPoolOutputs> GetDemurragePoolOutputs(const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void RecordDemurragePoolOutputs(const CBlockIndex& index, const demurrage::BlockPoolOutputs& outputs) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

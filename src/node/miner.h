@@ -107,6 +107,13 @@ private:
       * @pre BlockAssembler::m_mempool must not be nullptr
     */
     void addChunks() EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs);
+    /**
+     * BIP 462b: remove from the block being built the transaction whose
+     * charge exceeds its fee by the most, and its descendants in the block.
+     * charges has one entry per selected transaction and is updated to match.
+     * Returns the charges of the transactions removed.
+     */
+    CAmount RemoveUnfundedTransaction(std::vector<CAmount>& charges);
 
     // helper functions for addChunks()
     /** Test if a new chunk would "fit" in the block */
