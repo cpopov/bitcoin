@@ -1046,6 +1046,8 @@ static bool rest_getutxos(const std::any& context, HTTPRequest* req, const std::
     std::vector<CCoin> outs;
     std::string bitmapStringRepresentation;
     std::vector<bool> hits;
+    // BIP 462b: each found output's charge in the next block, once CHARGE_HEIGHT is known.
+    std::vector<std::optional<CAmount>> charges;
     bitmap.resize(CeilDiv(vOutPoints.size(), 8u));
     ChainstateManager* maybe_chainman = GetChainman(context, req);
     if (!maybe_chainman) return false;
@@ -1053,11 +1055,14 @@ static bool rest_getutxos(const std::any& context, HTTPRequest* req, const std::
     decltype(chainman.ActiveHeight()) active_height;
     uint256 active_hash;
     {
-        auto process_utxos = [&vOutPoints, &outs, &hits, &active_height, &active_hash, &chainman](const CCoinsView& view, const CTxMemPool* mempool) EXCLUSIVE_LOCKS_REQUIRED(chainman.GetMutex()) {
+        auto process_utxos = [&vOutPoints, &outs, &hits, &charges, &active_height, &active_hash, &chainman](const CCoinsView& view, const CTxMemPool* mempool) EXCLUSIVE_LOCKS_REQUIRED(chainman.GetMutex()) {
             for (const COutPoint& vOutPoint : vOutPoints) {
                 auto coin = !mempool || !mempool->isSpent(vOutPoint) ? view.GetCoin(vOutPoint) : std::nullopt;
                 hits.push_back(coin.has_value());
-                if (coin) outs.emplace_back(std::move(*coin));
+                if (coin) {
+                    charges.push_back(chainman.DemurrageChargeInNextBlock(coin->out.nValue, coin->nHeight == MEMPOOL_HEIGHT ? demurrage::UNCONFIRMED_HEIGHT : static_cast<int>(coin->nHeight)));
+                    outs.emplace_back(std::move(*coin));
+                }
             }
             active_height = chainman.ActiveHeight();
             active_hash = chainman.ActiveTip()->GetBlockHash();
@@ -1117,10 +1122,15 @@ static bool rest_getutxos(const std::any& context, HTTPRequest* req, const std::
         objGetUTXOResponse.pushKV("bitmap", bitmapStringRepresentation);
 
         UniValue utxos(UniValue::VARR);
-        for (const CCoin& coin : outs) {
+        for (size_t i{0}; i < outs.size(); ++i) {
+            const CCoin& coin{outs[i]};
             UniValue utxo(UniValue::VOBJ);
             utxo.pushKV("height", coin.nHeight);
             utxo.pushKV("value", ValueFromAmount(coin.out.nValue));
+            if (const auto charge{charges.at(i)}) {
+                utxo.pushKV("charge", ValueFromAmount(*charge));
+                utxo.pushKV("effective_value", ValueFromAmount(coin.out.nValue - *charge));
+            }
 
             // include the script in a json output
             UniValue o(UniValue::VOBJ);

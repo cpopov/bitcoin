@@ -701,6 +701,8 @@ private:
         int64_t m_vsize;
         /** Fees paid by this transaction: total input amounts subtracted by total output amounts. */
         CAmount m_base_fees;
+        /** BIP 462b: the policy charge, which m_modified_fees excludes. */
+        demurrage::PolicyCharge m_demurrage_charge;
         /** Base fees + any fee delta set by the user with prioritisetransaction. */
         CAmount m_modified_fees;
 
@@ -1008,6 +1010,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         m_subpackage.m_changeset = m_pool.GetChangeSet();
     }
     ws.m_tx_handle = m_subpackage.m_changeset->StageAddition(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(), entry_sequence, fSpendsCoinbase, nSigOpsCost, lock_points.value(), std::move(demurrage_inputs), demurrage_charge);
+    ws.m_demurrage_charge = demurrage_charge;
 
     // ws.m_modified_fees includes any fee deltas from PrioritiseTransaction,
     // less the demurrage charge (BIP 462b)
@@ -1390,14 +1393,14 @@ bool MemPoolAccept::SubmitPackage(const ATMPArgs& args, std::vector<Workspace>& 
             std::vector<Wtxid>{ws.m_ptx->GetWitnessHash()};
         results.emplace(ws.m_ptx->GetWitnessHash(),
                         MempoolAcceptResult::Success(std::move(m_subpackage.m_replaced_transactions), ws.m_vsize,
-                                         ws.m_base_fees, effective_feerate, effective_feerate_wtxids));
+                                         ws.m_base_fees, effective_feerate, effective_feerate_wtxids, ws.m_demurrage_charge));
         if (!m_pool.m_opts.signals) continue;
         const CTransaction& tx = *ws.m_ptx;
         const auto tx_info = NewMempoolTransactionInfo(ws.m_ptx, ws.m_base_fees,
                                                        ws.m_vsize, (*iter)->GetHeight(),
                                                        args.m_bypass_limits, args.m_package_submission,
                                                        IsCurrentForFeeEstimation(m_active_chainstate),
-                                                       m_pool.HasNoInputsOf(tx));
+                                                       m_pool.HasNoInputsOf(tx), ws.m_demurrage_charge.charge);
         m_pool.m_opts.signals->TransactionAddedToMempool(tx_info, m_pool.GetAndIncrementSequence());
     }
     return all_submitted;
@@ -1476,7 +1479,7 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransactionInternal(const CTransa
     // Tx was accepted, but not added
     if (args.m_test_accept) {
         return MempoolAcceptResult::Success(std::move(m_subpackage.m_replaced_transactions), ws.m_vsize,
-                                            ws.m_base_fees, effective_feerate, single_wtxid);
+                                            ws.m_base_fees, effective_feerate, single_wtxid, ws.m_demurrage_charge);
     }
 
     FinalizeSubpackage(args);
@@ -1503,7 +1506,7 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransactionInternal(const CTransa
                                                        ws.m_vsize, (*iter)->GetHeight(),
                                                        args.m_bypass_limits, args.m_package_submission,
                                                        IsCurrentForFeeEstimation(m_active_chainstate),
-                                                       m_pool.HasNoInputsOf(tx));
+                                                       m_pool.HasNoInputsOf(tx), ws.m_demurrage_charge.charge);
         m_pool.m_opts.signals->TransactionAddedToMempool(tx_info, m_pool.GetAndIncrementSequence());
     }
 
@@ -1515,7 +1518,7 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransactionInternal(const CTransa
     }
 
     return MempoolAcceptResult::Success(std::move(m_subpackage.m_replaced_transactions), ws.m_vsize, ws.m_base_fees,
-                                        effective_feerate, single_wtxid);
+                                        effective_feerate, single_wtxid, ws.m_demurrage_charge);
 }
 
 PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactionsInternal(const std::vector<CTransactionRef>& txns, ATMPArgs& args)
@@ -1638,7 +1641,7 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactionsInternal(con
             results.emplace(ws.m_ptx->GetWitnessHash(),
                             MempoolAcceptResult::Success(std::move(m_subpackage.m_replaced_transactions),
                                                          ws.m_vsize, ws.m_base_fees, effective_feerate,
-                                                         effective_feerate_wtxids));
+                                                         effective_feerate_wtxids, ws.m_demurrage_charge));
         }
     }
 
@@ -1761,7 +1764,7 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
             // the new transactions. This ensures we don't double-count transaction counts and sizes when
             // checking ancestor/descendant limits, or double-count transaction fees for fee-related policy.
             const auto& entry{*Assert(m_pool.GetEntry(txid))};
-            results_final.emplace(wtxid, MempoolAcceptResult::MempoolTx(entry.GetTxSize(), entry.GetFee()));
+            results_final.emplace(wtxid, MempoolAcceptResult::MempoolTx(entry.GetTxSize(), entry.GetFee(), {entry.GetDemurrageEvaluationHeight(), entry.GetDemurrageCharge()}));
         } else if (m_pool.exists(txid)) {
             // Transaction with the same non-witness data but different witness (same txid,
             // different wtxid) already exists in the mempool.
@@ -6083,6 +6086,12 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
         return util::Error{Untranslated("Work does not exceed active chainstate")};
     }
 
+    // BIP 462b: the unspent pool outputs are the pool inputs of the blocks
+    // after the snapshot's base. Blocks below the base are not available to
+    // find them in, so they are collected while the coins are loaded.
+    const auto demurrage_activation{WITH_LOCK(::cs_main, return DemurrageActivationHeight(snapshot_start_block))};
+    std::vector<std::pair<COutPoint, Coin>> pool_coins;
+
     const uint64_t coins_count = metadata.m_coins_count;
     uint64_t coins_left = metadata.m_coins_count;
 
@@ -6115,6 +6124,9 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
                 if (!MoneyRange(coin.out.nValue)) {
                     return util::Error{Untranslated(strprintf("Bad snapshot data after deserializing %d coins - bad tx out value",
                               coins_count - coins_left))};
+                }
+                if (demurrage_activation && static_cast<int>(coin.nHeight) >= *demurrage_activation && demurrage::IsPoolScript(coin.out.scriptPubKey)) {
+                    pool_coins.emplace_back(outpoint, coin);
                 }
                 coins_cache.EmplaceCoinInternalDANGER(outpoint, std::move(coin));
 
@@ -6242,6 +6254,10 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
     assert(index);
     assert(index == snapshot_start_block);
     index->m_chain_tx_count = au_data.m_chain_tx_count;
+
+    if (demurrage_activation) {
+        if (auto res{RecordSnapshotDemurragePoolOutputs(*snapshot_start_block, *demurrage_activation, pool_coins)}; !res) return res;
+    }
 
     LogInfo("[snapshot] validated snapshot (%.2f MB)",
         coins_cache.DynamicMemoryUsage() / (1000 * 1000));
@@ -6710,22 +6726,78 @@ demurrage::IndexSchedule& ChainstateManager::DemurrageSchedule(int charge_height
     return *m_demurrage_schedule;
 }
 
-bool ChainstateManager::HasExpectedDemurrageClaim(const CBlock& block, const CBlockIndex& prev)
+std::optional<CAmount> ChainstateManager::DemurrageChargeInNextBlock(CAmount value, int created_height)
 {
     AssertLockHeld(::cs_main);
+    const CBlockIndex* tip{ActiveTip()};
+    const auto charge_height{tip ? DemurrageKnownChargeHeight(tip) : std::nullopt};
+    if (!charge_height) return std::nullopt;
+    return DemurrageSchedule(*charge_height).ChargeFor(value, created_height, tip->nHeight + 1);
+}
+
+std::optional<demurrage::PolicyCharge> ChainstateManager::DemurragePolicyCharge(std::span<const demurrage::PolicyInput> inputs)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* tip{ActiveTip()};
+    const auto charge_height{tip ? DemurrageKnownChargeHeight(tip) : std::nullopt};
+    if (!charge_height) return std::nullopt;
+    return demurrage::EvaluatePolicyCharge(DemurrageSchedule(*charge_height), inputs, tip->nHeight + 1);
+}
+
+std::optional<CTransactionRef> ChainstateManager::ExpectedDemurrageClaim(const CBlockIndex& prev)
+{
+    AssertLockHeld(::cs_main);
+    // The values of the pool inputs are read from the coins tip.
+    if (&prev != ActiveTip()) return std::nullopt;
     const auto activation{DemurrageActivationHeight(&prev)};
-    if (!activation) return true;
+    if (!activation) return CTransactionRef{};
     std::vector<COutPoint> pool_inputs;
-    if (!GetDemurragePoolInputs(prev, *activation, pool_inputs)) return true;
-    if (pool_inputs.empty()) return true;
-    if (block.vtx.size() < 2) return false;
+    if (!GetDemurragePoolInputs(prev, *activation, pool_inputs)) return std::nullopt;
+    if (pool_inputs.empty()) return CTransactionRef{};
     CAmount pool_value{0};
     for (const COutPoint& outpoint : pool_inputs) {
         const auto coin{ActiveChainstate().CoinsTip().GetCoin(outpoint)};
-        if (!coin) return true;
+        if (!coin) return std::nullopt;
         pool_value += coin->out.nValue;
     }
-    return block.vtx[1]->GetWitnessHash() == CTransaction{demurrage::BuildClaimTransaction(pool_inputs, pool_value)}.GetWitnessHash();
+    return MakeTransactionRef(demurrage::BuildClaimTransaction(pool_inputs, pool_value));
+}
+
+bool ChainstateManager::HasExpectedDemurrageClaim(const CBlock& block, const CBlockIndex& prev)
+{
+    AssertLockHeld(::cs_main);
+    const auto claim{ExpectedDemurrageClaim(prev)};
+    if (!claim || !*claim) return true;
+    return block.vtx.size() >= 2 && block.vtx[1]->GetWitnessHash() == (*claim)->GetWitnessHash();
+}
+
+util::Result<void> ChainstateManager::RecordSnapshotDemurragePoolOutputs(const CBlockIndex& base, int activation_height, const std::vector<std::pair<COutPoint, Coin>>& pool_coins)
+{
+    AssertLockHeld(::cs_main);
+    // The unspent pool outputs are the carry, which the claim transaction of
+    // the base block created, and the contributions of the base block and of
+    // the COINBASE_MATURITY - 1 blocks below it, which coinbases created.
+    const int first_height{std::max(activation_height, base.nHeight - COINBASE_MATURITY + 1)};
+    std::map<int, demurrage::BlockPoolOutputs> records;
+    for (int height{first_height}; height <= base.nHeight; ++height) records[height];
+    for (const auto& [outpoint, coin] : pool_coins) {
+        const int height{static_cast<int>(coin.nHeight)};
+        const auto record{records.find(height)};
+        auto* slot{record == records.end() ? nullptr : coin.IsCoinBase() ? &record->second.contribution : height == base.nHeight ? &record->second.carry : nullptr};
+        if (!slot || *slot) {
+            return util::Error{Untranslated(strprintf("Bad snapshot: unexpected demurrage pool output %s created at height %d", outpoint.ToString(), height))};
+        }
+        *slot = outpoint;
+    }
+    // The carries of the blocks below the base are spent, and so unknown. They
+    // are needed only to connect the block after each of them, which
+    // background validation does after it has connected the block itself and
+    // recorded its pool outputs in full.
+    for (const auto& [height, outputs] : records) {
+        RecordDemurragePoolOutputs(*Assert(base.GetAncestor(height)), outputs);
+    }
+    LogInfo("[snapshot] recorded the demurrage pool outputs of %d blocks (%d outputs)", records.size(), pool_coins.size());
+    return {};
 }
 
 void ChainstateManager::RecordDemurragePoolOutputs(const CBlockIndex& index, const demurrage::BlockPoolOutputs& outputs)

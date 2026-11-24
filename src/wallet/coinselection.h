@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
@@ -72,6 +73,12 @@ public:
     /** The fee necessary to bump this UTXO's ancestor transactions to the target feerate */
     CAmount ancestor_bump_fees{0};
 
+    /** BIP 462b: the height of the block that confirmed this output, or demurrage::UNCONFIRMED_HEIGHT. */
+    int created_height{demurrage::UNCONFIRMED_HEIGHT};
+
+    /** BIP 462b: the demurrage charge that the wallet pays to spend this output. */
+    CAmount demurrage_charge{0};
+
     COutput(const COutPoint& outpoint, const CTxOut& txout, int depth, int input_bytes, bool solvable, bool safe, int64_t time, bool from_me, const std::optional<CFeeRate> feerate = std::nullopt)
         : outpoint{outpoint},
           txout{txout},
@@ -110,6 +117,21 @@ public:
         assert(fee);
         *fee += bump_fee;
         // Note: assert(effective_value - bump_fee == nValue - fee.value());
+        effective_value = txout.nValue - fee.value();
+    }
+
+    /**
+     * BIP 462b: a transaction that spends this output owes its charge on top of
+     * the fee for its size. The charge is owed whenever the output is spent,
+     * and only grows, so OutputGroup::Insert also counts it towards the
+     * long-term fee: spending the output now wastes nothing.
+     */
+    void ApplyDemurrageCharge(CAmount charge)
+    {
+        assert(charge >= 0);
+        assert(fee);
+        *fee += charge - demurrage_charge;
+        demurrage_charge = charge;
         effective_value = txout.nValue - fee.value();
     }
 
@@ -370,6 +392,9 @@ public:
     [[nodiscard]] CAmount GetSelectedEffectiveValue() const;
 
     [[nodiscard]] CAmount GetTotalBumpFees() const;
+
+    /** BIP 462b: the sum of the demurrage charges of the selected inputs. */
+    [[nodiscard]] CAmount GetTotalDemurrageCharges() const;
 
     void Clear();
 

@@ -198,6 +198,18 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         }
     }
 
+    // BIP 462b: once the height at which charges begin is known, record the
+    // height of the block that confirmed the output that each input spends.
+    if (WITH_LOCK(::cs_main, return node.chainman->DemurrageKnownChargeHeight(node.chainman->ActiveTip()).has_value())) {
+        std::map<COutPoint, Coin> spent_coins;
+        for (const PSBTInput& input : psbtx.inputs) spent_coins[input.GetOutPoint()];
+        FindCoins(node, spent_coins);
+        for (PSBTInput& input : psbtx.inputs) {
+            const Coin& coin{spent_coins.at(input.GetOutPoint())};
+            if (!coin.IsSpent() && coin.nHeight != MEMPOOL_HEIGHT) input.m_confirmation_height = coin.nHeight;
+        }
+    }
+
     std::optional<PrecomputedTransactionData> txdata_res = PrecomputePSBTData(psbtx);
     if (!txdata_res) {
         throw JSONRPCPSBTError(common::PSBTError::INVALID_TX);
@@ -929,6 +941,7 @@ const RPCResult& DecodePSBTInputs()
                 }},
                 {RPCResult::Type::STR_HEX, "taproot_internal_key", /*optional=*/ true, "The hex-encoded Taproot x-only internal key"},
                 {RPCResult::Type::STR_HEX, "taproot_merkle_root", /*optional=*/ true, "The hex-encoded Taproot merkle root"},
+                {RPCResult::Type::NUM, "confirmation_height", /*optional=*/ true, "BIP 462b: the height of the block that confirmed the output that the input spends"},
                 {RPCResult::Type::ARR, "musig2_participant_pubkeys", /*optional=*/true, "",
                 {
                     {RPCResult::Type::OBJ, "", "",
@@ -1404,6 +1417,11 @@ static RPCMethod decodepsbt()
         // Write taproot merkle root
         if (!input.m_tap_merkle_root.IsNull()) {
             in.pushKV("taproot_merkle_root", HexStr(input.m_tap_merkle_root));
+        }
+
+        // BIP 462b confirmation height
+        if (input.m_confirmation_height) {
+            in.pushKV("confirmation_height", *input.m_confirmation_height);
         }
 
         // Write MuSig2 fields
@@ -1994,6 +2012,9 @@ static RPCMethod analyzepsbt()
                     {RPCResult::Type::NUM, "estimated_vsize", /*optional=*/true, "Estimated vsize of the final signed transaction"},
                     {RPCResult::Type::STR_AMOUNT, "estimated_feerate", /*optional=*/true, "Estimated feerate of the final signed transaction in " + CURRENCY_UNIT + "/kvB. Shown only if all UTXO slots in the PSBT have been filled"},
                     {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The transaction fee paid. Shown only if all UTXO slots in the PSBT have been filled"},
+                    {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b demurrage charge that the inputs would owe in the next block, given the confirmation height that the PSBT states for each. An input with no confirmation height is taken to spend an unconfirmed output, which owes nothing. Shown with the fee, once the height at which charges begin is known"},
+                    {RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b net fee: the fee less that charge"},
+                    {RPCResult::Type::STR_AMOUNT, "charge_bound", /*optional=*/true, "BIP 462b: the most that the inputs can owe in the next block, whatever their confirmation heights. A signer that cannot check the heights should treat any fee above this as net fee"},
                     {RPCResult::Type::STR, "next", "Role of the next person that this psbt needs to go to"},
                     {RPCResult::Type::STR, "error", /*optional=*/true, "Error message (if there is one)"},
                 }
@@ -2057,6 +2078,25 @@ static RPCMethod analyzepsbt()
     }
     if (psbta.fee != std::nullopt) {
         result.pushKV("fee", ValueFromAmount(*psbta.fee));
+        // BIP 462b: the confirmation heights are claims by whoever built the
+        // PSBT. The bound does not depend on them.
+        ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+        LOCK(::cs_main);
+        if (chainman.DemurrageChargeInNextBlock(0, 0)) {
+            CAmount charge{0};
+            CAmount charge_bound{0};
+            for (unsigned int i{0}; i < psbtx.inputs.size(); ++i) {
+                CTxOut utxo;
+                if (!psbtx.inputs[i].GetUTXO(utxo)) continue;
+                const auto& height{psbtx.inputs[i].m_confirmation_height};
+                const int created_height{height && *height <= static_cast<uint32_t>(std::numeric_limits<int>::max()) ? static_cast<int>(*height) : demurrage::UNCONFIRMED_HEIGHT};
+                charge += *chainman.DemurrageChargeInNextBlock(utxo.nValue, created_height);
+                charge_bound += *chainman.DemurrageChargeInNextBlock(utxo.nValue, 0);
+            }
+            result.pushKV("charge", ValueFromAmount(charge));
+            result.pushKV("net_fee", ValueFromAmount(*psbta.fee - charge));
+            result.pushKV("charge_bound", ValueFromAmount(charge_bound));
+        }
     }
     result.pushKV("next", PSBTRoleName(psbta.next));
     if (!psbta.error.empty()) {

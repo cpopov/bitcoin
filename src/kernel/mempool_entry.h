@@ -142,6 +142,8 @@ public:
 
     /** BIP 462b policy: the policy charge that GetModifiedFee() excludes. */
     CAmount GetDemurrageCharge() const { return m_demurrage_charge.charge; }
+    /** BIP 462b policy: the policy charge when the transaction was accepted. */
+    CAmount GetDemurrageChargeAtAcceptance() const { return m_demurrage_charge_at_acceptance; }
     /** BIP 462b policy: E_tx, the height the policy charge was evaluated at, or demurrage::NO_EVALUATION_HEIGHT. */
     int GetDemurrageEvaluationHeight() const { return m_demurrage_charge.evaluation_height; }
     const std::vector<demurrage::PolicyInput>& GetDemurrageInputs() const { return m_demurrage_inputs; }
@@ -212,18 +214,25 @@ struct TransactionInfo {
     const int64_t m_virtual_transaction_size;
     /* The block height the transaction entered the mempool */
     const unsigned int txHeight;
+    /** BIP 462b: the policy charge when the transaction entered the mempool. */
+    const CAmount m_demurrage_charge;
 
-    TransactionInfo(const CTransactionRef& tx, const CAmount& fee, const int64_t vsize, const unsigned int height)
+    TransactionInfo(const CTransactionRef& tx, const CAmount& fee, const int64_t vsize, const unsigned int height, const CAmount demurrage_charge = 0)
         : m_tx{tx},
           m_fee{fee},
           m_virtual_transaction_size{vsize},
-          txHeight{height} {}
+          txHeight{height},
+          m_demurrage_charge{demurrage_charge} {}
+
+    /** BIP 462b: the fee less the policy charge when the transaction entered the
+     *  mempool, and not less than zero. This is the fee that fee estimation tracks. */
+    CAmount NetFeeAtAcceptance() const { return std::max<CAmount>(0, m_fee - m_demurrage_charge); }
 };
 
 struct RemovedMempoolTransactionInfo {
     TransactionInfo info;
     explicit RemovedMempoolTransactionInfo(const CTxMemPoolEntry& entry)
-        : info{entry.GetSharedTx(), entry.GetFee(), entry.GetTxSize(), entry.GetHeight()} {}
+        : info{entry.GetSharedTx(), entry.GetFee(), entry.GetTxSize(), entry.GetHeight(), entry.GetDemurrageChargeAtAcceptance()} {}
 };
 
 struct NewMempoolTransactionInfo {
@@ -247,8 +256,9 @@ struct NewMempoolTransactionInfo {
                                        const int64_t vsize, const unsigned int height,
                                        const bool mempool_limit_bypassed, const bool submitted_in_package,
                                        const bool chainstate_is_current,
-                                       const bool has_no_mempool_parents)
-        : info{tx, fee, vsize, height},
+                                       const bool has_no_mempool_parents,
+                                       const CAmount demurrage_charge = 0)
+        : info{tx, fee, vsize, height, demurrage_charge},
           m_mempool_limit_bypassed{mempool_limit_bypassed},
           m_submitted_in_package{submitted_in_package},
           m_chainstate_is_current{chainstate_is_current},

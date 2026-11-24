@@ -6,6 +6,7 @@
 #define BITCOIN_INTERFACES_CHAIN_H
 
 #include <blockfilter.h>
+#include <consensus/demurrage.h>
 #include <common/settings.h>
 #include <consensus/amount.h>
 #include <kernel/chain.h> // IWYU pragma: export
@@ -248,6 +249,23 @@ public:
     //  The combined bump fee may be used to correct overestimation due to
     //  shared ancestry by multiple UTXOs after coin selection.
     virtual std::optional<CAmount> calculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& target_feerate) = 0;
+
+    //! BIP 462b: the demurrage charge that each of these outputs would owe if
+    //! it were spent blocks_ahead blocks after the next block. An output of an
+    //! unconfirmed transaction is taken to be created in the next block.
+    //! Returns nullopt until the height at which charges begin is known.
+    virtual std::optional<std::vector<CAmount>> demurrageCharges(const std::vector<demurrage::PolicyInput>& outputs, int blocks_ahead) = 0;
+
+    //! BIP 462b: the fee that the mempool compares a replacement of this
+    //! transaction against: the greater of its net fee now and its net fee
+    //! when it was accepted, with any prioritisation. Returns nullopt if the
+    //! transaction is not in the mempool.
+    virtual std::optional<CAmount> mempoolReplacementFee(const Txid& txid) = 0;
+
+    //! BIP 462b: the policy charge that the mempool would now give a
+    //! transaction that spends these outputs. Returns nullopt until the height
+    //! at which charges begin is known.
+    virtual std::optional<CAmount> demurragePolicyCharge(const std::vector<demurrage::PolicyInput>& inputs) = 0;
 
     //! Get the node's package limits.
     //! Currently only returns the ancestor and descendant count limits, but could be enhanced to

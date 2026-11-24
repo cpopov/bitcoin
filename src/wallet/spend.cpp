@@ -260,6 +260,45 @@ static OutputType GetOutputType(TxoutType type, bool is_from_p2sh)
     }
 }
 
+int DemurrageCreatedHeight(const CWalletTx& wtx)
+{
+    const auto* confirmed{wtx.state<TxStateConfirmed>()};
+    return confirmed ? confirmed->confirmed_block_height : demurrage::UNCONFIRMED_HEIGHT;
+}
+
+std::optional<std::vector<demurrage::PolicyInput>> GetDemurrageInputs(const CWallet& wallet, const CTransaction& tx)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    std::vector<demurrage::PolicyInput> inputs;
+    inputs.reserve(tx.vin.size());
+    for (const CTxIn& txin : tx.vin) {
+        const CWalletTx* prev{wallet.GetWalletTx(txin.prevout.hash)};
+        if (!prev || txin.prevout.n >= prev->GetTx()->vout.size()) return std::nullopt;
+        inputs.push_back({.value = prev->GetTx()->vout[txin.prevout.n].nValue, .created_height = DemurrageCreatedHeight(*prev)});
+    }
+    return inputs;
+}
+
+CAmount GetTxDemurrageCharge(const CWallet& wallet, const CTransaction& tx)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const auto inputs{GetDemurrageInputs(wallet, tx)};
+    if (!inputs) return 0;
+    return wallet.chain().demurragePolicyCharge(*inputs).value_or(0);
+}
+
+void ApplyDemurrageCharges(const CWallet& wallet, std::vector<COutput*>& outputs)
+{
+    std::vector<demurrage::PolicyInput> inputs;
+    inputs.reserve(outputs.size());
+    for (const COutput* output : outputs) inputs.push_back({.value = output->txout.nValue, .created_height = output->created_height});
+    const auto charges{wallet.chain().demurrageCharges(inputs, WALLET_CHARGE_MARGIN)};
+    if (!charges) return;
+    for (size_t i{0}; i < outputs.size(); ++i) {
+        if (outputs[i]->HasEffectiveValue()) outputs[i]->ApplyDemurrageCharge(charges->at(i));
+    }
+}
+
 // Fetch and validate the coin control selected inputs.
 // Coins could be internal (from the wallet) or external.
 util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoinControl& coin_control,
@@ -268,14 +307,22 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
     CoinsResult result;
     const bool can_grind_r = wallet.CanGrindR();
     std::map<COutPoint, CAmount> map_of_bump_fees = wallet.chain().calculateIndividualBumpFees(coin_control.ListSelected(), coin_selection_params.m_effective_feerate);
+    // BIP 462b: the heights of the blocks that confirmed the external inputs.
+    std::map<COutPoint, Coin> external_coins;
+    for (const COutPoint& outpoint : coin_control.ListSelected()) {
+        if (!wallet.GetTXO(outpoint)) external_coins[outpoint];
+    }
+    if (!external_coins.empty()) wallet.chain().findCoins(external_coins);
     for (const COutPoint& outpoint : coin_control.ListSelected()) {
         int64_t input_bytes = coin_control.GetInputWeight(outpoint).value_or(-1);
         if (input_bytes != -1) {
             input_bytes = GetVirtualTransactionSize(input_bytes, 0, 0);
         }
         CTxOut txout;
+        int created_height{demurrage::UNCONFIRMED_HEIGHT};
         if (auto txo = wallet.GetTXO(outpoint)) {
             txout = txo->GetTxOut();
+            created_height = DemurrageCreatedHeight(txo->GetWalletTx());
             if (input_bytes == -1) {
                 input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
             }
@@ -295,6 +342,9 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
             }
 
             txout = *out;
+            if (const Coin& coin{external_coins.at(outpoint)}; !coin.IsSpent() && coin.nHeight != MEMPOOL_HEIGHT) {
+                created_height = coin.nHeight;
+            }
         }
 
         if (input_bytes == -1) {
@@ -308,8 +358,14 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
         /* Set some defaults for depth, solvable, safe, time, and from_me as these don't matter for preset inputs since no selection is being done. */
         COutput output(outpoint, txout, /*depth=*/0, input_bytes, /*solvable=*/true, /*safe=*/true, /*time=*/0, /*from_me=*/false, coin_selection_params.m_effective_feerate);
         output.ApplyBumpFee(map_of_bump_fees.at(output.outpoint));
+        output.created_height = created_height;
         result.Add(OutputType::UNKNOWN, output);
     }
+    std::vector<COutput*> outputs;
+    for (auto& [_, coins] : result.coins) {
+        for (COutput& output : coins) outputs.push_back(&output);
+    }
+    ApplyDemurrageCharges(wallet, outputs);
     return result;
 }
 
@@ -468,6 +524,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
         auto available_output_type = GetOutputType(type, is_from_p2sh);
         auto available_output = COutput(outpoint, output, nDepth, input_bytes, solvable, tx_safe, wtx.GetTxTime(), tx_from_me, feerate);
+        available_output.created_height = DemurrageCreatedHeight(wtx);
         if (wtx.GetTx()->version == TRUC_VERSION && nDepth == 0 && params.check_version_trucness) {
             unconfirmed_truc_coins.emplace_back(available_output_type, available_output);
             auto [it, _] = truc_txid_by_value.try_emplace(wtx.GetTx()->GetHash(), 0);
@@ -511,11 +568,14 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     if (feerate.has_value()) {
         std::map<COutPoint, CAmount> map_of_bump_fees = wallet.chain().calculateIndividualBumpFees(outpoints, feerate.value());
 
+        std::vector<COutput*> all_outputs;
         for (auto& [_, outputs] : result.coins) {
             for (auto& output : outputs) {
                 output.ApplyBumpFee(map_of_bump_fees.at(output.outpoint));
+                all_outputs.push_back(&output);
             }
         }
+        ApplyDemurrageCharges(wallet, all_outputs);
     }
 
     return result;
@@ -1193,7 +1253,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.min_viable_change = std::max(change_spend_fee + 1, dust);
 
     // Include the fees for things that aren't inputs, excluding the change output
-    const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.m_subtract_fee_outputs ? 0 : coin_selection_params.tx_noinputs_size);
+    CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.m_subtract_fee_outputs ? 0 : coin_selection_params.tx_noinputs_size);
+    // BIP 462b: each input's effective value is net of its own demurrage
+    // charge. The mempool's policy charge for the whole transaction can exceed
+    // the sum of those by up to CHARGE_TOLERANCE, so the selection allows for
+    // that once any output can owe a charge.
+    const bool demurrage_charges_apply{wallet.chain().demurrageCharges({{.value = MAX_MONEY, .created_height = 0}}, demurrage::CHARGE_MARGIN).value_or(std::vector<CAmount>{0}).at(0) > 0};
+    if (demurrage_charges_apply && !coin_selection_params.m_subtract_fee_outputs) not_input_fees += demurrage::CHARGE_TOLERANCE;
     CAmount selection_target = recipients_sum + not_input_fees;
 
     // This can only happen if feerate is 0, and requested destinations are value of 0 (e.g. OP_RETURN)
@@ -1334,7 +1400,16 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     if (nBytes == -1) {
         return util::Error{_("Missing solving data for estimating transaction size")};
     }
-    CAmount fee_needed = coin_selection_params.m_effective_feerate.GetFee(nBytes) + result.GetTotalBumpFees();
+    // BIP 462b: the transaction pays the demurrage charge of its inputs on top
+    // of the fee for its size: the greater of the mempool's policy charge and
+    // the charges that the selection allowed for.
+    CAmount demurrage_charge{result.GetTotalDemurrageCharges()};
+    if (demurrage_charges_apply) {
+        std::vector<demurrage::PolicyInput> policy_inputs;
+        for (const auto& coin : result.GetInputSet()) policy_inputs.push_back({.value = coin->txout.nValue, .created_height = coin->created_height});
+        demurrage_charge = std::max(demurrage_charge, wallet.chain().demurragePolicyCharge(policy_inputs).value_or(0));
+    }
+    CAmount fee_needed = coin_selection_params.m_effective_feerate.GetFee(nBytes) + result.GetTotalBumpFees() + demurrage_charge;
     const CAmount output_value = CalculateOutputValue(txNew);
     Assume(recipients_sum + change_amount == output_value);
     CAmount current_fee = result.GetSelectedValue() - output_value;
@@ -1418,12 +1493,14 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         return util::Error{_("Transaction too large")};
     }
 
-    if (current_fee > wallet.m_max_tx_fee) {
+    // BIP 462b: the limits apply to the net fee. The charge is owed whatever
+    // fee the wallet chooses.
+    if (current_fee - demurrage_charge > wallet.m_max_tx_fee) {
         return util::Error{TransactionErrorString(TransactionError::MAX_FEE_EXCEEDED)};
     }
 
     const int64_t tx_vsize{GetVirtualTransactionSize(*tx)};
-    if (current_fee > wallet.m_max_tx_fee_rate.GetFee(tx_vsize)) {
+    if (current_fee - demurrage_charge > wallet.m_max_tx_fee_rate.GetFee(tx_vsize)) {
         return util::Error{TransactionErrorString(TransactionError::MAX_FEE_RATE_EXCEEDED)};
     }
 

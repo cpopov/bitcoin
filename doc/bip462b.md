@@ -1,11 +1,12 @@
 # BIP 462b reference implementation
 
-This branch implements version 0.4.0 of the draft **BIP 462b, Soft-Fork
+This branch implements version 0.4.1 of the draft **BIP 462b, Soft-Fork
 Demurrage Security Budget** (`bip-0462b.md`), except for the points listed under
-[Differences from draft 0.4.0](#differences-from-draft-040). It was first
+[Differences from draft 0.4.1](#differences-from-draft-041). It was first
 written against version 0.1.0. Versions 0.2.0 and 0.3.0 address the problems it
 found in 0.1.0, listed below. Version 0.4.0 follows a review of 0.3.1 and of
-this branch. No version changes a mainnet consensus rule when both deployments
+this branch. Version 0.4.1 changes no rule: it records that this branch now
+covers the wallet, PSBT, snapshots and the remaining interfaces. No version changes a mainnet consensus rule when both deployments
 activate together.
 
 The demurrage is charged when an output is spent. The block owes the charge, the
@@ -35,6 +36,8 @@ draft stage. On regtest they can be activated in two ways:
 cmake -B build && cmake --build build -j$(nproc)
 build/bin/test_bitcoin --run_test=demurrage_tests
 build/test/functional/feature_demurrage.py
+build/test/functional/feature_demurrage_interfaces.py
+build/test/functional/feature_demurrage_assumeutxo.py
 ```
 
 ## Parameters
@@ -50,6 +53,8 @@ build/test/functional/feature_demurrage.py
 | `CHARGE_TOLERANCE` (policy) | 1,000 satoshis | 1,000 satoshis | `demurrage::CHARGE_TOLERANCE` |
 | Version bit of `demurrage` | 4 | 4 | `kernel/chainparams.cpp` |
 | Version bit of `demurrage_charges` | 3 | 3 | `kernel/chainparams.cpp` |
+| Wallet margin (wallet policy) | 6 blocks | 6 blocks | `wallet::WALLET_CHARGE_MARGIN` |
+| PSBT input type (provisional) | `0x20` | `0x20` | `PSBT_IN_CONFIRMATION_HEIGHT` |
 
 Both bits are below 5, the range in which Bitcoin Core warns about unknown
 deployments.
@@ -89,10 +94,15 @@ target rate are about 1.2 BTC and 175 BTC.
 | Relay and mining policy: fee rules | The ephemeral dust check in `PreChecks` compares the fee, not the net fee |
 | Relay and mining policy: pool outputs | `PreChecks`: `demurrage-pool-output`, `demurrage-pool-spend`. Claim transactions from disconnected blocks fail the first check, so they are not returned to the mempool. |
 | Relay and mining policy: block assembly | `BlockAssembler::CreateNewBlock`, `node::GetDemurrageCharges`, `node::GetBlockDemurrageCharge`; `BlockAssembler::RemoveUnfundedTransaction` leaves out a transaction whose charge the block cannot fund, with its descendants; `node::UpdateDemurrageContribution` for `generateblock`; the contribution is added to `CoinbaseTx::required_outputs` for IPC mining clients |
-| Relay and mining policy: compact blocks | The `CBlockHeaderAndShortTxIDs` constructor in `blockencodings.cpp` prefills the transaction at index 1 when it is a claim transaction |
+| Relay and mining policy: compact blocks | The `CBlockHeaderAndShortTxIDs` constructor in `blockencodings.cpp` prefills the transaction at index 1 when it is a claim transaction. On receipt, `PeerManagerImpl::ExtraTxnForCompactBlock` adds the claim transaction from `ChainstateManager::ExpectedDemurrageClaim` to the extra transactions that `PartiallyDownloadedBlock::InitData` matches against the short ids. |
 | Relay and mining policy: checking before relay | `ChainstateManager::HasExpectedDemurrageClaim`, in `ChainstateManager::AcceptBlock` before `NewPoWValidBlock` is signalled |
 | getblocktemplate | `getblocktemplate` in `rpc/mining.cpp`, and `gbt_optional_rule` in `deploymentinfo.cpp`: `true` for `demurrage`, `false` for `demurrage_charges`. `WarnDemurrageRuleRequired` logs the warning. The `charge` and `demurrage_contribution` fields come from `CBlockTemplate::vTxDemurrageCharges` and `CBlockTemplate::demurrage_contribution`. |
-| Fees and interfaces: node interfaces | `getmempoolentry`, `getrawmempool` and the other RPCs that describe mempool entries give `chargeheight`, `fees.charge` and `fees.net` (`rpc/mempool.cpp`). `gettxout` gives `charge` and `effective_value` (`rpc/blockchain.cpp`). Each field appears once `CHARGE_HEIGHT` is known. |
+| Claim transaction: snapshots | `ChainstateManager::PopulateAndValidateSnapshot` collects the `POOL_SCRIPT` coins created at or above `ACTIVATION_HEIGHT`. Once the snapshot's hash is verified, `RecordSnapshotDemurragePoolOutputs` records them as the pool outputs of the base block and of the 99 blocks below it. |
+| Fees and interfaces: node interfaces | `getmempoolentry`, `getrawmempool` and the other RPCs that describe mempool entries give `chargeheight`, `fees.charge` and `fees.net`. `testmempoolaccept` gives the same, and `submitpackage` gives `fees.charge` and `fees.net`, from `MempoolAcceptResult::m_demurrage_charge` (`rpc/mempool.cpp`). `gettxout` and `scantxoutset` give `charge` and `effective_value` (`rpc/blockchain.cpp`), as does `/rest/getutxos` in JSON (`rest.cpp`). `scantxoutset` also gives `total_effective_value`. Each field appears once `CHARGE_HEIGHT` is known. `ChainstateManager::DemurrageChargeInNextBlock` and `DemurragePolicyCharge` compute them. |
+| Fees and interfaces: fee limits | `BroadcastTransaction` in `node/transaction.cpp` (`sendrawtransaction`'s `maxfeerate`, the wallet's `-maxtxfee`) and `testmempoolaccept` compare the net fee. `submitpackage`'s `maxfeerate` already compared modified fees. |
+| Fees and interfaces: fee estimation | `TransactionInfo::NetFeeAtAcceptance()` in `kernel/mempool_entry.h`: the fee less the policy charge at acceptance, and not less than zero. `CBlockPolicyEstimator` uses it when a transaction enters the mempool and when a block confirms it, so each transaction stays in one feerate bucket. |
+| Fees and interfaces: PSBT | `PSBTInput::m_confirmation_height` and `PSBT_IN_CONFIRMATION_HEIGHT` in `psbt.h`. `ProcessPSBT` (`utxoupdatepsbt`, `descriptorprocesspsbt`) fills it from the UTXO set, and `CWallet::FillPSBT` from the wallet's transactions, once `CHARGE_HEIGHT` is known. `decodepsbt` shows `confirmation_height`. `analyzepsbt` gives `charge`, `net_fee` and `charge_bound`. |
+| Fees and interfaces: wallet | `interfaces::Chain::demurrageCharges`, `demurragePolicyCharge` and `mempoolReplacementFee`. `COutput::ApplyDemurrageCharge` and `wallet::ApplyDemurrageCharges` in coin selection; `CreateTransactionInternal` adds the charge to the fee it needs; `feebumper.cpp` compares net fees. `listunspent` gives `charge` and `effective_value`, and `getbalances` gives `mine.effective` (`wallet/rpc/coins.cpp`, `wallet/receive.cpp`). |
 | Test vectors | `src/test/demurrage_tests.cpp`, `test/functional/feature_demurrage.py` |
 
 ### Reject reasons
@@ -149,6 +159,43 @@ target rate are about 1.2 BTC and 175 BTC.
 - **Checking before relay.** The check covers blocks whose parent is the tip,
   which are the only ones announced before validation. It passes a block whose
   pool inputs it cannot find.
+- **Building the claim of a compact block.** The claim transaction is offered
+  to the reconstruction as one more candidate, matched by short id like a
+  mempool transaction, so a compact block is handled the same whether or not it
+  has a claim transaction. It is built only for a block whose parent is the
+  tip, because the values of the pool inputs come from the coins tip.
+- **Snapshots.** A snapshot's coins are not indexed by script, so the pool
+  outputs are picked out while the coins are loaded, and recorded once the
+  snapshot's hash has been checked. The carries of the blocks below the base
+  are spent, so their records hold only a contribution. Background validation
+  writes each record in full when it connects the block, before any block
+  needs its carry. Loading fails if the pool outputs are not those that a
+  valid chain leaves unspent: one carry, created by the base block, and at most
+  one contribution from each of the last 100 blocks.
+- **`dumptxoutset rollback`.** Regtest now has snapshot data for two test
+  chains, at heights up to 299 and at 710. With no height given, the RPC rolls
+  back to the latest snapshot height that the chain has reached, where before
+  it took the highest height in the parameters.
+- **Wallet fees.** Each input's charge is added to the fee of spending it, so
+  coin selection compares effective values net of charges. The charge also
+  counts towards the input's long-term fee: it is owed whenever the output is
+  spent, so spending it now wastes nothing. The mempool's policy charge for the
+  whole transaction can exceed the sum of the inputs' charges by up to
+  `CHARGE_TOLERANCE`, so the selection target allows for that, and the final
+  fee uses the exact policy charge.
+- **Wallet margin.** The wallet pays the charge of its inputs six blocks after
+  the next one (`WALLET_CHARGE_MARGIN`), or the policy charge if that is
+  greater. The draft leaves the margin to the wallet. Without one, a
+  transaction that spends a large input falls below its feerate after one
+  block (see observation 1 below).
+- **Fee limits.** `-maxtxfee`, `-maxfeerate` and the RPC `maxfeerate` arguments
+  apply to the net fee. A charge can be many times any sensible fee limit, and
+  it is owed whatever fee the sender chooses.
+- **The PSBT field is written only once `CHARGE_HEIGHT` is known**, so PSBTs
+  are unchanged on a chain where the deployments are not locked in.
+- **Fee estimation.** A transaction is tracked at its net feerate at
+  acceptance, and that does not change while it waits. A net fee below zero is
+  tracked as zero.
 
 ## Defects found in the review of draft 0.3.1
 
@@ -194,6 +241,25 @@ Found while implementing it.
    still announced to high-bandwidth compact block peers before it is rejected.
    The functional test shows both cases, and still has to isolate its
    non-enforcing node for the second.
+
+4. **A wallet's margin raises the cost of replacing its transactions.** The
+   margin is net fee when the transaction is accepted, and the replacement rule
+   compares against the net fee at acceptance. A replacement therefore pays the
+   original's margin as well as its own. With two inputs of 0.01 BTC on
+   regtest the margin is under 2,000 satoshis, and the functional test bumps
+   such a transaction. With a 50 BTC coinbase output it is about 0.07 BTC,
+   which on a transaction of 141 vB is some 50,000 sat/vB. On mainnet at the
+   full target rate the margin of a 1,000 BTC input is about 34,000 satoshis.
+   The draft's Open Questions note this.
+5. **A wallet transaction that outlives its margin waits for a bump.** Once the
+   charge of a large input has grown past the fee, the net fee is negative and
+   block assembly passes the transaction over. In the functional test a
+   transaction that spends a coinbase output is in that state seven blocks
+   after it was sent.
+6. **`estimatesmartfee` can answer from the mempool.** Its mempool-based
+   forecaster reads the mempool's modified fees, which are already net. The
+   functional test therefore checks `estimaterawfee`, which reads only the
+   block-based estimator that this branch changed.
 
 ## Problems found in draft 0.1.0
 
@@ -306,33 +372,27 @@ This follows the draft's `getblocktemplate` section as of version 0.4.0.
   `default_witness_commitment` is still the witness commitment. The contribution
   is not one of the outputs it describes.
 
-## Differences from draft 0.4.0
+## Differences from draft 0.4.1
 
-- **Compact blocks, receiving side.** A node does not build the claim
-  transaction of a compact block that lacks it. It requests it with
-  `getblocktxn`, as for any other missing transaction. Senders prefill it, so
-  this costs a round trip only for blocks relayed by nodes that do not implement
-  the BIP.
-- **assumeutxo.** The draft states how to find the pool inputs in a snapshot.
-  This implementation does not do so. After a snapshot is loaded, the first
-  blocks need the claim of the base block and the contributions of the 100
-  blocks below it, of which there is no record, and `ConnectBlock` stops with a
-  fatal error. A fix is to write the records while loading the snapshot, using
-  the identities in problem 6 below.
-- **PSBT.** There is no per-input confirmation height field.
-- **Wallet.** The wallet does not add the charge to its fee. Once a wallet
-  transaction's policy charge exceeds its fee, the mempool rejects it with
-  `min relay fee not met`. The wallet does not report effective balances.
-- **Fee estimation** still uses fees, not net fees.
-- **Node interfaces.** Only the mempool RPCs and `gettxout` report charges.
-  `scantxoutset`, `testmempoolaccept` and the REST interface do not.
+- **PSBT.** The type of the confirmation height field, `0x20`, is provisional.
+  BIP 174's registry has not assigned one.
+- **Compact blocks.** A node builds the claim transaction only for a compact
+  block whose parent is its tip. For any other it requests the transaction with
+  `getblocktxn`.
+- **Wallet interfaces.** `gettransaction`, `listtransactions` and the graphical
+  interface show a transaction's fee without separating the charge. An
+  external signer is not given the charge bound.
+- **Node interfaces.** `submitpackage` does not report the evaluation height.
+  `getrawtransaction` reports a fee without the charge.
 - **Stratum V2**: left by the draft to a separate specification.
 
-The two deployments, per-transaction evaluation heights, re-evaluation, the
-charge of unconfirmed inputs, charges from the lock-in of both deployments, the
-replacement rule, block assembly, compact block prefilling, the check before
-relay, the `getblocktemplate` support, the fee rule for ephemeral dust and the
-regtest parameters match the draft.
+Everything else in the draft is implemented: the consensus rules, the two
+deployments, per-transaction evaluation heights, re-evaluation, the charge of
+unconfirmed inputs, charges from the lock-in of both deployments, the
+replacement rule, block assembly, compact block prefilling and reconstruction,
+the check before relay, the pool outputs of snapshots, `getblocktemplate`, the
+fee rule for ephemeral dust, the node interfaces, the PSBT field, the wallet,
+fee estimation and the regtest parameters.
 
 ## Tests
 
@@ -351,6 +411,9 @@ regtest parameters match the draft.
     zero-rate case, and 200 random sets of regtest inputs against a linear
     search;
   - the serialisation of a block's pool output record;
+  - the PSBT confirmation height field in both PSBT versions: its bytes, a
+    round trip, and merging;
+  - the net fee that fee estimation tracks, including a charge above the fee;
   - the regtest schedule;
   - the height from which `getblocktemplate` requires the rule, for several
     values of `CHARGE_HEIGHT`.
@@ -412,5 +475,37 @@ regtest parameters match the draft.
     created in pruned blocks;
   - a block that node1 accepts and node0 rejects.
 
+- `test/functional/feature_demurrage_interfaces.py`, on one node with a
+  wallet:
+  - `testmempoolaccept`, `submitpackage`, `scantxoutset` and `/rest/getutxos`
+    against `getmempoolentry` and `gettxout`;
+  - a transaction whose fee is far above `maxfeerate` and whose net fee is
+    not is accepted, and one whose net fee is above it is refused;
+  - `listunspent` and `getbalances`: the effective balance is the balance less
+    the charges of its outputs, and falls with each block;
+  - `sendtoaddress` from coinbase outputs, with the charge on top of the
+    feerate and, with `subtractfeefromamount`, taken from the amount. After six
+    empty blocks the net fee is what the feerate asks for, to within the
+    wallet's size estimate;
+  - `bumpfee`, without and with a feerate, on a transaction whose net fee has
+    fallen since it was accepted;
+  - `walletcreatefundedpsbt`, `walletprocesspsbt`, `utxoupdatepsbt`,
+    `decodepsbt` and `analyzepsbt`: confirmation heights, none for an
+    unconfirmed output, the charge, the net fee and the bound;
+  - `estimaterawfee` after 36 transactions that each pay about 18 sat/vB net
+    and a charge of more than a hundred times that;
+  - a compact block with only its coinbase prefilled, sent by a peer: the node
+    builds the claim transaction and connects the block without a
+    `getblocktxn` request.
+- `test/functional/feature_demurrage_assumeutxo.py`. A deterministic chain of
+  830 blocks, in which every block from 576 owes a charge. The regtest
+  assumeutxo data at height 710 is for this chain. A second node loads the
+  snapshot, which holds a carry and 100 contributions. It connects the blocks
+  after the base, restarts, connects blocks up to and beyond the last one that
+  spends a contribution from below the base, completes background validation,
+  and then mines.
+
 Each of the replacement, announcement and pruning cases was also run against a
-build with the corresponding change removed, and failed there.
+build with the corresponding change removed, and failed there. So were compact
+block reconstruction, the snapshot records, net fee estimation, the wallet's
+charge, its margin, the net fee in `bumpfee` and the net fee limit.

@@ -832,7 +832,7 @@ void OutputGroup::Insert(const std::shared_ptr<COutput>& output, size_t ancestor
 
     fee += coin.GetFee();
 
-    coin.long_term_fee = coin.input_bytes < 0 ? 0 : m_long_term_feerate.GetFee(coin.input_bytes);
+    coin.long_term_fee = (coin.input_bytes < 0 ? 0 : m_long_term_feerate.GetFee(coin.input_bytes)) + coin.demurrage_charge;
     long_term_fee += coin.long_term_fee;
 
     effective_value += coin.GetEffectiveValue();
@@ -959,6 +959,11 @@ CAmount SelectionResult::GetSelectedValue() const
 CAmount SelectionResult::GetSelectedEffectiveValue() const
 {
     return std::accumulate(m_selected_inputs.cbegin(), m_selected_inputs.cend(), CAmount{0}, [](CAmount sum, const auto& coin) { return sum + coin->GetEffectiveValue(); }) + bump_fee_group_discount;
+}
+
+CAmount SelectionResult::GetTotalDemurrageCharges() const
+{
+    return std::accumulate(m_selected_inputs.cbegin(), m_selected_inputs.cend(), CAmount{0}, [](CAmount sum, const auto& coin) { return sum + coin->demurrage_charge; });
 }
 
 CAmount SelectionResult::GetTotalBumpFees() const

@@ -348,9 +348,12 @@ static RPCMethod testmempoolaccept()
                                                                 "Use vsize_bip141 to actually get that behavior or switch to the explicit vsize_adjusted for retained behavior."},
                     {RPCResult::Type::NUM, "vsize_bip141", /*optional=*/true, "Virtual transaction size as defined in BIP 141.\n"
                                                                        "This is different from actual serialized size for witness transactions as witness data is discounted (only present when 'allowed' is true)."},
+                    {RPCResult::Type::NUM, "chargeheight", /*optional=*/true, "BIP 462b evaluation height: the block height at which the policy charge was evaluated. Only once the height at which charges begin is known"},
                     {RPCResult::Type::OBJ, "fees", /*optional=*/true, "Transaction fees (only present if 'allowed' is true)",
                     {
                         {RPCResult::Type::STR_AMOUNT, "base", "transaction fee in " + CURRENCY_UNIT},
+                        {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b policy charge: the demurrage charge of the transaction's inputs at chargeheight, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
+                        {RPCResult::Type::STR_AMOUNT, "net", /*optional=*/true, "BIP 462b net fee: the transaction fee less the policy charge, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
                         {RPCResult::Type::STR_AMOUNT, "effective-feerate", /*optional=*/false, "the effective feerate in " + CURRENCY_UNIT + " per KvB. May differ from the base feerate if, for example, there are modified fees from prioritisetransaction or a package feerate was used."},
                         {RPCResult::Type::ARR, "effective-includes", /*optional=*/false, "transactions whose fees and vsizes are included in effective-feerate.",
                             {RPCResult{RPCResult::Type::STR_HEX, "", "transaction wtxid in hex"},
@@ -430,7 +433,10 @@ static RPCMethod testmempoolaccept()
                     // Check that fee does not exceed maximum fee
                     const int64_t virtual_size = tx_result.m_vsize.value();
                     const CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);
-                    if (max_raw_tx_fee && fee > max_raw_tx_fee) {
+                    // BIP 462b: the limit applies to the net fee.
+                    const demurrage::PolicyCharge& charge{tx_result.m_demurrage_charge};
+                    const bool has_charge{charge.evaluation_height != demurrage::NO_EVALUATION_HEIGHT};
+                    if (max_raw_tx_fee && fee - charge.charge > max_raw_tx_fee) {
                         result_inner.pushKV("allowed", false);
                         result_inner.pushKV("reject-reason", "max-fee-exceeded");
                         exit_early = true;
@@ -443,6 +449,11 @@ static RPCMethod testmempoolaccept()
                         result_inner.pushKV("vsize_bip141", GetVirtualTransactionSize(*tx));
                         UniValue fees(UniValue::VOBJ);
                         fees.pushKV("base", ValueFromAmount(fee));
+                        if (has_charge) {
+                            result_inner.pushKV("chargeheight", charge.evaluation_height);
+                            fees.pushKV("charge", ValueFromAmount(charge.charge));
+                            fees.pushKV("net", ValueFromAmount(fee - charge.charge));
+                        }
                         fees.pushKV("effective-feerate", ValueFromAmount(tx_result.m_effective_feerate.value().GetFeePerK()));
                         UniValue effective_includes_res(UniValue::VARR);
                         for (const auto& wtxid : tx_result.m_wtxids_fee_calculations.value()) {
@@ -1414,6 +1425,8 @@ static RPCMethod submitpackage()
                         {RPCResult::Type::NUM, "vsize_bip141", /*optional=*/true, "Virtual transaction size as defined in BIP 141."},
                         {RPCResult::Type::OBJ, "fees", /*optional=*/true, "Transaction fees", {
                             {RPCResult::Type::STR_AMOUNT, "base", "transaction fee in " + CURRENCY_UNIT},
+                            {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b policy charge: the demurrage charge of the transaction's inputs at chargeheight, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
+                            {RPCResult::Type::STR_AMOUNT, "net", /*optional=*/true, "BIP 462b net fee: the transaction fee less the policy charge, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
                             {RPCResult::Type::STR_AMOUNT, "effective-feerate", /*optional=*/true, "if the transaction was not already in the mempool, the effective feerate in " + CURRENCY_UNIT + " per KvB. For example, the package feerate and/or feerate with modified fees from prioritisetransaction."},
                             {RPCResult::Type::ARR, "effective-includes", /*optional=*/true, "if effective-feerate is provided, the wtxids of the transactions whose fees and vsizes are included in effective-feerate.",
                                 {{RPCResult::Type::STR_HEX, "", "transaction wtxid in hex"},
@@ -1559,6 +1572,10 @@ static RPCMethod submitpackage()
                     result_inner.pushKV("vsize_bip141", GetVirtualTransactionSize(*tx));
                     UniValue fees(UniValue::VOBJ);
                     fees.pushKV("base", ValueFromAmount(it->second.m_base_fees.value()));
+                    if (const demurrage::PolicyCharge& charge{tx_result.m_demurrage_charge}; charge.evaluation_height != demurrage::NO_EVALUATION_HEIGHT) {
+                        fees.pushKV("charge", ValueFromAmount(charge.charge));
+                        fees.pushKV("net", ValueFromAmount(it->second.m_base_fees.value() - charge.charge));
+                    }
                     if (tx_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
                         // Effective feerate is not provided for MEMPOOL_ENTRY transactions even
                         // though modified fees is known, because it is unknown whether package

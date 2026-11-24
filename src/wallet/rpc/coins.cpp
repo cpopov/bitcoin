@@ -411,6 +411,7 @@ RPCMethod getbalances()
                 {RPCResult::Type::OBJ, "mine", "balances from outputs that the wallet can sign",
                 {
                     {RPCResult::Type::STR_AMOUNT, "trusted", "trusted balance (outputs created by the wallet or confirmed outputs)"},
+                    {RPCResult::Type::STR_AMOUNT, "effective", /*optional=*/true, "BIP 462b effective balance: the trusted balance less the demurrage charge that each of its outputs would owe if it were spent in the next block. Only once the height at which charges begin is known"},
                     {RPCResult::Type::STR_AMOUNT, "untrusted_pending", "untrusted pending balance (outputs created by others that are in the mempool)"},
                     {RPCResult::Type::STR_AMOUNT, "immature", "balance from immature coinbase outputs"},
                     {RPCResult::Type::STR_AMOUNT, "nonmempool", "sum of coins that are spent by transactions not in the mempool (usually an over-estimate due to not accounting for change or spends that conflict with each other)"},
@@ -434,12 +435,13 @@ RPCMethod getbalances()
 
     LOCK(wallet.cs_wallet);
 
-    const auto bal = GetBalance(wallet, /*min_depth=*/0, /*avoid_reuse=*/true, /*include_nonmempool=*/true);
+    const auto bal = GetBalance(wallet, /*min_depth=*/0, /*avoid_reuse=*/true, /*include_nonmempool=*/true, /*include_effective=*/true);
 
     UniValue balances{UniValue::VOBJ};
     {
         UniValue balances_mine{UniValue::VOBJ};
         balances_mine.pushKV("trusted", ValueFromAmount(bal.m_mine_trusted));
+        if (bal.m_mine_effective) balances_mine.pushKV("effective", ValueFromAmount(*bal.m_mine_effective));
         balances_mine.pushKV("untrusted_pending", ValueFromAmount(bal.m_mine_untrusted_pending));
         balances_mine.pushKV("immature", ValueFromAmount(bal.m_mine_immature));
         balances_mine.pushKV("nonmempool", ValueFromAmount(bal.m_mine_nonmempool));
@@ -522,6 +524,8 @@ RPCMethod listunspent()
                             {RPCResult::Type::ARR, "parent_descs", /*optional=*/false, "List of parent descriptors for the output script of this coin.", {
                                 {RPCResult::Type::STR, "desc", "The descriptor string."},
                             }},
+                            {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b demurrage charge that the output would owe if it were spent in the next block, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
+                            {RPCResult::Type::STR_AMOUNT, "effective_value", /*optional=*/true, "BIP 462b effective value: the amount less that charge, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
                             {RPCResult::Type::BOOL, "safe", "Whether this output is considered safe to spend. Unconfirmed transactions\n"
                                                             "from outside keys and unconfirmed replacement transactions are considered unsafe\n"
                                                             "and are not eligible for spending by fundrawtransaction and sendtoaddress."},
@@ -618,7 +622,15 @@ RPCMethod listunspent()
 
     const bool avoid_reuse = pwallet->IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
 
+    // BIP 462b: each output's demurrage charge in the next block.
+    std::vector<demurrage::PolicyInput> charged_outputs;
+    for (const COutput& out : vecOutputs) charged_outputs.push_back({.value = out.txout.nValue, .created_height = out.created_height});
+    const auto charges{pwallet->chain().demurrageCharges(charged_outputs, /*blocks_ahead=*/0)};
+    size_t output_index{0};
+
     for (const COutput& out : vecOutputs) {
+        const std::optional<CAmount> charge{charges ? std::optional{charges->at(output_index)} : std::nullopt};
+        ++output_index;
         CTxDestination address;
         const CScript& scriptPubKey = out.txout.scriptPubKey;
         bool fValidAddress = ExtractDestination(scriptPubKey, address);
@@ -674,6 +686,10 @@ RPCMethod listunspent()
         entry.pushKV("scriptPubKey", HexStr(scriptPubKey));
         entry.pushKV("amount", ValueFromAmount(out.txout.nValue));
         entry.pushKV("confirmations", out.depth);
+        if (charge) {
+            entry.pushKV("charge", ValueFromAmount(*charge));
+            entry.pushKV("effective_value", ValueFromAmount(out.txout.nValue - *charge));
+        }
         if (!out.depth) {
             size_t ancestor_count, unused_cluster_count, ancestor_size;
             CAmount ancestor_fees;

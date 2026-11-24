@@ -6,8 +6,11 @@
 #include <consensus/consensus.h>
 #include <util/check.h>
 #include <wallet/receive.h>
+#include <wallet/spend.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
+
+#include <numeric>
 
 namespace wallet {
 bool InputIsMine(const CWallet& wallet, const CTxIn& txin)
@@ -242,9 +245,11 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx)
     return CachedTxIsTrusted(wallet, wtx, trusted_parents);
 }
 
-Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse, bool include_nonmempool)
+Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse, bool include_nonmempool, bool include_effective)
 {
     Balance ret;
+    // BIP 462b: the outputs that make up the trusted balance.
+    std::vector<demurrage::PolicyInput> trusted_outputs;
     bool allow_used_addresses = !avoid_reuse || !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
     {
         LOCK(wallet.cs_wallet);
@@ -284,11 +289,19 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse,
                         bucket = &ret.m_mine_used;
                     }
                     *bucket += credit_mine;
+                    if (include_effective && bucket == &ret.m_mine_trusted) {
+                        trusted_outputs.push_back({.value = credit_mine, .created_height = DemurrageCreatedHeight(wtx)});
+                    }
                     if (nonmempool_spent) {
                         ret.m_mine_nonmempool -= credit_mine;
                     }
                 }
             }
+        }
+    }
+    if (include_effective) {
+        if (const auto charges{wallet.chain().demurrageCharges(trusted_outputs, /*blocks_ahead=*/0)}) {
+            ret.m_mine_effective = ret.m_mine_trusted - std::accumulate(charges->begin(), charges->end(), CAmount{0});
         }
     }
     return ret;

@@ -629,8 +629,9 @@ void CBlockPolicyEstimator::processTransaction(const NewMempoolTransactionInfo& 
     }
     trackedTxs++;
 
-    // Feerates are stored and reported as BTC-per-kb:
-    const CFeeRate feeRate(tx.info.m_fee, tx.info.m_virtual_transaction_size);
+    // Feerates are stored and reported as BTC-per-kb. BIP 462b: estimates are
+    // net feerates, to which the caller adds the charge of the inputs it spends.
+    const CFeeRate feeRate(tx.info.NetFeeAtAcceptance(), tx.info.m_virtual_transaction_size);
 
     mapMemPoolTxs[hash].blockHeight = txHeight;
     unsigned int bucketIndex = feeStats->NewTx(txHeight, static_cast<double>(feeRate.GetFeePerK()));
@@ -661,7 +662,7 @@ bool CBlockPolicyEstimator::processBlockTx(unsigned int nBlockHeight, const Remo
     }
 
     // Feerates are stored and reported as BTC-per-kb:
-    CFeeRate feeRate(tx.info.m_fee, tx.info.m_virtual_transaction_size);
+    CFeeRate feeRate(tx.info.NetFeeAtAcceptance(), tx.info.m_virtual_transaction_size);
 
     feeStats->Record(blocksToConfirm, static_cast<double>(feeRate.GetFeePerK()));
     shortStats->Record(blocksToConfirm, static_cast<double>(feeRate.GetFeePerK()));

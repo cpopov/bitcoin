@@ -251,6 +251,13 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
     }
 
     old_fee = input_value - output_value;
+    // BIP 462b: feerates are net of the demurrage charge, and the new
+    // transaction pays its own charge on top of its feerate. The mempool
+    // compares a replacement against the greater of the original's net fee now
+    // and when it was accepted. If the original is no longer in the mempool,
+    // use its net fee now.
+    const CAmount old_net_fee{std::clamp<CAmount>(
+        wallet.chain().mempoolReplacementFee(txid).value_or(old_fee - GetTxDemurrageCharge(wallet, *tx)), 0, old_fee)};
 
     // Fill in recipients (and preserve a single change key if there
     // is one). If outputs vector is non-empty, replace original
@@ -296,13 +303,13 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
         }
         temp_mtx.vout = txouts;
         const int64_t maxTxSize{CalculateMaximumSignedTxSize(CTransaction(temp_mtx), &wallet, &new_coin_control).vsize};
-        Result res = CheckFeeRate(wallet, temp_mtx, *new_coin_control.m_feerate, maxTxSize, old_fee, errors);
+        Result res = CheckFeeRate(wallet, temp_mtx, *new_coin_control.m_feerate, maxTxSize, old_net_fee, errors);
         if (res != Result::OK) {
             return res;
         }
     } else {
         // The user did not provide a feeRate argument
-        new_coin_control.m_feerate = EstimateFeeRate(wallet, wtx, old_fee, new_coin_control);
+        new_coin_control.m_feerate = EstimateFeeRate(wallet, wtx, old_net_fee, new_coin_control);
     }
 
     // Fill in required inputs we are double-spending(all of them)

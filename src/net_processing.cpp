@@ -1083,6 +1083,14 @@ private:
      *  The last -blockreconstructionextratxn/DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN of
      *  these are kept in a ring buffer */
     std::vector<std::pair<Wtxid, CTransactionRef>> vExtraTxnForCompact GUARDED_BY(g_msgproc_mutex);
+    /**
+     * BIP 462b: the transactions to try when reconstructing the compact block
+     * at pindex, besides those of the mempool. A claim transaction is never in
+     * a mempool, but the chain determines it. If the block extends the tip and
+     * needs one, it is built and added to vExtraTxnForCompact in with_claim.
+     */
+    const std::vector<std::pair<Wtxid, CTransactionRef>>& ExtraTxnForCompactBlock(const CBlockIndex& pindex, std::vector<std::pair<Wtxid, CTransactionRef>>& with_claim)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
     /** Offset into vExtraTxnForCompact to insert the next tx */
     size_t vExtraTxnForCompactIt GUARDED_BY(g_msgproc_mutex) = 0;
 
@@ -1998,6 +2006,17 @@ std::vector<CTransactionRef> PeerManagerImpl::AbortPrivateBroadcast(const uint25
     m_connman.m_private_broadcast.NumToOpenSub(connections_cancelled);
 
     return removed_txs;
+}
+
+const std::vector<std::pair<Wtxid, CTransactionRef>>& PeerManagerImpl::ExtraTxnForCompactBlock(const CBlockIndex& pindex, std::vector<std::pair<Wtxid, CTransactionRef>>& with_claim)
+{
+    if (!pindex.pprev) return vExtraTxnForCompact;
+    const auto claim{m_chainman.ExpectedDemurrageClaim(*pindex.pprev)};
+    if (!claim || !*claim) return vExtraTxnForCompact;
+    with_claim.reserve(vExtraTxnForCompact.size() + 1);
+    with_claim = vExtraTxnForCompact;
+    with_claim.emplace_back((*claim)->GetWitnessHash(), *claim);
+    return with_claim;
 }
 
 void PeerManagerImpl::AddToCompactExtraTransactions(const CTransactionRef& tx)
@@ -4904,6 +4923,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
+        // BIP 462b: holds the extra transactions and the claim transaction, if the block needs one.
+        std::vector<std::pair<Wtxid, CTransactionRef>> extra_txn_with_claim;
+
         // We want to be a bit conservative just to be extra careful about DoS
         // possibilities in compact block processing...
         if (pindex->nHeight <= m_chainman.ActiveChain().Height() + 2) {
@@ -4921,7 +4943,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 }
 
                 PartiallyDownloadedBlock& partialBlock = *(*queuedBlockIt)->partialBlock;
-                ReadStatus status = partialBlock.InitData(cmpctblock, vExtraTxnForCompact);
+                ReadStatus status = partialBlock.InitData(cmpctblock, ExtraTxnForCompactBlock(*pindex, extra_txn_with_claim));
                 if (status == READ_STATUS_INVALID) {
                     RemoveBlockRequest(pindex->GetBlockHash(), pfrom.GetId()); // Reset in-flight state in case Misbehaving does not result in a disconnect
                     Misbehaving(peer, "invalid compact block");
@@ -4972,7 +4994,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 // Optimistically try to reconstruct anyway since we might be
                 // able to without any round trips.
                 PartiallyDownloadedBlock tempBlock(&m_mempool);
-                ReadStatus status = tempBlock.InitData(cmpctblock, vExtraTxnForCompact);
+                ReadStatus status = tempBlock.InitData(cmpctblock, ExtraTxnForCompactBlock(*pindex, extra_txn_with_claim));
                 // Malformed compact blocks are peer misbehavior; reconstruction failures are not.
                 if (status != READ_STATUS_OK) {
                     if (status == READ_STATUS_INVALID) Misbehaving(peer, "invalid compact block");

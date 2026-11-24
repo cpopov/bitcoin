@@ -49,8 +49,9 @@ struct Balance {
     CAmount m_mine_immature{0};          //!< Immature coinbases in the main chain
     CAmount m_mine_used{0};              //!< Trusted/untrusted/immature funds in utxos that have already been spent from (only populated if AVOID REUSE wallet flag is set)
     CAmount m_mine_nonmempool{0};        //!< Coins spent by wallet txs that are not in the mempool
+    std::optional<CAmount> m_mine_effective; //!< BIP 462b: the trusted balance less the demurrage charge that each of its outputs would owe in the next block. Only if requested, and once the height at which charges begin is known
 };
-Balance GetBalance(const CWallet& wallet, int min_depth = 0, bool avoid_reuse = true, bool include_nonmempool = false);
+Balance GetBalance(const CWallet& wallet, int min_depth = 0, bool avoid_reuse = true, bool include_nonmempool = false, bool include_effective = false);
 
 std::map<CTxDestination, CAmount> GetAddressBalances(const CWallet& wallet);
 std::set<std::set<CTxDestination>> GetAddressGroupings(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

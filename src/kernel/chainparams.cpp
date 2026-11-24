@@ -763,6 +763,15 @@ public:
                 .m_chain_tx_count = 334,
                 .blockhash = uint256{"0c552ced4721c249a389eb9b08cb8da261cd46f0e7b5f9d064d48f3113406853"},
             },
+            {
+                // For use by test/functional/feature_demurrage_assumeutxo.py, whose
+                // chain enforces BIP 462b from height 288 and starts the index at 432
+                // (-testactivationheight=demurrage@288, demurrage_charges@432).
+                .height = 710,
+                .hash_serialized = AssumeutxoHash{uint256{"95b09e6600281646b2422a0e124b97fa3e834ec8a842824ab87192c1c6a52de8"}},
+                .m_chain_tx_count = 881,
+                .blockhash = uint256{"111b72d10a0d42d5557452bcbefe92c12e7d311bcb6837967984ea14f7f645e1"},
+            },
         };
 
         chainTxData = ChainTxData{

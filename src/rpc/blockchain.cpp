@@ -2410,9 +2410,12 @@ static RPCMethod scantxoutset()
                         {RPCResult::Type::NUM, "height", "Height of the unspent transaction output"},
                         {RPCResult::Type::STR_HEX, "blockhash", "Blockhash of the unspent transaction output"},
                         {RPCResult::Type::NUM, "confirmations", "Number of confirmations of the unspent transaction output when the scan was done"},
+                        {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b demurrage charge that the output would owe if it were spent in the block after the scan, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
+                        {RPCResult::Type::STR_AMOUNT, "effective_value", /*optional=*/true, "BIP 462b effective value: the amount less that charge, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
                     }},
                 }},
                 {RPCResult::Type::STR_AMOUNT, "total_amount", "The total amount of all found unspent outputs in " + CURRENCY_UNIT},
+                {RPCResult::Type::STR_AMOUNT, "total_effective_value", /*optional=*/true, "BIP 462b: the total effective value of all found unspent outputs in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
             }},
             scan_result_abort,
             scan_result_status_some,
@@ -2496,6 +2499,21 @@ static RPCMethod scantxoutset()
         result.pushKV("height", tip->nHeight);
         result.pushKV("bestblock", tip->GetBlockHash().GetHex());
 
+        // BIP 462b: each output's charge in the block after the scanned tip.
+        std::optional<std::vector<CAmount>> charges;
+        {
+            ChainstateManager& chainman = EnsureChainman(node);
+            LOCK(cs_main);
+            if (const auto charge_height{chainman.DemurrageKnownChargeHeight(tip)}) {
+                charges.emplace();
+                for (const auto& [outpoint, coin] : coins) {
+                    charges->push_back(chainman.DemurrageSchedule(*charge_height).ChargeFor(coin.out.nValue, coin.nHeight, tip->nHeight + 1));
+                }
+            }
+        }
+        CAmount total_charge{0};
+        size_t coin_index{0};
+
         for (const auto& it : coins) {
             const COutPoint& outpoint = it.first;
             const Coin& coin = it.second;
@@ -2514,11 +2532,18 @@ static RPCMethod scantxoutset()
             unspent.pushKV("height", coin.nHeight);
             unspent.pushKV("blockhash", coinb_block.GetBlockHash().GetHex());
             unspent.pushKV("confirmations", tip->nHeight - coin.nHeight + 1);
+            if (charges) {
+                const CAmount charge{charges->at(coin_index++)};
+                total_charge += charge;
+                unspent.pushKV("charge", ValueFromAmount(charge));
+                unspent.pushKV("effective_value", ValueFromAmount(txo.nValue - charge));
+            }
 
             unspents.push_back(std::move(unspent));
         }
         result.pushKV("unspents", std::move(unspents));
         result.pushKV("total_amount", ValueFromAmount(total_in));
+        if (charges) result.pushKV("total_effective_value", ValueFromAmount(total_in - total_charge));
     } else {
         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid action '%s'", action));
     }
@@ -3159,8 +3184,18 @@ static RPCMethod dumptxoutset()
     } else if (snapshot_type == "rollback") {
         auto snapshot_heights = node.chainman->GetParams().GetAvailableSnapshotHeights();
         CHECK_NONFATAL(snapshot_heights.size() > 0);
-        auto max_height = std::max_element(snapshot_heights.begin(), snapshot_heights.end());
-        target_index = ParseHashOrHeight(*max_height, *node.chainman);
+        // The latest snapshot height that the chain has reached. Regtest has
+        // snapshot data for more than one test chain, at different heights.
+        // If it has reached none, the highest one gives the error.
+        int target_height{*std::max_element(snapshot_heights.begin(), snapshot_heights.end())};
+        if (target_height > tip->nHeight) {
+            int reached{-1};
+            for (const int height : snapshot_heights) {
+                if (height <= tip->nHeight) reached = std::max(reached, height);
+            }
+            if (reached >= 0) target_height = reached;
+        }
+        target_index = ParseHashOrHeight(target_height, *node.chainman);
     } else if (snapshot_type == "latest") {
         target_index = tip;
     } else {

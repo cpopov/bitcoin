@@ -717,6 +717,36 @@ public:
         }
         return MiniMiner(*m_node.mempool, outpoints).CalculateTotalBumpFees(target_feerate);
     }
+    std::optional<std::vector<CAmount>> demurrageCharges(const std::vector<demurrage::PolicyInput>& outputs, int blocks_ahead) override
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman().ActiveTip()};
+        const auto charge_height{tip ? chainman().DemurrageKnownChargeHeight(tip) : std::nullopt};
+        if (!charge_height) return std::nullopt;
+        demurrage::IndexSchedule& schedule{chainman().DemurrageSchedule(*charge_height)};
+        const int next_height{tip->nHeight + 1};
+        std::vector<CAmount> charges;
+        charges.reserve(outputs.size());
+        for (const demurrage::PolicyInput& output : outputs) {
+            charges.push_back(schedule.ChargeFor(output.value, std::min(output.created_height, next_height), next_height + std::max(blocks_ahead, 0)));
+        }
+        return charges;
+    }
+    std::optional<CAmount> mempoolReplacementFee(const Txid& txid) override
+    {
+        if (!m_node.mempool) return std::nullopt;
+        LOCK(m_node.mempool->cs);
+        const CTxMemPoolEntry* entry{m_node.mempool->GetEntry(txid)};
+        if (!entry) return std::nullopt;
+        return entry->GetModifiedFeeForReplacement();
+    }
+    std::optional<CAmount> demurragePolicyCharge(const std::vector<demurrage::PolicyInput>& inputs) override
+    {
+        LOCK(::cs_main);
+        const auto charge{chainman().DemurragePolicyCharge(inputs)};
+        if (!charge) return std::nullopt;
+        return charge->charge;
+    }
     void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) override
     {
         const CTxMemPool::Limits default_limits{};

@@ -2012,6 +2012,15 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, co
         *n_signed = 0;
     }
     LOCK(cs_wallet);
+    // BIP 462b: once the height at which charges begin is known, record the
+    // height of the block that confirmed the output that each input spends.
+    if (chain().demurrageCharges({}, /*blocks_ahead=*/0)) {
+        for (PSBTInput& input : psbtx.inputs) {
+            const auto it{mapWallet.find(input.prev_txid)};
+            if (it == mapWallet.end()) continue;
+            if (const auto* confirmed{it->second.state<TxStateConfirmed>()}) input.m_confirmation_height = confirmed->confirmed_block_height;
+        }
+    }
     // Get all of the previous transactions
     for (PSBTInput& input : psbtx.inputs) {
         if (PSBTInputSigned(input)) {

@@ -6,9 +6,11 @@
 #include <consensus/demurrage.h>
 #include <consensus/params.h>
 #include <kernel/chainparams.h>
+#include <kernel/mempool_entry.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
+#include <psbt.h>
 #include <random.h>
 #include <script/interpreter.h>
 #include <script/script.h>
@@ -367,6 +369,53 @@ BOOST_AUTO_TEST_CASE(pool_outputs_serialization)
         stream >> read;
         BOOST_CHECK(read == outputs);
     }
+}
+
+// Fees and interfaces: the per-input confirmation height of a PSBT.
+BOOST_AUTO_TEST_CASE(psbt_confirmation_height)
+{
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{1}), 0});
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{2}), 3});
+    tx.vout.emplace_back(CAmount{50'000}, CScript{} << OP_TRUE);
+
+    for (const uint32_t version : {0u, 2u}) {
+        PartiallySignedTransaction psbt{tx, version};
+        psbt.inputs[0].m_confirmation_height = 1'260'000;
+        // The second input spends an unconfirmed output, so it has no height.
+
+        DataStream stream;
+        stream << psbt;
+        // The field is <keylen 1> <type> <valuelen 4> <height as a 32-bit little-endian integer>.
+        const std::vector<unsigned char> field{0x01, PSBT_IN_CONFIRMATION_HEIGHT, 0x04, 0xe0, 0x39, 0x13, 0x00};
+        const auto bytes{MakeUCharSpan(stream)};
+        BOOST_CHECK(std::search(bytes.begin(), bytes.end(), field.begin(), field.end()) != bytes.end());
+
+        PartiallySignedTransaction decoded{deserialize, stream};
+        BOOST_REQUIRE_EQUAL(decoded.inputs.size(), 2U);
+        BOOST_CHECK(decoded.inputs[0].m_confirmation_height == 1'260'000U);
+        BOOST_CHECK(!decoded.inputs[1].m_confirmation_height);
+
+        // Merging keeps a height that only one of the two PSBTs has.
+        PartiallySignedTransaction other{tx, version};
+        other.inputs[1].m_confirmation_height = 7;
+        BOOST_REQUIRE(decoded.Merge(other));
+        BOOST_CHECK(decoded.inputs[0].m_confirmation_height == 1'260'000U);
+        BOOST_CHECK(decoded.inputs[1].m_confirmation_height == 7U);
+    }
+}
+
+// Fee estimation tracks the net fee: the fee less the policy charge when the
+// transaction entered the mempool.
+BOOST_AUTO_TEST_CASE(net_fee_at_acceptance)
+{
+    const auto tx{MakeTransactionRef(CMutableTransaction{})};
+    BOOST_CHECK_EQUAL(TransactionInfo(tx, 5'000, 100, 10).NetFeeAtAcceptance(), 5'000);
+    BOOST_CHECK_EQUAL(TransactionInfo(tx, 5'000, 100, 10, /*demurrage_charge=*/4'200).NetFeeAtAcceptance(), 800);
+    // A transaction whose descendants pay its charge has no net fee of its own.
+    BOOST_CHECK_EQUAL(TransactionInfo(tx, 5'000, 100, 10, /*demurrage_charge=*/5'001).NetFeeAtAcceptance(), 0);
+    const NewMempoolTransactionInfo added{tx, 5'000, 100, 10, false, false, true, true, /*demurrage_charge=*/4'200};
+    BOOST_CHECK_EQUAL(added.info.NetFeeAtAcceptance(), 800);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

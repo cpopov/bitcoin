@@ -79,9 +79,13 @@ TransactionError BroadcastTransaction(NodeContext& node, const CTransactionRef t
                 const MempoolAcceptResult result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);
                 if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
                     return HandleATMPError(result.m_state, err_string);
-                } else if (check_max_fee && result.m_base_fees.value() > max_tx_fee) {
+                }
+                // BIP 462b: the limits apply to the net fee. The policy charge is
+                // owed whatever fee the sender chooses, and goes to the pool.
+                const CAmount net_fee{result.m_base_fees.value() - result.m_demurrage_charge.charge};
+                if (check_max_fee && net_fee > max_tx_fee) {
                     return TransactionError::MAX_FEE_EXCEEDED;
-                } else if (check_max_feerate && result.m_base_fees.value() > max_tx_fee_rate.GetFee(result.m_vsize.value())) {
+                } else if (check_max_feerate && net_fee > max_tx_fee_rate.GetFee(result.m_vsize.value())) {
                     return TransactionError::MAX_FEE_RATE_EXCEEDED;
                 }
             }

@@ -71,6 +71,9 @@ inline constexpr uint8_t PSBT_IN_TAP_MERKLE_ROOT = 0x18;
 inline constexpr uint8_t PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS = 0x1a;
 inline constexpr uint8_t PSBT_IN_MUSIG2_PUB_NONCE = 0x1b;
 inline constexpr uint8_t PSBT_IN_MUSIG2_PARTIAL_SIG = 0x1c;
+// BIP 462b: the height of the block that confirmed the output that the input
+// spends. The type is provisional: BIP 174's registry has not assigned one.
+inline constexpr uint8_t PSBT_IN_CONFIRMATION_HEIGHT = 0x20;
 inline constexpr uint8_t PSBT_IN_PROPRIETARY = 0xFC;
 
 // Output types
@@ -318,6 +321,10 @@ public:
     // Key is the aggregate pubkey and the script leaf hash, value is a map of participant pubkey to partial_sig
     std::map<std::pair<CPubKey, uint256>, std::map<CPubKey, uint256>> m_musig2_partial_sigs;
 
+    // BIP 462b: the height of the block that confirmed the output that this input
+    // spends. Absent when that output is unconfirmed, or when the height is not known.
+    std::optional<uint32_t> m_confirmation_height;
+
     std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;
     std::set<PSBTProprietary> m_proprietary;
     std::optional<int> sighash_type;
@@ -514,6 +521,12 @@ public:
         if (!final_script_witness.IsNull()) {
             SerializeToVector(s, CompactSizeWriter(PSBT_IN_SCRIPTWITNESS));
             SerializeToVector(s, final_script_witness.stack);
+        }
+
+        // Write the BIP 462b confirmation height
+        if (m_confirmation_height) {
+            SerializeToVector(s, CompactSizeWriter(PSBT_IN_CONFIRMATION_HEIGHT));
+            SerializeToVector(s, *m_confirmation_height);
         }
 
         // Write PSBTv2 fields
@@ -895,6 +908,13 @@ public:
                     UnserializeFromVector(s, partial_sig);
 
                     m_musig2_partial_sigs[std::make_pair(agg_pub, leaf_hash)].emplace(part_pub, partial_sig);
+                    break;
+                }
+                case PSBT_IN_CONFIRMATION_HEIGHT:
+                {
+                    ExpectedKeySize("Input Confirmation Height", key, 1);
+                    m_confirmation_height.emplace();
+                    UnserializeFromVector(s, *m_confirmation_height);
                     break;
                 }
                 case PSBT_IN_PROPRIETARY:

@@ -20,6 +20,39 @@
 #include <vector>
 
 namespace wallet {
+/**
+ * BIP 462b: the wallet pays each input's demurrage charge as if the
+ * transaction were mined this many blocks after the next one. The mempool's
+ * policy charge looks further ahead for inputs of small value, and then the
+ * wallet pays that. For an input of large value the policy charge has no
+ * margin, and a transaction that paid only that would fall below the minimum
+ * relay feerate after one block.
+ */
+inline constexpr int WALLET_CHARGE_MARGIN{6};
+
+/** BIP 462b: the height of the block that confirmed a wallet transaction, or demurrage::UNCONFIRMED_HEIGHT. */
+int DemurrageCreatedHeight(const CWalletTx& wtx);
+
+/**
+ * BIP 462b: the outputs that a transaction spends, as the policy charge sees
+ * them. nullopt unless every input spends an output of a wallet transaction.
+ */
+std::optional<std::vector<demurrage::PolicyInput>> GetDemurrageInputs(const CWallet& wallet, const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/**
+ * BIP 462b: the policy charge that the mempool would now give a transaction.
+ * Zero if the height at which charges begin is not known, or if the wallet
+ * does not know every output that the transaction spends.
+ */
+CAmount GetTxDemurrageCharge(const CWallet& wallet, const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/**
+ * BIP 462b: set the demurrage charge of each output, WALLET_CHARGE_MARGIN
+ * blocks after the next block, as part of the fee to spend it. Does nothing to
+ * outputs without a fee, or until the height at which charges begin is known.
+ */
+void ApplyDemurrageCharges(const CWallet& wallet, std::vector<COutput*>& outputs);
+
 /** Get the marginal bytes if spending the specified output from this transaction.
  * Use CoinControl to determine whether to expect signature grinding when calculating the size of the input spend. */
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* pwallet, const CCoinControl* coin_control);

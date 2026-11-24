@@ -169,6 +169,10 @@ struct MempoolAcceptResult {
     /** The wtxid of the transaction in the mempool which has the same txid but different witness. */
     const std::optional<Wtxid> m_other_wtxid;
 
+    /** BIP 462b: the transaction's policy charge and the height it was evaluated at. Present when
+     * m_base_fees is. The evaluation height is demurrage::NO_EVALUATION_HEIGHT when no charge applies. */
+    const demurrage::PolicyCharge m_demurrage_charge;
+
     static MempoolAcceptResult Failure(TxValidationState state) {
         return MempoolAcceptResult(state);
     }
@@ -183,13 +187,14 @@ struct MempoolAcceptResult {
                                        int64_t vsize,
                                        CAmount fees,
                                        CFeeRate effective_feerate,
-                                       const std::vector<Wtxid>& wtxids_fee_calculations) {
+                                       const std::vector<Wtxid>& wtxids_fee_calculations,
+                                       const demurrage::PolicyCharge& demurrage_charge = {}) {
         return MempoolAcceptResult(std::move(replaced_txns), vsize, fees,
-                                   effective_feerate, wtxids_fee_calculations);
+                                   effective_feerate, wtxids_fee_calculations, demurrage_charge);
     }
 
-    static MempoolAcceptResult MempoolTx(int64_t vsize, CAmount fees) {
-        return MempoolAcceptResult(vsize, fees);
+    static MempoolAcceptResult MempoolTx(int64_t vsize, CAmount fees, const demurrage::PolicyCharge& demurrage_charge = {}) {
+        return MempoolAcceptResult(vsize, fees, demurrage_charge);
     }
 
     static MempoolAcceptResult MempoolTxDifferentWitness(const Wtxid& other_wtxid) {
@@ -209,13 +214,15 @@ private:
                                  int64_t vsize,
                                  CAmount fees,
                                  CFeeRate effective_feerate,
-                                 const std::vector<Wtxid>& wtxids_fee_calculations)
+                                 const std::vector<Wtxid>& wtxids_fee_calculations,
+                                 const demurrage::PolicyCharge& demurrage_charge)
         : m_result_type(ResultType::VALID),
         m_replaced_transactions(std::move(replaced_txns)),
         m_vsize{vsize},
         m_base_fees(fees),
         m_effective_feerate(effective_feerate),
-        m_wtxids_fee_calculations(wtxids_fee_calculations) {}
+        m_wtxids_fee_calculations(wtxids_fee_calculations),
+        m_demurrage_charge{demurrage_charge} {}
 
     /** Constructor for fee-related failure case */
     explicit MempoolAcceptResult(TxValidationState state,
@@ -227,8 +234,8 @@ private:
         m_wtxids_fee_calculations(wtxids_fee_calculations) {}
 
     /** Constructor for already-in-mempool case. It wouldn't replace any transactions. */
-    explicit MempoolAcceptResult(int64_t vsize, CAmount fees)
-        : m_result_type(ResultType::MEMPOOL_ENTRY), m_vsize{vsize}, m_base_fees(fees) {}
+    explicit MempoolAcceptResult(int64_t vsize, CAmount fees, const demurrage::PolicyCharge& demurrage_charge)
+        : m_result_type(ResultType::MEMPOOL_ENTRY), m_vsize{vsize}, m_base_fees(fees), m_demurrage_charge{demurrage_charge} {}
 
     /** Constructor for witness-swapped case. */
     explicit MempoolAcceptResult(const Wtxid& other_wtxid)
@@ -1249,6 +1256,26 @@ public:
     demurrage::IndexSchedule& DemurrageSchedule(int charge_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
+     * BIP 462b: the charge that an output of this value, created at
+     * created_height (or demurrage::UNCONFIRMED_HEIGHT), would owe if the next
+     * block of the active chain spent it. nullopt until CHARGE_HEIGHT is known.
+     */
+    std::optional<CAmount> DemurrageChargeInNextBlock(CAmount value, int created_height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * BIP 462b: the policy charge of a transaction with these inputs, if it
+     * were evaluated now. nullopt until CHARGE_HEIGHT is known.
+     */
+    std::optional<demurrage::PolicyCharge> DemurragePolicyCharge(std::span<const demurrage::PolicyInput> inputs) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * BIP 462b: the claim transaction that a block on top of prev must have at
+     * index 1, or a null reference if it must have none. nullopt if prev is
+     * not the active tip, or if the pool inputs cannot be found.
+     */
+    std::optional<CTransactionRef> ExpectedDemurrageClaim(const CBlockIndex& prev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
      * BIP 462b: whether a block on top of prev has the claim transaction that
      * its pool inputs require at index 1. Blocks are checked with this before
      * they are announced ahead of full validation. Returns true if the check
@@ -1264,6 +1291,15 @@ public:
      */
     std::optional<demurrage::BlockPoolOutputs> GetDemurragePoolOutputs(const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void RecordDemurragePoolOutputs(const CBlockIndex& index, const demurrage::BlockPoolOutputs& outputs) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * BIP 462b: record the pool outputs of the base block of a snapshot and of
+     * the blocks below it whose contributions are unspent, from the pool
+     * outputs found in the snapshot's coins (those created at or above
+     * activation_height). Fails if they are not the outputs that a valid
+     * chain leaves unspent.
+     */
+    util::Result<void> RecordSnapshotDemurragePoolOutputs(const CBlockIndex& base, int activation_height, const std::vector<std::pair<COutPoint, Coin>>& pool_coins) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
      * BIP 462b: the pool inputs of the block after prev, in claim order: the
