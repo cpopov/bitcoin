@@ -6,6 +6,8 @@
 #include <consensus/consensus.h>
 #include <coins.h>
 #include <consensus/demurrage.h>
+#include <script/interpreter.h>
+#include <script/script.h>
 #include <util/check.h>
 
 #include <algorithm>
@@ -249,6 +251,29 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx)
     return CachedTxIsTrusted(wallet, wtx, trusted_parents);
 }
 
+/**
+ * BIP 462: whether an input of @p tx that spends a taproot output by the key
+ * path is signed with SIGHASH_DEMURRAGE. Consensus checks that signature, and
+ * BIP 341 rejects its hash type, so the transaction is invalid on a chain that
+ * does not apply BIP 462. Script-path spends are not considered: which of their
+ * witness elements are signatures depends on the script.
+ */
+static bool HasDemurrageKeyPathSignature(const CTransaction& tx, const std::vector<CScript>& spent_scripts)
+{
+    if (spent_scripts.size() != tx.vin.size()) return false;
+    for (size_t i{0}; i < tx.vin.size(); ++i) {
+        if (!spent_scripts[i].IsPayToTaproot()) continue;
+        const std::vector<std::vector<unsigned char>>& stack{tx.vin[i].scriptWitness.stack};
+        size_t size{stack.size()};
+        // The annex, if any, is the last element.
+        if (size >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) --size;
+        if (size != 1) continue;
+        // A 64-byte signature uses SIGHASH_DEFAULT.
+        if (stack[0].size() == 65 && (stack[0].back() & SIGHASH_DEMURRAGE)) return true;
+    }
+    return false;
+}
+
 std::optional<DemurrageDebit> CachedTxGetDemurrageDebit(const CWallet& wallet, const CWalletTx& wtx)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -267,7 +292,8 @@ std::optional<DemurrageDebit> CachedTxGetDemurrageDebit(const CWallet& wallet, c
         for (size_t i{0}; i < wtx.GetTx()->vin.size(); ++i) {
             if (InputIsMine(wallet, wtx.GetTx()->vin[i])) debit += values->values.at(i);
         }
-        result = DemurrageDebit{.ref_height = values->ref_height, .debit = debit};
+        result = DemurrageDebit{.ref_height = values->ref_height, .debit = debit,
+                                .demurrage_signed = HasDemurrageKeyPathSignature(*wtx.GetTx(), values->script_pubkeys)};
     }
     // The coins a confirmed transaction spends are fixed; cache its valuation
     // for the block it is confirmed in.
@@ -276,6 +302,49 @@ std::optional<DemurrageDebit> CachedTxGetDemurrageDebit(const CWallet& wallet, c
         wtx.m_is_cache_empty = false;
     }
     return result;
+}
+
+bool TxDescendsFromDemurrageSignature(const CWallet& wallet, const CWalletTx& wtx, std::map<Txid, bool>& memo)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (const auto it{memo.find(wtx.GetHash())}; it != memo.end()) return it->second;
+    const int activation_height{wallet.chain().getDemurrageActivationHeight()};
+    // Depth first through the wallet transactions it spends, without recursion,
+    // since a chain of them can be long. A transaction is in the memo, as
+    // whether it has such a signature itself, while its inputs are followed.
+    struct Frame {
+        const CWalletTx* tx;
+        size_t next_input;
+    };
+    std::vector<Frame> stack;
+    const auto visit{[&](const CWalletTx& tx) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet) {
+        const std::optional<DemurrageDebit> debit{CachedTxGetDemurrageDebit(wallet, tx)};
+        memo[tx.GetHash()] = debit && debit->demurrage_signed;
+        // Neither a coinbase nor a transaction confirmed before activation, nor
+        // the transactions they descend from, can have such a signature.
+        const auto* conf{tx.state<TxStateConfirmed>()};
+        const bool before_activation{conf && conf->confirmed_block_height < activation_height};
+        stack.push_back({&tx, tx.IsCoinBase() || before_activation ? tx.GetTx()->vin.size() : 0});
+    }};
+    visit(wtx);
+    while (!stack.empty()) {
+        const CWalletTx& tx{*stack.back().tx};
+        bool& result{memo.at(tx.GetHash())};
+        size_t& next_input{stack.back().next_input};
+        if (result || next_input == tx.GetTx()->vin.size()) {
+            stack.pop_back();
+            if (result && !stack.empty()) memo.at(stack.back().tx->GetHash()) = true;
+            continue;
+        }
+        const CWalletTx* parent{wallet.GetWalletTx(tx.GetTx()->vin[next_input++].prevout.hash)};
+        if (!parent) continue;
+        if (const auto it{memo.find(parent->GetHash())}; it != memo.end()) {
+            result = result || it->second;
+            continue;
+        }
+        visit(*parent);
+    }
+    return memo.at(wtx.GetHash());
 }
 
 /** Longest chain of unconfirmed wallet transactions followed to derive a
@@ -316,12 +385,22 @@ static std::optional<uint32_t> UnbroadcastRefHeight(const CWallet& wallet, const
     return result;
 }
 
+std::optional<uint64_t> GetDemurrageWalletIndex(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    // A wallet without a chain, or that has not processed a block yet, values nothing.
+    if (!wallet.HaveChain() || !wallet.HaveLastBlock()) return std::nullopt;
+    const int height{wallet.GetLastBlockHeight()};
+    if (height + 1 < wallet.chain().getDemurrageActivationHeight()) return std::nullopt;
+    return wallet.chain().getDemurrageIndex(height);
+}
+
 std::optional<DemurrageValuation> GetDemurrageValuation(const CWallet& wallet, const std::vector<COutPoint>& outpoints)
 {
     AssertLockHeld(wallet.cs_wallet);
+    if (!wallet.HaveChain() || !wallet.HaveLastBlock()) return std::nullopt;
     const int height{wallet.GetLastBlockHeight()};
-    if (height + 1 < wallet.chain().getDemurrageActivationHeight()) return std::nullopt;
-    const std::optional<uint64_t> index{wallet.chain().getDemurrageIndex(height)};
+    const std::optional<uint64_t> index{GetDemurrageWalletIndex(wallet)};
     if (!index) return std::nullopt;
     DemurrageValuation valuation{.height = height, .index = *index, .coins = {}};
 
@@ -353,6 +432,33 @@ std::optional<DemurrageValuation> GetDemurrageValuation(const CWallet& wallet, c
     return valuation;
 }
 
+std::optional<DemurrageInputFields> GetDemurrageInputFields(const CWallet& wallet, const std::vector<COutPoint>& outpoints)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (outpoints.empty()) return std::nullopt;
+    const std::optional<DemurrageValuation> valuation{GetDemurrageValuation(wallet, outpoints)};
+    if (!valuation) return std::nullopt;
+    const int activation_height{wallet.chain().getDemurrageActivationHeight()};
+    // The transaction's reference height is the highest among the coins it
+    // spends, and its index, I(ref_height), the lowest of theirs.
+    std::vector<const DemurrageValuation::CoinInfo*> coins;
+    uint32_t ref_height{0};
+    uint64_t tx_index{demurrage::INDEX_ONE};
+    for (const COutPoint& outpoint : outpoints) {
+        const auto it{valuation->coins.find(outpoint)};
+        if (it == valuation->coins.end()) return std::nullopt;
+        coins.push_back(&it->second);
+        ref_height = std::max(ref_height, it->second.ref_height);
+        tx_index = std::min(tx_index, it->second.index_created);
+    }
+    DemurrageInputFields fields{.ref_heights = {}, .values = {}, .committed_ref_height = demurrage::CommittedRefHeight(ref_height, activation_height)};
+    for (const DemurrageValuation::CoinInfo* coin : coins) {
+        fields.ref_heights.push_back(demurrage::CommittedRefHeight(coin->ref_height, activation_height));
+        fields.values.push_back(demurrage::EffectiveValue(coin->nominal, coin->index_created, tx_index));
+    }
+    return fields;
+}
+
 std::optional<CAmount> GetEffectiveOutputValue(const COutPoint& outpoint, const DemurrageValuation& valuation)
 {
     const auto it{valuation.coins.find(outpoint)};
@@ -360,7 +466,9 @@ std::optional<CAmount> GetEffectiveOutputValue(const COutPoint& outpoint, const 
     return demurrage::EffectiveValue(it->second.nominal, it->second.index_created, valuation.index);
 }
 
-bool ConvertOutputsToRefHeight(CMutableTransaction& tx, const DemurrageValuation& valuation, std::optional<unsigned int> change_pos)
+bool ConvertOutputsToRefHeight(CMutableTransaction& tx, const DemurrageValuation& valuation, std::optional<unsigned int> change_pos,
+                               const std::map<unsigned int, DemurrageFixedOutput>& fixed_outputs,
+                               const std::optional<DemurrageFeeFloor>& fee_floor)
 {
     // I(ref_height) is the lowest index among the inputs (the index never rises).
     uint64_t tx_index{demurrage::INDEX_ONE};
@@ -374,8 +482,14 @@ bool ConvertOutputsToRefHeight(CMutableTransaction& tx, const DemurrageValuation
     CAmount value_in{0};
     for (const auto* coin : inputs) value_in += demurrage::EffectiveValue(coin->nominal, coin->index_created, tx_index);
     CAmount value_out{0};
-    for (CTxOut& txout : tx.vout) {
-        const std::optional<CAmount> value{demurrage::ConvertValue(txout.nValue, valuation.index, tx_index)};
+    for (unsigned int pos{0}; pos < tx.vout.size(); ++pos) {
+        CTxOut& txout{tx.vout[pos]};
+        // An output with a fixed nominal amount is re-expressed from its own
+        // index, so that it is unchanged if the reference height is.
+        const auto fixed{fixed_outputs.find(pos)};
+        const std::optional<CAmount> value{fixed == fixed_outputs.end() ?
+                                           demurrage::ConvertValue(txout.nValue, valuation.index, tx_index) :
+                                           demurrage::ConvertValue(fixed->second.nominal, fixed->second.index, tx_index)};
         if (!value || !MoneyRange(*value)) return false;
         txout.nValue = *value;
         value_out += txout.nValue;
@@ -384,8 +498,40 @@ bool ConvertOutputsToRefHeight(CMutableTransaction& tx, const DemurrageValuation
     if (value_out > value_in) {
         if (!change_pos || tx.vout.at(*change_pos).nValue < value_out - value_in) return false;
         tx.vout.at(*change_pos).nValue -= value_out - value_in;
+        value_out = value_in;
+    }
+    // The mempool measures a fee as fee_effective in the next block. Rounding,
+    // and that block's demurrage, can leave it a few satoshis below the fee
+    // that was computed at the wallet's last block.
+    if (fee_floor && change_pos && fee_floor->index > 0 && fee_floor->index <= tx_index) {
+        const CAmount fee{value_in - value_out};
+        std::optional<CAmount> needed{demurrage::ConvertValue(fee_floor->fee, fee_floor->index, tx_index)};
+        if (!needed) return false;
+        while (demurrage::EffectiveValue(*needed, tx_index, fee_floor->index) < fee_floor->fee) ++*needed;
+        CTxOut& change{tx.vout.at(*change_pos)};
+        if (*needed > fee && change.nValue >= *needed - fee) change.nValue -= *needed - fee;
     }
     return true;
+}
+
+CAmount GetEffectiveTxOutValue(const CWallet& wallet, const CWalletTx& wtx, CAmount nominal)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const std::optional<uint64_t> index{GetDemurrageWalletIndex(wallet)};
+    if (!index) return nominal;
+    // The index at which the transaction's amounts are expressed: I(reference height).
+    std::optional<uint64_t> tx_index;
+    const auto* conf{wtx.state<TxStateConfirmed>()};
+    if (conf && conf->confirmed_block_height < wallet.chain().getDemurrageActivationHeight()) {
+        tx_index = demurrage::INDEX_ONE;
+    } else if (wtx.IsCoinBase()) {
+        // A coinbase output's reference height is the height of its block.
+        if (conf) tx_index = wallet.chain().getDemurrageIndex(conf->confirmed_block_height);
+    } else if (const auto debit{CachedTxGetDemurrageDebit(wallet, wtx)}) {
+        tx_index = wallet.chain().getDemurrageIndex(static_cast<int>(debit->ref_height));
+    }
+    if (!tx_index || *index > *tx_index) return nominal;
+    return demurrage::EffectiveValue(nominal, *tx_index, *index);
 }
 
 Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse, bool include_nonmempool)
@@ -454,6 +600,11 @@ std::map<CTxDestination, CAmount> GetAddressBalances(const CWallet& wallet)
 
     {
         LOCK(wallet.cs_wallet);
+        // BIP 462: report effective values at the wallet's last processed block, like GetBalance()
+        std::vector<COutPoint> outpoints;
+        outpoints.reserve(wallet.GetTXOs().size());
+        for (const auto& [outpoint, txo] : wallet.GetTXOs()) outpoints.push_back(outpoint);
+        const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(wallet, outpoints)};
         std::set<Txid> trusted_parents;
         for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
             const CWalletTx& wtx = txo.GetWalletTx();
@@ -469,6 +620,9 @@ std::map<CTxDestination, CAmount> GetAddressBalances(const CWallet& wallet)
             if(!ExtractDestination(txo.GetTxOut().scriptPubKey, addr)) continue;
 
             CAmount n = wallet.IsSpent(outpoint) ? 0 : txo.GetTxOut().nValue;
+            if (n > 0 && demurrage_valuation) {
+                n = GetEffectiveOutputValue(outpoint, *demurrage_valuation).value_or(n);
+            }
             balances[addr] += n;
         }
     }

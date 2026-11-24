@@ -133,7 +133,8 @@ static UniValue ListReceived(const CWallet& wallet, const UniValue& params, cons
                 continue;
 
             tallyitem& item = mapTally[address];
-            item.nAmount += txout.nValue;
+            // BIP 462: outputs are valued at the wallet's last block, like balances.
+            item.nAmount += GetEffectiveTxOutValue(wallet, wtx, txout.nValue);
             item.nConf = std::min(item.nConf, nDepth);
             item.txids.push_back(wtx.GetHash());
         }

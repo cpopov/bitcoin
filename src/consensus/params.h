@@ -113,8 +113,6 @@ struct Params {
     /** BIP 462: first height of the first demurrage rate period
      *  (ACTIVATION_HEIGHT). std::numeric_limits<int>::max() if not scheduled. */
     int DemurrageHeight{std::numeric_limits<int>::max()};
-    /** BIP 462 RATE_PERIOD: number of blocks for which a demurrage rate applies. */
-    int nDemurrageRatePeriod{2016};
     /** BIP 462 TARGET_RATE_PER_BLOCK, as the exact fraction num / den.
      *  0.30% per year over 52,560 blocks per year is 3 / 52,560,000. */
     int64_t nDemurrageTargetRateNum{3};

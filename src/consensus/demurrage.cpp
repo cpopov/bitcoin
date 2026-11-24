@@ -4,9 +4,15 @@
 
 #include <consensus/demurrage.h>
 
+#include <consensus/merkle.h>
 #include <consensus/params.h>
+#include <hash.h>
+#include <primitives/transaction.h>
+#include <script/script.h>
 #include <util/check.h>
 
+#include <algorithm>
+#include <utility>
 
 namespace demurrage {
 namespace {
@@ -27,23 +33,19 @@ bool IsActive(int height, const Consensus::Params& params)
     return height >= params.DemurrageHeight;
 }
 
-bool IsRatePeriodStart(int height, const Consensus::Params& params)
+uint64_t ComputeRate(CAmount utxo_value, CAmount subsidy, uint64_t prev_index, const Consensus::Params& params)
 {
-    return IsActive(height, params) && (height - params.DemurrageHeight) % params.nDemurrageRatePeriod == 0;
-}
-
-uint64_t ComputeRate(CAmount utxo_value, CAmount covered, const Consensus::Params& params)
-{
-    Assert(utxo_value >= 0 && covered >= 0);
-    Assert(params.nDemurrageTargetRateNum >= 0 && params.nDemurrageTargetRateDen > 0 && params.nDemurrageRatePeriod > 0);
-    if (utxo_value == 0) return 0;
-    const arith_uint256 period_value{arith_uint256{static_cast<uint64_t>(utxo_value)} * arith_uint256{static_cast<uint64_t>(params.nDemurrageRatePeriod)}};
-    // target_k = TARGET_RATE_PER_BLOCK * U_k * RATE_PERIOD
-    const arith_uint256 target{(period_value * arith_uint256{static_cast<uint64_t>(params.nDemurrageTargetRateNum)}) / arith_uint256{static_cast<uint64_t>(params.nDemurrageTargetRateDen)}};
-    const arith_uint256 covered256{static_cast<uint64_t>(covered)};
-    if (target <= covered256) return 0;
-    // r_k = shortfall_k / (RATE_PERIOD * U_k)
-    const arith_uint256 rate{((target - covered256) * arith_uint256{INDEX_ONE}) / period_value};
+    Assert(utxo_value >= 0 && subsidy >= 0);
+    Assert(params.nDemurrageTargetRateNum >= 0 && params.nDemurrageTargetRateDen > 0);
+    // Demurrage stops at INDEX_MIN, so that the index never reaches zero.
+    if (utxo_value == 0 || prev_index <= INDEX_MIN) return 0;
+    const arith_uint256 value{static_cast<uint64_t>(utxo_value)};
+    // target(h) = TARGET_RATE_PER_BLOCK * U(h - 1)
+    const arith_uint256 target{(value * arith_uint256{static_cast<uint64_t>(params.nDemurrageTargetRateNum)}) / arith_uint256{static_cast<uint64_t>(params.nDemurrageTargetRateDen)}};
+    const arith_uint256 subsidy256{static_cast<uint64_t>(subsidy)};
+    if (target <= subsidy256) return 0;
+    // r(h) = shortfall(h) / U(h - 1)
+    const arith_uint256 rate{((target - subsidy256) * arith_uint256{INDEX_ONE}) / value};
     Assert(rate.bits() <= 64);
     return rate.GetLow64();
 }
@@ -95,18 +97,11 @@ BlockState BaselineState(CAmount utxo_value)
     return state;
 }
 
-BlockContext ComputeBlockContext(const BlockState& prev, int height, CAmount covered, const Consensus::Params& params)
+BlockContext ComputeBlockContext(const BlockState& prev, CAmount subsidy, const Consensus::Params& params)
 {
-    Assert(IsActive(height, params));
     BlockContext ctx;
     ctx.prev_utxo_value = prev.UtxoValue();
-    ctx.period_start = IsRatePeriodStart(height, params);
-    if (ctx.period_start) {
-        // covered_k = subsidy_{k-1} (the schedule); U_k = U(H_k - 1).
-        ctx.rate = ComputeRate(ctx.prev_utxo_value, covered, params);
-    } else {
-        ctx.rate = prev.rate;
-    }
+    ctx.rate = ComputeRate(ctx.prev_utxo_value, subsidy, prev.index, params);
     // At activation the parent's index is I(ACTIVATION_HEIGHT - 1) = 1.
     ctx.index = NextIndex(prev.index, ctx.rate);
     ctx.dividend = Dividend(ctx.rate, ctx.prev_utxo_value);
@@ -123,6 +118,65 @@ BlockState ComputeBlockState(const BlockState& prev, const BlockContext& ctx, co
     Assert(totals.normalized_spent <= total);
     state.normalized_utxo = total - totals.normalized_spent;
     return state;
+}
+
+uint32_t CommittedRefHeight(uint32_t ref_height, int activation_height)
+{
+    Assert(activation_height > 0);
+    return std::max(ref_height, static_cast<uint32_t>(activation_height - 1));
+}
+
+uint256 CommitmentLeaf(const uint256& txid, uint32_t committed_ref_height)
+{
+    return (HashWriter{} << txid << committed_ref_height).GetHash();
+}
+
+uint256 CoinbaseCommitmentLeaf(int height)
+{
+    Assert(height >= 0);
+    return CommitmentLeaf(uint256::ZERO, static_cast<uint32_t>(height));
+}
+
+uint256 Commitment(const BlockState& prev, const BlockContext& ctx, std::vector<uint256> leaves)
+{
+    Assert(!leaves.empty());
+    const uint256 ref_height_root{ComputeMerkleRoot(std::move(leaves))};
+    // state(h) = I(h) || r(h) || N(h - 1), little-endian.
+    return (HashWriter{} << ctx.index << ctx.rate << ArithToUint256(prev.normalized_utxo) << ref_height_root).GetHash();
+}
+
+CScript CommitmentScript(const uint256& commitment)
+{
+    std::vector<unsigned char> data(COMMITMENT_HEADER.begin(), COMMITMENT_HEADER.end());
+    data.insert(data.end(), commitment.begin(), commitment.end());
+    CScript script{CScript{} << OP_RETURN << data};
+    Assert(script.size() == MINIMUM_COMMITMENT_SCRIPT_SIZE);
+    return script;
+}
+
+bool IsCommitmentScript(const CScript& script)
+{
+    return script.size() >= MINIMUM_COMMITMENT_SCRIPT_SIZE &&
+           script[0] == OP_RETURN &&
+           script[1] == 0x24 &&
+           std::equal(COMMITMENT_HEADER.begin(), COMMITMENT_HEADER.end(), script.begin() + 2);
+}
+
+std::optional<size_t> GetCommitmentIndex(const CTransaction& coinbase)
+{
+    std::optional<size_t> index;
+    for (size_t o{0}; o < coinbase.vout.size(); ++o) {
+        if (IsCommitmentScript(coinbase.vout[o].scriptPubKey)) index = o;
+    }
+    return index;
+}
+
+std::optional<uint256> GetCommitment(const CTransaction& coinbase)
+{
+    const std::optional<size_t> index{GetCommitmentIndex(coinbase)};
+    if (!index) return std::nullopt;
+    const CScript& script{coinbase.vout[*index].scriptPubKey};
+    return uint256{std::span<const unsigned char>{script.data() + 6, 32}};
 }
 
 } // namespace demurrage

@@ -52,6 +52,7 @@
 #include <vector>
 
 class Chainstate;
+class CBlockUndo;
 class CTxMemPool;
 class ChainstateManager;
 struct ChainTxData;
@@ -136,10 +137,6 @@ std::optional<demurrage::InputValues> GetDemurrageInputValues(const node::BlockM
 std::optional<demurrage::InputValues> GetMempoolDemurrageInputValues(Chainstate& chainstate, const CTxMemPool* mempool, const CTransaction& tx)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-/** BIP 462: covered_k for the rate period beginning at @p height, the block
- *  subsidy schedule over the RATE_PERIOD blocks before it. */
-CAmount GetDemurrageCoveredSubsidy(int height, const Consensus::Params& params);
-
 /** BIP 462: context of the block after @p tip, if BIP 462 is active for it and
  *  the state after @p tip is known. */
 std::optional<demurrage::BlockContext> GetNextDemurrageBlockContext(const node::BlockManager& blockman, const CBlockIndex& tip, const Consensus::Params& params)
@@ -147,9 +144,24 @@ std::optional<demurrage::BlockContext> GetNextDemurrageBlockContext(const node::
 
 /** BIP 462: fee_effective of each transaction, connected in order in the block
  *  after the tip of @p chainstate. This is what the block producer may claim
- *  for it. Returns nullopt if BIP 462 is not active for that block, or if a
- *  transaction's inputs are invalid. */
-std::optional<std::vector<CAmount>> GetDemurrageBlockFees(Chainstate& chainstate, const std::vector<CTransactionRef>& txs)
+ *  for it. If @p commitment is not null, it is set to the demurrage commitment
+ *  of a block that holds a coinbase and these transactions. Returns nullopt if
+ *  BIP 462 is not active for that block, or if a transaction's inputs are
+ *  invalid. */
+std::optional<std::vector<CAmount>> GetDemurrageBlockFees(Chainstate& chainstate, const std::vector<CTransactionRef>& txs, uint256* commitment = nullptr)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+/** BIP 462 rules on the header of the block after @p prev: the timestamp rules
+ *  of BIP 54, and the version bit of the block at ACTIVATION_HEIGHT. A failure
+ *  is recorded in @p state as @p result. */
+bool CheckDemurrageBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockValidationResult result, const CBlockIndex& prev, const Consensus::Params& params);
+
+/** BIP 462: the coinbase limit of the connected block @p block, whose block
+ *  index entry is @p index and whose undo data is @p undo: its subsidy, the
+ *  fee_effective of each of its transactions and its demurrage dividend, as
+ *  ConnectBlock computed them. Returns nullopt if BIP 462 does not apply to the
+ *  block, or if the demurrage state of its ancestors is unknown. */
+std::optional<CAmount> GetDemurrageCoinbaseLimit(const node::BlockManager& blockman, const CBlockIndex& index, const CBlock& block, const CBlockUndo& undo, const Consensus::Params& params)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 bool FatalError(kernel::Notifications& notifications, BlockValidationState& state, const bilingual_str& message);
@@ -838,15 +850,27 @@ public:
                       CCoinsViewCache& view, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
-     * BIP 462: if the block after @p prev is the activation block, make sure the
-     * demurrage state after @p prev holds the effective value of the UTXO set,
-     * computing it with a one-time scan of the UTXO set if necessary. @p prev
-     * must be the tip of this chainstate.
+     * BIP 462: make sure the demurrage state after @p prev holds the value of
+     * the UTXO set, if the block after @p prev is the activation block, or if
+     * @p prev is at or above the height from which this chainstate tracks that
+     * value ahead of activation. The value is computed with a one-time scan of
+     * the UTXO set if the state is missing. @p prev must be the tip of this
+     * chainstate.
      */
     bool EnsureDemurrageBaseline(const CBlockIndex& prev, BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! BIP 462: whether this chainstate computed the baseline state itself.
     bool m_demurrage_baseline_computed GUARDED_BY(::cs_main){false};
+
+    //! BIP 462: how many blocks before ACTIVATION_HEIGHT - 1 a chainstate may
+    //! start to track the value of the UTXO set.
+    static constexpr int DEMURRAGE_BASELINE_LEAD{2016};
+
+    //! BIP 462: the height from which this chainstate tracks the value of the
+    //! UTXO set ahead of activation. Each node picks it at random in the first
+    //! half of the DEMURRAGE_BASELINE_LEAD blocks, so that nodes do not all
+    //! scan the UTXO set at the same block.
+    std::optional<int> m_demurrage_scan_height GUARDED_BY(::cs_main);
 
     // Apply the effects of a block disconnection on the UTXO set.
     bool DisconnectTip(BlockValidationState& state, DisconnectedBlockTransactions* disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);

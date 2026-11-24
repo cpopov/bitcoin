@@ -33,6 +33,9 @@ enum
     SIGHASH_NONE = 2,
     SIGHASH_SINGLE = 3,
     SIGHASH_ANYONECANPAY = 0x80,
+    //! BIP 462, taproot only: the signature also commits to the value of every
+    //! input at the transaction's reference height, and to that height.
+    SIGHASH_DEMURRAGE = 0x40,
 
     SIGHASH_DEFAULT = 0, //!< Taproot only; implied when sighash byte is missing, and equivalent to SIGHASH_ALL
     SIGHASH_OUTPUT_MASK = 3,
@@ -182,7 +185,25 @@ struct PrecomputedTransactionData
     //! Whether m_spent_outputs is initialized.
     bool m_spent_outputs_ready = false;
 
+    // BIP 462 data, for signatures that use SIGHASH_DEMURRAGE.
+    //! sha_input_values: single SHA256 of the value of every input at the
+    //! index of the transaction's reference height, 8 bytes each.
+    uint256 m_demurrage_input_values_single_hash;
+    //! The transaction's reference height, in committed form.
+    uint32_t m_demurrage_ref_height{0};
+    //! Whether the 2 fields above are initialized. SIGHASH_DEMURRAGE is valid
+    //! only if they are, which is the case from the BIP 462 activation height.
+    bool m_demurrage_ready{false};
+
     PrecomputedTransactionData() = default;
+
+    /** Provide the BIP 462 data, which is not derived from the transaction and
+     *  the outputs it spends alone.
+     *
+     * @param[in]   input_values          The value of each input at the index of the transaction's
+     *                                    reference height, one for each tx.vin, in order.
+     * @param[in]   committed_ref_height  The transaction's reference height, in committed form. */
+    void SetDemurrage(std::span<const CAmount> input_values, uint32_t committed_ref_height);
 
     /** Initialize this PrecomputedTransactionData with transaction data.
      *

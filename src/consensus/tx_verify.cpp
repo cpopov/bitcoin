@@ -170,7 +170,8 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
 }
 
 bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee,
-                              const demurrage::TxContext* demurrage_ctx, uint32_t* ref_height_out)
+                              const demurrage::TxContext* demurrage_ctx, uint32_t* ref_height_out,
+                              std::vector<CAmount>* input_values_out)
 {
     // are the actual inputs available?
     if (!inputs.HaveInputs(tx)) {
@@ -197,6 +198,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     }
 
     CAmount nValueIn = 0;
+    std::vector<CAmount> input_values;
+    if (demurrage_active && input_values_out) input_values.reserve(tx.vin.size());
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
         const COutPoint &prevout = tx.vin[i].prevout;
         const Coin& coin = inputs.AccessCoin(prevout);
@@ -221,6 +224,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                                      strprintf("no demurrage index for input %s", prevout.ToString()));
             }
             input_value = demurrage::EffectiveValue(coin.out.nValue, *coin_index, *ref_index);
+            if (input_values_out) input_values.push_back(input_value);
         }
         nValueIn += input_value;
         if (!MoneyRange(nValueIn)) {
@@ -250,5 +254,6 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     }
 
     txfee = txfee_aux;
+    if (demurrage_active && input_values_out) *input_values_out = std::move(input_values);
     return true;
 }

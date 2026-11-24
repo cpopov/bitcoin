@@ -1463,6 +1463,17 @@ PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)
     Init(txTo, {});
 }
 
+void PrecomputedTransactionData::SetDemurrage(std::span<const CAmount> input_values, uint32_t committed_ref_height)
+{
+    HashWriter ss{};
+    for (const CAmount value : input_values) {
+        ss << value;
+    }
+    m_demurrage_input_values_single_hash = ss.GetSHA256();
+    m_demurrage_ref_height = committed_ref_height;
+    m_demurrage_ready = true;
+}
+
 // explicit instantiation
 template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut>&& spent_outputs, bool force);
 template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut>&& spent_outputs, bool force);
@@ -1519,7 +1530,13 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
     // Hash type
     const uint8_t output_type = (hash_type == SIGHASH_DEFAULT) ? SIGHASH_ALL : (hash_type & SIGHASH_OUTPUT_MASK); // Default (no sighash byte) is equivalent to SIGHASH_ALL
     const uint8_t input_type = hash_type & SIGHASH_INPUT_MASK;
-    if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83))) return false;
+    // BIP 462: SIGHASH_ALL, SIGHASH_NONE and SIGHASH_SINGLE can be combined
+    // with SIGHASH_DEMURRAGE (0x41, 0x42, 0x43), but only where the values of
+    // the inputs are known: from the BIP 462 activation height. It cannot be
+    // combined with SIGHASH_ANYONECANPAY, which leaves the other inputs, and
+    // therefore the transaction's reference height, open.
+    const bool demurrage_type{hash_type >= 0x41 && hash_type <= 0x43 && cache.m_demurrage_ready};
+    if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83) || demurrage_type)) return false;
     ss << hash_type;
 
     // Transaction level data
@@ -1530,6 +1547,10 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
         ss << cache.m_spent_amounts_single_hash;
         ss << cache.m_spent_scripts_single_hash;
         ss << cache.m_sequences_single_hash;
+        if (demurrage_type) {
+            ss << cache.m_demurrage_input_values_single_hash;
+            ss << cache.m_demurrage_ref_height;
+        }
     }
     if (output_type == SIGHASH_ALL) {
         ss << cache.m_outputs_single_hash;

@@ -149,6 +149,24 @@ util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const C
                         const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types);
 
 /**
+ * BIP 462: like AttemptSelection(), but return only an input set with a coin that
+ * protects the transaction from replay (see CoinSelectionParams::m_avoid_replay).
+ * In order of preference:
+ * 1. for each OutputType with such a coin, the best input set of that type if it
+ *    has one, or else the group with such a coin of the largest amount and other
+ *    groups of that type selected to make up the target; the one that wastes the
+ *    least among them;
+ * 2. if mixing is allowed, the best mixed input set, if it has such a coin;
+ * 3. or else the group with such a coin of the largest amount, and other groups
+ *    of any type selected to make up the target.
+ *
+ * returns  If successful, a SelectionResult whose input set has such a coin.
+ *          If failed, an empty error message: no such input set was found.
+ */
+util::Result<SelectionResult> AttemptProtectedSelection(interfaces::Chain& chain, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
+                                                        const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types);
+
+/**
  * Attempt to find a valid input set that meets the provided eligibility filter and target.
  * Multiple coin selection algorithms will be run and the input set that produces the least waste
  * (according to the waste metric) will be chosen.
@@ -182,6 +200,11 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
  *                                     If failed, returns (1) an empty error message if the target was not reached (general "Insufficient funds")
  *                                                or (2) an specific error message if there was something particularly wrong (e.g. a selection
  *                                                result that surpassed the tx max weight size).
+ *
+ * The coin eligibility filters are tried in turn, from the strictest, until one gives a selection.
+ * With CoinSelectionParams::m_avoid_replay, they are first tried with AttemptProtectedSelection():
+ * an input set that protects the transaction from replay under a looser filter is preferred to one that
+ * does not under a stricter filter.
  */
 util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, CoinsResult& available_coins, const CAmount& nTargetValue,
                  const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

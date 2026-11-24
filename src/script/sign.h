@@ -31,8 +31,20 @@ struct bilingual_str;
 struct CMutableTransaction;
 struct SignatureData;
 
+/** BIP 462: what a signature that uses SIGHASH_DEMURRAGE commits to. */
+struct DemurrageSigningData {
+    //! The value of each input at the index of the transaction's reference
+    //! height, in input order.
+    std::vector<CAmount> input_values;
+    //! The transaction's reference height, in committed form.
+    uint32_t committed_ref_height{0};
+};
+
 struct SignOptions {
     int sighash_type{SIGHASH_DEFAULT};
+    //! BIP 462: what signatures that use SIGHASH_DEMURRAGE commit to. Used by
+    //! SignTransaction(); a PSBT holds it in its inputs' BIP 462 fields.
+    std::optional<DemurrageSigningData> demurrage{};
 };
 
 /** Interface for signature creators. */

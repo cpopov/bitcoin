@@ -603,10 +603,9 @@ public:
         consensus.CSVHeight = 1;    // Always active unless overridden
         consensus.SegwitHeight = 0; // Always active unless overridden
         // BIP 462: not active unless overridden with -testactivationheight=demurrage@<height>.
-        // Shorter rate period and a much higher target than mainnet, so that
-        // demurrage is non-zero while regtest's fast-halving subsidy still exists.
+        // A much higher target than mainnet, so that demurrage is non-zero
+        // while regtest's fast-halving subsidy still exists.
         consensus.DemurrageHeight = std::numeric_limits<int>::max();
-        consensus.nDemurrageRatePeriod = 144;
         consensus.nDemurrageTargetRateNum = 1; // 0.2% per block
         consensus.nDemurrageTargetRateDen = 500;
         consensus.MinBIP9WarningHeight = 0;
@@ -676,10 +675,10 @@ public:
                 // chain applies BIP 462 from height 432
                 // (-testactivationheight=demurrage@432).
                 .height = 600,
-                .hash_serialized = AssumeutxoHash{uint256{"ff98a87d19a94abe66d005d7644c4ea4b80dd6a87cac6b01eaba346bb240cf7c"}},
+                .hash_serialized = AssumeutxoHash{uint256{"f418caab799076e6a9fcbff721b5322a41cd3269466a9a13676594b55d7e6ca9"}},
                 .m_chain_tx_count = 1001,
-                .blockhash = uint256{"58513f276d01bcce65cb16f7ff85a8e890b931b3b184acf9fcce0ace9d399354"},
-                .demurrage_states_hash = uint256{"641081d6ef72cb40b784a5f0b9fc3afa100a400749c578c0853fa4382e5e2283"},
+                .blockhash = uint256{"599b7245b716a63ef11dc2062b2e5a128391c1ce6a54c6fd19942342f06e0c46"},
+                .demurrage_states_hash = uint256{"205495c5730195916cce83a05e93d02cb9b1fc12935dec643ae7acaf332160fd"},
             },
         };
 

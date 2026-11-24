@@ -182,7 +182,7 @@ FUZZ_TARGET(scriptpubkeyman, .init = initialize_spkm)
                 std::map<COutPoint, Coin> coins{ConsumeCoins(fuzzed_data_provider)};
                 const int sighash{fuzzed_data_provider.ConsumeIntegral<int>()};
                 std::map<int, bilingual_str> input_errors;
-                (void)spk_manager->SignTransaction(tx_to, coins, sighash, input_errors);
+                (void)spk_manager->SignTransaction(tx_to, coins, {.sighash_type = sighash}, input_errors);
             },
             [&] {
                 std::optional<PartiallySignedTransaction> opt_psbt{ConsumeDeserializableConstructor<PartiallySignedTransaction>(fuzzed_data_provider)};

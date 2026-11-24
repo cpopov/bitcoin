@@ -1320,22 +1320,21 @@ static RPCMethod getdemurrageinfo()
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
                 {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "ACTIVATION_HEIGHT (omitted if BIP 462 is not scheduled)"},
-                {RPCResult::Type::NUM, "rate_period", "RATE_PERIOD in blocks"},
                 {RPCResult::Type::NUM, "target_rate_num", "TARGET_RATE_PER_BLOCK numerator"},
                 {RPCResult::Type::NUM, "target_rate_den", "TARGET_RATE_PER_BLOCK denominator"},
                 {RPCResult::Type::NUM, "index_scale", "Fixed-point scale of index and rate (1.0)"},
+                {RPCResult::Type::NUM, "index_min", "INDEX_MIN: the rate is zero once the index is at or below it"},
                 {RPCResult::Type::NUM, "height", "Height of the block"},
                 {RPCResult::Type::STR_HEX, "blockhash", "Hash of the block"},
                 {RPCResult::Type::BOOL, "active", "Whether BIP 462 rules applied to this block"},
                 {RPCResult::Type::NUM, "index", /*optional=*/true, "Demurrage index I(height)"},
-                {RPCResult::Type::NUM, "rate", /*optional=*/true, "Per-block demurrage rate r_k of the rate period containing this block"},
-                {RPCResult::Type::STR_AMOUNT, "utxo_value", /*optional=*/true, "Effective value U(height) of the UTXO set after this block (from ACTIVATION_HEIGHT - 1)"},
+                {RPCResult::Type::NUM, "rate", /*optional=*/true, "Demurrage rate r(height) of this block"},
+                {RPCResult::Type::STR_AMOUNT, "utxo_value", /*optional=*/true, "Effective value U(height) of the UTXO set after this block (from ACTIVATION_HEIGHT - 1, and from the earlier block at which this node first computed it)"},
+                {RPCResult::Type::STR_HEX, "normalized_utxo", /*optional=*/true, "Normalized value N(height) of the UTXO set after this block, as a big-endian hex number (known for the same blocks as utxo_value). The next block's demurrage commitment commits to it"},
                 {RPCResult::Type::OBJ, "next_block", /*optional=*/true, "Values for the block after the chain tip (only when height is the tip and BIP 462 is active for the next block)", {
                     {RPCResult::Type::NUM, "height", "Height of the next block"},
                     {RPCResult::Type::NUM, "index", "Demurrage index of the next block"},
-                    {RPCResult::Type::NUM, "rate", "Per-block demurrage rate of the next block"},
-                    {RPCResult::Type::BOOL, "rate_period_start", "Whether the next block begins a rate period"},
-                    {RPCResult::Type::STR_AMOUNT, "covered", "covered_k of the rate period containing the next block: the block subsidy schedule over the previous rate period"},
+                    {RPCResult::Type::NUM, "rate", "Demurrage rate of the next block"},
                     {RPCResult::Type::STR_AMOUNT, "subsidy", "Block subsidy"},
                     {RPCResult::Type::STR_AMOUNT, "dividend", "Demurrage dividend"},
                     {RPCResult::Type::STR_AMOUNT, "coinbase_limit_before_fees", "subsidy + dividend. The coinbase may also claim the fee_effective of each transaction in the block"},
@@ -1361,10 +1360,10 @@ static RPCMethod getdemurrageinfo()
 
     UniValue ret(UniValue::VOBJ);
     if (consensus.DemurrageHeight != std::numeric_limits<int>::max()) ret.pushKV("activation_height", consensus.DemurrageHeight);
-    ret.pushKV("rate_period", consensus.nDemurrageRatePeriod);
     ret.pushKV("target_rate_num", consensus.nDemurrageTargetRateNum);
     ret.pushKV("target_rate_den", consensus.nDemurrageTargetRateDen);
     ret.pushKV("index_scale", demurrage::INDEX_ONE);
+    ret.pushKV("index_min", demurrage::INDEX_MIN);
     ret.pushKV("height", block->nHeight);
     ret.pushKV("blockhash", block->GetBlockHash().GetHex());
     ret.pushKV("active", demurrage::IsActive(block->nHeight, consensus));
@@ -1373,6 +1372,7 @@ static RPCMethod getdemurrageinfo()
         ret.pushKV("index", state->index);
         ret.pushKV("rate", state->rate);
         ret.pushKV("utxo_value", ValueFromAmount(state->UtxoValue()));
+        ret.pushKV("normalized_utxo", state->normalized_utxo.GetHex());
     } else if (!demurrage::IsActive(block->nHeight, consensus)) {
         ret.pushKV("index", demurrage::INDEX_ONE);
         ret.pushKV("rate", 0);
@@ -1384,9 +1384,6 @@ static RPCMethod getdemurrageinfo()
             n.pushKV("height", tip->nHeight + 1);
             n.pushKV("index", next->index);
             n.pushKV("rate", next->rate);
-            n.pushKV("rate_period_start", next->period_start);
-            const int period_start{consensus.DemurrageHeight + (tip->nHeight + 1 - consensus.DemurrageHeight) / consensus.nDemurrageRatePeriod * consensus.nDemurrageRatePeriod};
-            n.pushKV("covered", ValueFromAmount(GetDemurrageCoveredSubsidy(period_start, consensus)));
             n.pushKV("subsidy", ValueFromAmount(subsidy));
             n.pushKV("dividend", ValueFromAmount(next->dividend));
             n.pushKV("coinbase_limit_before_fees", ValueFromAmount(subsidy + next->dividend));

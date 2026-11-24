@@ -120,7 +120,10 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
     // so external signers are not asked to sign more than once.
     bool complete;
     pwallet->FillPSBT(psbtx, {.sign = false, .bip32_derivs = true}, complete);
-    const auto err{pwallet->FillPSBT(psbtx, {.sign = true, .bip32_derivs = false}, complete)};
+    // BIP 462: -walletdemurragesighash may make the wallet sign with SIGHASH_DEMURRAGE.
+    const int sighash{WITH_LOCK(pwallet->cs_wallet, return pwallet->GetOwnTransactionSighash(rawTx.vin))};
+    const std::optional<int> sighash_type{sighash == SIGHASH_DEFAULT ? std::nullopt : std::optional{sighash}};
+    const auto err{pwallet->FillPSBT(psbtx, {.sign = true, .sighash_type = sighash_type, .bip32_derivs = false}, complete)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }
@@ -881,7 +884,12 @@ RPCMethod signrawtransactionwithwallet()
             "       \"SINGLE\"\n"
             "       \"ALL|ANYONECANPAY\"\n"
             "       \"NONE|ANYONECANPAY\"\n"
-            "       \"SINGLE|ANYONECANPAY\""},
+            "       \"SINGLE|ANYONECANPAY\"\n"
+            "       \"ALL|DEMURRAGE\"\n"
+            "       \"NONE|DEMURRAGE\"\n"
+            "       \"SINGLE|DEMURRAGE\"\n"
+            "The DEMURRAGE types (BIP 462) sign taproot inputs with SIGHASH_DEMURRAGE, which commits to the value of every input at the\n"
+            "transaction's reference height, and sign other inputs without it. They are valid once BIP 462 applies to the next block."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -1635,9 +1643,15 @@ RPCMethod sendall()
             // block. Express the outputs at the transaction's reference height, the
             // highest among its inputs, so that each recipient receives that
             // effective value and the fee is as estimated. Rounding is taken from
-            // the output that received the remainder.
+            // the output that received the remainder, and so are the few
+            // satoshis that keep the fee, as the mempool measures it in the
+            // next block, at the fee computed above.
             if (const auto valuation{GetDemurrageValuation(*pwallet, outpoints_spent)}) {
-                if (!ConvertOutputsToRefHeight(rawTx, *valuation, remainder_pos)) {
+                std::optional<DemurrageFeeFloor> fee_floor;
+                if (const auto next_index{pwallet->chain().getDemurrageIndex(valuation->height + 1)}) {
+                    fee_floor = DemurrageFeeFloor{.fee = actual_fee, .index = *next_index};
+                }
+                if (!ConvertOutputsToRefHeight(rawTx, *valuation, remainder_pos, {}, fee_floor)) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "Unable to value the transaction's inputs for BIP 462");
                 }
             }
@@ -1671,7 +1685,12 @@ RPCMethod walletprocesspsbt()
             "       \"SINGLE\"\n"
             "       \"ALL|ANYONECANPAY\"\n"
             "       \"NONE|ANYONECANPAY\"\n"
-            "       \"SINGLE|ANYONECANPAY\""},
+            "       \"SINGLE|ANYONECANPAY\"\n"
+            "       \"ALL|DEMURRAGE\"\n"
+            "       \"NONE|DEMURRAGE\"\n"
+            "       \"SINGLE|DEMURRAGE\"\n"
+            "The DEMURRAGE types (BIP 462) sign taproot inputs with SIGHASH_DEMURRAGE, which commits to the value of every input at the\n"
+            "transaction's reference height, and sign other inputs without it. They are valid once BIP 462 applies to the next block."},
                     {"bip32derivs", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include BIP 32 derivation paths for public keys if we know them"},
                     {"finalize", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also finalize inputs if possible"},
                 },

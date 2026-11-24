@@ -34,10 +34,10 @@ MOCKTIME = 1_700_000_000
 
 # The regtest assumeutxo data for SNAPSHOT_BASE_HEIGHT (src/kernel/chainparams.cpp).
 EXPECTED = {
-    "base_hash": "58513f276d01bcce65cb16f7ff85a8e890b931b3b184acf9fcce0ace9d399354",
-    "txoutset_hash": "ff98a87d19a94abe66d005d7644c4ea4b80dd6a87cac6b01eaba346bb240cf7c",
+    "base_hash": "599b7245b716a63ef11dc2062b2e5a128391c1ce6a54c6fd19942342f06e0c46",
+    "txoutset_hash": "f418caab799076e6a9fcbff721b5322a41cd3269466a9a13676594b55d7e6ca9",
     "nchaintx": 1001,
-    "demurrage_states_hash": "641081d6ef72cb40b784a5f0b9fc3afa100a400749c578c0853fa4382e5e2283",
+    "demurrage_states_hash": "205495c5730195916cce83a05e93d02cb9b1fc12935dec643ae7acaf332160fd",
 }
 
 # Snapshot metadata: magic (5), version (2), network magic (4), base block hash

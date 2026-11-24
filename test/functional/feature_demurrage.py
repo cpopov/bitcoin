@@ -4,25 +4,33 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test BIP 462 (target-based demurrage security budget).
 
-Regtest parameters: RATE_PERIOD = 144 blocks and TARGET_RATE_PER_BLOCK = 1/500,
-far above mainnet, so that demurrage is non-zero while regtest's subsidy,
-which halves every 150 blocks, still exists.
+Regtest parameter: TARGET_RATE_PER_BLOCK = 1/500, far above mainnet, so that
+demurrage is non-zero while regtest's subsidy, which halves every 150 blocks,
+still exists.
 
 The test checks, against an independent Python model of the BIP's fixed-point
 arithmetic:
-- the UTXO set value at activation, the per-period rate (from the subsidy
-  schedule only), the index and the coinbase limit (subsidy + fee_effective +
+- the UTXO set value at activation, the per-block rate (from the block's
+  subsidy only), the index and the coinbase limit (subsidy + fee_effective +
   dividend);
+- the mempool's fees: fee_effective in the next block;
 - inherited reference heights: a transaction is valued at the highest
   reference height among its inputs, and its outputs inherit it;
 - transactions signed before activation, and pre-signed TRUC packages, stay
   valid however long they wait;
 - effective supply grows only by the subsidy;
-- the wallet, PSBTs, and effective values in RPC and REST;
+- the wallet (payments, fee bumps, amounts by address), PSBTs, and effective
+  values in RPC and REST;
+- the coinstats index, against a scan of the UTXO set;
 - the consensus behaviour BIP 462's Layer 2 section relies on: pre-signed
   commitment and second-stage transactions, and SIGHASH_SINGLE |
   SIGHASH_ANYONECANPAY transactions that add a younger input;
-- restarts, reorgs, and a node upgraded after activation.
+- restarts, reorgs, and a node upgraded after activation, which discards the
+  blocks it connected without BIP 462.
+
+The rules on blocks (activation block, demurrage commitment, timestamps) are
+tested in feature_demurrage_blocks.py, and SIGHASH_DEMURRAGE in
+feature_demurrage_sighash.py.
 """
 from decimal import Decimal
 import http.client
@@ -31,8 +39,10 @@ import urllib.parse
 
 from test_framework.address import address_to_scriptpubkey
 from test_framework.blocktools import (
+    add_demurrage_commitment,
     add_witness_commitment,
     create_block,
+    demurrage_activation_version,
     create_coinbase,
 )
 from test_framework.messages import (
@@ -68,6 +78,8 @@ from test_framework.wallet_util import generate_keypair
 
 ACTIVATION_HEIGHT = 432
 ONE = 10**18
+INDEX_MIN = 10**9
+HALVING_INTERVAL = 150
 
 
 def sat(amount):
@@ -75,7 +87,7 @@ def sat(amount):
 
 
 def subsidy(height):
-    halvings = height // 150
+    halvings = height // HALVING_INTERVAL
     return 0 if halvings >= 64 else (50 * COIN) >> halvings
 
 
@@ -83,20 +95,17 @@ class DemurrageModel:
     """Independent model of the BIP 462 fixed-point arithmetic."""
 
     def __init__(self, info):
-        self.rate_period = info["rate_period"]
         self.num = info["target_rate_num"]
         self.den = info["target_rate_den"]
 
-    def covered(self, period_start):
-        return sum(subsidy(h) for h in range(max(0, period_start - self.rate_period), period_start))
-
-    def rate(self, utxo_value, covered):
-        if utxo_value == 0:
+    def rate(self, utxo_value, block_subsidy, prev_index):
+        """r(h), from U(h - 1), block_subsidy(h) and I(h - 1)."""
+        if utxo_value == 0 or prev_index <= INDEX_MIN:
             return 0
-        target = utxo_value * self.rate_period * self.num // self.den
-        if target <= covered:
+        target = utxo_value * self.num // self.den
+        if target <= block_subsidy:
             return 0
-        return (target - covered) * ONE // (self.rate_period * utxo_value)
+        return (target - block_subsidy) * ONE // utxo_value
 
     @staticmethod
     def next_index(index, rate):
@@ -131,12 +140,23 @@ class DemurrageTest(BitcoinTestFramework):
     def ref_height(self, txid, vout=0):
         return self.nodes[0].gettxout(txid, vout)["ref_height"]
 
+    def mempool_fee(self, fee, ref_height):
+        """The fee the mempool keeps for a transaction that enters it now, and
+        whose fee is fee at ref_height: its fee_effective in the next block."""
+        return self.model.effective(fee, self.index_at(ref_height), self.state()["next_block"]["index"])
+
+    def check_mempool_fee(self, txid, fee, ref_height=None):
+        if ref_height is None:
+            ref_height = self.ref_height(txid)
+        assert_equal(sat(self.nodes[0].getmempoolentry(txid)["fees"]["base"]), self.mempool_fee(fee, ref_height))
+
     def run_test(self):
         node = self.nodes[0]
         self.wallet = MiniWallet(node)
         info = node.getdemurrageinfo()
         assert_equal(info["activation_height"], ACTIVATION_HEIGHT)
         assert_equal(info["index_scale"], ONE)
+        assert_equal(info["index_min"], INDEX_MIN)
         self.model = DemurrageModel(info)
 
         self.test_before_activation()
@@ -145,10 +165,11 @@ class DemurrageTest(BitcoinTestFramework):
         self.test_inherited_reference_heights()
         self.test_fees_to_producer()
         self.test_truc_commitments()
-        self.test_rate_period_and_supply()
+        self.test_rate_and_supply()
         self.test_wallet()
         self.test_effective_value_reporting()
         self.test_layer2()
+        self.test_coinstatsindex()
         self.test_restart_and_reorg()
         self.test_upgrade_after_activation()
 
@@ -189,15 +210,13 @@ class DemurrageTest(BitcoinTestFramework):
         utxo_value = sat(info["utxo_value"])
         assert_equal(utxo_value, sat(node.gettxoutsetinfo()["total_amount"]))
 
-        self.log.info("The first rate covers the shortfall of the previous period's subsidy schedule")
+        self.log.info("The first rate covers the shortfall of the activation block's own subsidy")
         nb = info["next_block"]
-        covered = self.model.covered(ACTIVATION_HEIGHT)
-        assert_equal(sat(nb["covered"]), covered)
-        rate = self.model.rate(utxo_value, covered)
+        assert_equal(sat(nb["subsidy"]), subsidy(ACTIVATION_HEIGHT))
+        rate = self.model.rate(utxo_value, subsidy(ACTIVATION_HEIGHT), ONE)
         assert_greater_than(rate, 0)
         assert_greater_than(ONE * self.model.num // self.model.den, rate)
         assert_equal(nb["height"], ACTIVATION_HEIGHT)
-        assert_equal(nb["rate_period_start"], True)
         assert_equal(nb["rate"], rate)
         assert_equal(nb["index"], self.model.next_index(ONE, rate))
         dividend = self.model.dividend(rate, utxo_value)
@@ -217,7 +236,10 @@ class DemurrageTest(BitcoinTestFramework):
         for value, result in ((limit + 1, "bad-cb-amount"), (limit, None)):
             coinbase = create_coinbase(ACTIVATION_HEIGHT, script_pubkey=self.wallet.get_output_script())
             coinbase.vout[0].nValue = value
-            block = create_block(int(tip, 16), coinbase, ntime=block_time)
+            # The activation block sets bit 31 of its version, and every block
+            # from it on commits to the demurrage state.
+            block = create_block(int(tip, 16), coinbase, ntime=block_time, version=demurrage_activation_version())
+            add_demurrage_commitment(block, node)
             block.solve()
             assert_equal(node.submitblock(block.serialize().hex()), result)
         self.wallet.rescan_utxos()
@@ -272,12 +294,19 @@ class DemurrageTest(BitcoinTestFramework):
             self.wallet.get_utxo(txid=u["txid"], vout=u["vout"])
         self.wallet.scan_tx(node.decoderawtransaction(mixed["hex"]))
         assert_equal(self.ref_height(mixed["txid"]), coinbase_height)
-        assert_equal(sat(node.getmempoolentry(mixed["txid"])["fees"]["base"]), decayed - mixed["tx"].vout[0].nValue)
+        mixed_fee = decayed - mixed["tx"].vout[0].nValue
+
+        self.log.info("The mempool keeps each fee as fee_effective in the next block")
+        # The fee of the first transaction is expressed at index 1, and that of
+        # the second at a lower index. Their fee_effective can be compared.
+        self.check_mempool_fee(single["txid"], sat(single["fee"]), old_ref)
+        self.check_mempool_fee(mixed["txid"], mixed_fee, coinbase_height)
+        assert_greater_than(sat(single["fee"]), sat(node.getmempoolentry(single["txid"])["fees"]["base"]))
 
         self.log.info("Unconfirmed children inherit their parent's reference height")
         child = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=mixed["new_utxos"][0])
         assert_equal(self.ref_height(child["txid"]), coinbase_height)
-        self.fee_txs = [(single, old_ref), (mixed, coinbase_height), (child, coinbase_height)]
+        self.fee_txs = [(single, old_ref, sat(single["fee"])), (mixed, coinbase_height, mixed_fee), (child, coinbase_height, sat(child["fee"]))]
 
     def test_fees_to_producer(self):
         node = self.nodes[0]
@@ -285,9 +314,10 @@ class DemurrageTest(BitcoinTestFramework):
         height = node.getblockcount() + 1
         index_h = self.state()["next_block"]["index"]
         fees = 0
-        for tx, ref in self.fee_txs:
-            fee = sat(node.getmempoolentry(tx["txid"])["fees"]["base"])
+        for tx, ref, fee in self.fee_txs:
             fees += self.model.effective(fee, self.index_at(ref), index_h)
+            # No block was mined since they entered the mempool.
+            assert_equal(sat(node.getmempoolentry(tx["txid"])["fees"]["base"]), self.model.effective(fee, self.index_at(ref), index_h))
         limit = subsidy(height) + fees + sat(self.state()["next_block"]["dividend"])
         tmpl = node.getblocktemplate({"rules": ["segwit"]})
         assert_equal(tmpl["coinbasevalue"], limit)
@@ -299,6 +329,7 @@ class DemurrageTest(BitcoinTestFramework):
             coinbase = create_coinbase(height, script_pubkey=self.wallet.get_output_script())
             coinbase.vout[0].nValue = value
             block = create_block(tmpl=tmpl, coinbase=coinbase, txlist=txs)
+            add_demurrage_commitment(block, script=tmpl["default_demurrage_commitment"])
             add_witness_commitment(block)
             block.solve()
             assert_equal(node.submitblock(block.serialize().hex()), result)
@@ -362,27 +393,41 @@ class DemurrageTest(BitcoinTestFramework):
         assert_equal(node.getrawmempool(), [])
         self.wallet.rescan_utxos()
 
-    def test_rate_period_and_supply(self):
+    def test_rate_and_supply(self):
         node = self.nodes[0]
-        self.log.info("Each rate period's rate is set from the previous period's subsidy schedule")
+        self.log.info("Each block's rate is set from its own subsidy and the UTXO set value before it")
         start = node.getblockcount() + 1
-        periods = (start - ACTIVATION_HEIGHT) // self.model.rate_period + 1
-        period_end = ACTIVATION_HEIGHT + periods * self.model.rate_period - 1
-        assert_greater_than(period_end, start)
-        while node.getblockcount() < period_end:
+        halving = (start // HALVING_INTERVAL + 1) * HALVING_INTERVAL
+        while node.getblockcount() < halving - 1:
             # Keep some fee-paying transactions flowing; they do not affect the rate.
             self.wallet.send_self_transfer(from_node=node)
             self.mine()
         info = self.state()
         nb = info["next_block"]
-        assert_equal(nb["rate_period_start"], True)
-        covered = self.model.covered(period_end + 1)
-        assert_equal(sat(nb["covered"]), covered)
-        rate = self.model.rate(sat(info["utxo_value"]), covered)
+        assert_equal(nb["height"], halving)
+        assert_equal(sat(nb["subsidy"]), subsidy(halving))
+        rate = self.model.rate(sat(info["utxo_value"]), subsidy(halving), info["index"])
         assert_equal(nb["rate"], rate)
         assert_equal(nb["index"], self.model.next_index(info["index"], rate))
+
+        self.log.info("The first block after a halving already pays for the shortfall")
+        # The subsidy halves from this block on, and the dividend makes up for
+        # it in the same block: the total of the two does not fall.
+        before = subsidy(halving - 1) + self.model.dividend(info["rate"], sat(self.state(halving - 2)["utxo_value"]))
+        after = subsidy(halving) + sat(nb["dividend"])
+        assert_greater_than(rate, info["rate"])
+        assert_greater_than(after, before - 2)
         self.mine(3)
-        assert_equal(self.state()["rate"], rate)
+        assert_equal(self.state(halving)["rate"], rate)
+
+        self.log.info("Every block since activation has the rate and index of the model")
+        prev = self.state(ACTIVATION_HEIGHT - 1)
+        for height in range(ACTIVATION_HEIGHT, node.getblockcount() + 1):
+            state = self.state(height)
+            expected = self.model.rate(sat(prev["utxo_value"]), subsidy(height), prev["index"])
+            assert_equal(state["rate"], expected)
+            assert_equal(state["index"], self.model.next_index(prev["index"], expected))
+            prev = state
 
         self.log.info("Effective supply grows only by the subsidy")
         for height in range(start, node.getblockcount() + 1):
@@ -469,14 +514,18 @@ class DemurrageTest(BitcoinTestFramework):
             # actual size by a few vbytes, and conversions round down.
             shortfall = balance - delivered - fee_rate * tx["vsize"]
             assert 0 <= shortfall <= 100, shortfall
-            mempool_fee = node.getmempoolentry(txid)["fees"]["base"]
+            # The mempool measures the fee in the next block, and the wallet
+            # pays the fee rate it was asked for, measured in the same way.
+            wallet_fee = -w.gettransaction(txid)["fee"]
+            self.check_mempool_fee(txid, sat(wallet_fee))
+            assert_greater_than(sat(node.getmempoolentry(txid)["fees"]["base"]) + 1, fee_rate * tx["vsize"])
             self.mine()
             assert_equal(w.listunspent(), [])
             self.log.info("gettransaction and listtransactions report the fee as consensus values the inputs")
             wtx = w.gettransaction(txid)
-            assert_equal(wtx["fee"], -mempool_fee)
+            assert_equal(wtx["fee"], -wallet_fee)
             assert_equal(wtx["ref_height"], self.ref_height(txid))
-            assert_equal(next(t for t in w.listtransactions() if t["txid"] == txid and t["category"] == "send")["fee"], -mempool_fee)
+            assert_equal(next(t for t in w.listtransactions() if t["txid"] == txid and t["category"] == "send")["fee"], -wallet_fee)
 
         self.log.info("decodepsbt and analyzepsbt report the fee as consensus values the inputs")
         self.fund_wallet(w)
@@ -489,12 +538,15 @@ class DemurrageTest(BitcoinTestFramework):
         analyzed = node.analyzepsbt(funded["psbt"])
         assert_equal(analyzed["fee"], decoded["fee"])
         txid = node.sendrawtransaction(w.walletprocesspsbt(funded["psbt"])["hex"])
-        assert_equal(node.getmempoolentry(txid)["fees"]["base"], decoded["fee"])
+        self.check_mempool_fee(txid, sat(decoded["fee"]))
+        assert_greater_than(sat(node.getmempoolentry(txid)["fees"]["base"]) + 1, fee_rate * node.getmempoolentry(txid)["vsize"])
         # Valuing inputs with different reference heights at their nominal
         # values would overstate the fee.
         assert_greater_than(nominal_fee, decoded["fee"])
         self.mine()
         assert_equal(w.gettransaction(txid)["fee"], -decoded["fee"])
+
+        self.test_wallet_bumpfee(w)
 
         self.log.info("The wallet values the outputs of its transactions that were never broadcast")
         self.fund_wallet(w)
@@ -520,6 +572,93 @@ class DemurrageTest(BitcoinTestFramework):
         self.mine()
         assert_equal(w.listunspent(), [])
         self.wallet.rescan_utxos()
+
+    def test_wallet_bumpfee(self, w):
+        node = self.nodes[0]
+        w.sendall(recipients=[self.wallet.get_address()])
+        self.mine()
+        assert_equal(w.listunspent(), [])
+        node.createwallet("receiver")
+        receiver = node.get_wallet_rpc("receiver")
+        address = receiver.getnewaddress()
+
+        def payment(txid):
+            tx = node.getrawtransaction(txid, True)
+            return next(o for o in tx["vout"] if o["scriptPubKey"].get("address") == address)
+
+        def delivered(txid):
+            return sat(node.gettxout(txid, payment(txid)["n"])["effective_value"])
+
+        self.log.info("bumpfee keeps the amount of each payment, and values the original fee as consensus does")
+        self.fund_wallet(w)
+        txid = w.sendtoaddress(address=address, amount=5, replaceable=True)  # needs both coins
+        assert_equal(len(node.getrawtransaction(txid, True)["vin"]), 2)
+        original = payment(txid)
+        # The reference height is below the tip, so the nominal amount exceeds
+        # the 5 BTC that the payment delivers.
+        assert_greater_than(original["value"], 5)
+        ref = self.ref_height(txid)
+        fee = -w.gettransaction(txid)["fee"]
+        self.check_mempool_fee(txid, sat(fee), ref)
+        for _ in range(2):
+            bumped = w.bumpfee(txid)
+            txid = bumped["txid"]
+            assert_equal(bumped["origfee"], fee)
+            assert_equal(self.ref_height(txid), ref)
+            assert_equal(payment(txid)["value"], original["value"])
+            assert_greater_than(bumped["fee"], fee)
+            fee = bumped["fee"]
+            assert_equal(-w.gettransaction(txid)["fee"], fee)
+            self.check_mempool_fee(txid, sat(fee), ref)
+        vout = payment(txid)["n"]
+        self.mine()
+
+        self.log.info("Amounts by address are effective values, like balances")
+        balance = receiver.getbalance()
+        assert_equal(balance, node.gettxout(txid, vout)["effective_value"])
+        assert_greater_than(original["value"], balance)
+        assert_equal(receiver.listaddressgroupings(), [[[address, balance, ""]]])
+        assert_equal(receiver.getreceivedbyaddress(address), balance)
+        assert_equal(receiver.getreceivedbylabel(""), balance)
+        assert_equal(receiver.listreceivedbyaddress()[0]["amount"], balance)
+        assert_equal(receiver.listreceivedbylabel()[0]["amount"], balance)
+        # Once the output is spent, the amount received is still valued at the
+        # wallet's last block, from the transaction's reference height.
+        receiver.sendall(recipients=[self.wallet.get_address()])
+        self.mine()
+        received = self.model.effective(sat(original["value"]), self.index_at(ref), self.state()["index"])
+        assert_equal(sat(receiver.getreceivedbyaddress(address)), received)
+        assert_equal(sat(receiver.listreceivedbyaddress()[0]["amount"]), received)
+        assert_equal(receiver.listaddressgroupings(), [[[address, 0, ""]]])
+
+        self.log.info("A replacement that adds a younger input re-expresses the payment at its reference height")
+        w.sendall(recipients=[self.wallet.get_address()])
+        self.mine()
+        self.fund_wallet(w)
+        refs = {self.ref_height(u["txid"], u["vout"]): u for u in w.listunspent()}
+        old_ref, new_ref = min(refs), max(refs)
+        assert_greater_than(new_ref, old_ref)
+        # Spend the older coin alone and in full: without a change output, the
+        # replacement can only pay a higher fee by adding the younger coin.
+        old_coin = {"txid": refs[old_ref]["txid"], "vout": refs[old_ref]["vout"]}
+        txid = w.sendall(recipients=[address], inputs=[old_coin], replaceable=True)["txid"]
+        assert_equal(self.ref_height(txid), old_ref)
+        original = payment(txid)
+        delivered_before = delivered(txid)
+        txid = w.bumpfee(txid)["txid"]
+        assert_equal(len(node.getrawtransaction(txid, True)["vin"]), 2)
+        assert_equal(self.ref_height(txid), new_ref)
+        # The same nominal amount, moved from the old index to the new one...
+        assert_equal(sat(payment(txid)["value"]), self.model.effective(sat(original["value"]), self.index_at(old_ref), self.index_at(new_ref)))
+        assert_greater_than(original["value"], payment(txid)["value"])
+        # ...which delivers the same effective value, up to rounding.
+        assert 0 <= delivered_before - delivered(txid) <= 2, (delivered_before, delivered(txid))
+        self.mine()
+
+        w.sendall(recipients=[self.wallet.get_address()])
+        self.mine()
+        assert_equal(w.listunspent(), [])
+        receiver.unloadwallet()
 
     def test_effective_value_reporting(self):
         node = self.nodes[0]
@@ -606,7 +745,7 @@ class DemurrageTest(BitcoinTestFramework):
         for vout in range(2):
             assert_equal(self.ref_height(commitment_txid, vout), funding_ref)
         second_stage_txid = node.sendrawtransaction(second_stage.serialize().hex())
-        assert_equal(node.getmempoolentry(second_stage_txid)["fees"]["base"], Decimal(1000) / COIN)
+        self.check_mempool_fee(second_stage_txid, 1000, funding_ref)
         self.mine()
         assert_equal(self.ref_height(second_stage_txid), funding_ref)
 
@@ -632,9 +771,61 @@ class DemurrageTest(BitcoinTestFramework):
         res = node.testmempoolaccept([bumped(sat(sponsor["value"]) - 1000)])[0]
         assert_equal(res["reject-reason"], "bad-txns-in-belowout")
         txid = node.sendrawtransaction(bumped(sat(sponsor["value"]) - 1000 - decay))
-        assert_equal(node.getmempoolentry(txid)["fees"]["base"], Decimal(1000) / COIN)
+        self.check_mempool_fee(txid, 1000, sponsor_ref)
         self.mine()
         assert_equal(self.ref_height(txid), sponsor_ref)
+
+    def test_coinstatsindex(self):
+        node = self.nodes[0]
+        self.log.info("The coinstats index hashes the same UTXO set as a scan")
+        self.restart_node(0, extra_args=self.extra_args[0] + ["-coinstatsindex"])
+
+        def check():
+            node.syncwithvalidationinterfacequeue()
+            self.wait_until(lambda: node.getindexinfo()["coinstatsindex"] == {"synced": True, "best_block_height": node.getblockcount()})
+            indexed = node.gettxoutsetinfo(hash_type="muhash", use_index=True)
+            scanned = node.gettxoutsetinfo(hash_type="muhash", use_index=False)
+            for key in ("height", "bestblock", "txouts", "bogosize", "muhash", "total_amount", "effective_total_amount"):
+                assert_equal(indexed[key], scanned[key])
+            return indexed
+
+        # The chain so far holds dividends, and coins whose reference height
+        # differs from their height.
+        assert_greater_than(sat(self.state()["next_block"]["dividend"]), 0)
+        check()
+
+        self.log.info("Its unclaimed rewards are the coinbase limit less what the coinbase claims")
+        self.wallet.send_self_transfer(from_node=node)
+        self.mine()
+        info = check()
+        assert_equal(info["block_info"]["unspendables"]["unclaimed_rewards"], 0)
+        # The coinbase claimed the dividend on top of the subsidy.
+        assert_greater_than(sat(info["block_info"]["coinbase"]), subsidy(info["height"]))
+
+        self.wallet.send_self_transfer(from_node=node)
+        height = node.getblockcount() + 1
+        tmpl = node.getblocktemplate({"rules": ["segwit"]})
+        unclaimed = 12345
+        coinbase = create_coinbase(height, script_pubkey=self.wallet.get_output_script())
+        coinbase.vout[0].nValue = tmpl["coinbasevalue"] - unclaimed
+        block = create_block(tmpl=tmpl, coinbase=coinbase, txlist=[t["data"] for t in tmpl["transactions"]])
+        add_demurrage_commitment(block, script=tmpl["default_demurrage_commitment"])
+        add_witness_commitment(block)
+        block.solve()
+        assert_equal(node.submitblock(block.serialize().hex()), None)
+        info = check()
+        assert_equal(sat(info["block_info"]["unspendables"]["unclaimed_rewards"]), unclaimed)
+
+        self.log.info("It follows a reorganisation")
+        node.invalidateblock(node.getbestblockhash())
+        self.mine()
+        assert_equal(node.getrawmempool(), [])
+        info = check()
+        assert_equal(info["height"], height)
+        assert_equal(info["block_info"]["unspendables"]["unclaimed_rewards"], 0)
+
+        self.restart_node(0)
+        self.wallet.rescan_utxos()
 
     def test_restart_and_reorg(self):
         node = self.nodes[0]
@@ -664,41 +855,38 @@ class DemurrageTest(BitcoinTestFramework):
         assert_equal(self.state(), mined)
 
     def test_upgrade_after_activation(self):
-        self.log.info("A node upgraded after activation validates the blocks since activation again")
+        self.log.info("A node upgraded after activation discards the blocks it connected without BIP 462")
         node = self.nodes[0]
+        tip = node.getbestblockhash()
         recorded_height = node.getblockcount()
         recorded = self.state(recorded_height)
-        recorded.pop("next_block")  # only reported for the chain tip
-        # Restart without BIP 462 rules, as a node that has not been upgraded,
-        # and extend the chain with blocks connected without them.
+        activation_block = node.getblockhash(ACTIVATION_HEIGHT)
+        assert_greater_than(0, node.getblockheader(activation_block)["version"])
+        # Restart without BIP 462 rules, as a node that has not been upgraded.
+        # Such a node rejects the activation block, whose version is negative,
+        # and follows the blocks of miners that have not upgraded either.
         self.restart_node(0, extra_args=[])
+        node.invalidateblock(activation_block)
+        assert_equal(node.getblockcount(), ACTIVATION_HEIGHT - 1)
         self.wallet.rescan_utxos()
-        first_old = node.getblockcount() + 1
-        self.mine(110)
-        # A transaction that is valid without BIP 462 but not with it: it values
-        # a coin created before activation at its nominal value, alongside a
-        # coinbase output of the blocks connected without BIP 462, which sets
-        # its reference height.
-        utxos = self.wallet.get_utxos(confirmed_only=True, mark_as_spent=False)
-        before = next(u for u in utxos if u["height"] < ACTIVATION_HEIGHT)
-        after = next(u for u in utxos if u["coinbase"] and u["height"] == first_old)
-        for u in (before, after):
-            self.wallet.get_utxo(txid=u["txid"], vout=u["vout"])
-        nominal = self.wallet.send_self_transfer_multi(from_node=node, utxos_to_spend=[before, after])
-        last_valid = node.getblockcount()
-        self.mine(3)
-        assert nominal["txid"] in node.getblock(node.getblockhash(last_valid + 1))["tx"]
-        tip = node.getbestblockhash()
+        self.wallet.send_self_transfer(from_node=node)
+        self.mine(5)
+        old_tip = node.getbestblockhash()
+        old_activation_block = node.getblock(node.getblockhash(ACTIVATION_HEIGHT), 2)
+        assert_greater_than(old_activation_block["version"], 0)
+        assert all(not out["scriptPubKey"]["hex"].startswith("6a249996b0b3") for out in old_activation_block["tx"][0]["vout"])
 
-        with node.assert_debug_log([f"BIP 462: blocks from height {ACTIVATION_HEIGHT} to {last_valid + 3} were connected without BIP 462 rules"], timeout=60):
+        with node.assert_debug_log([f"BIP 462: blocks from height {ACTIVATION_HEIGHT} to {ACTIVATION_HEIGHT + 4} were connected without BIP 462 rules"], timeout=60):
             self.restart_node(0)
-        self.wait_until(lambda: node.getblockcount() == last_valid)
-        assert_equal(next(t for t in node.getchaintips() if t["hash"] == tip)["status"], "invalid")
-        # Validating the blocks again reproduces the state they had, and the
-        # blocks connected without BIP 462 now have a state too.
+        # None of them is valid: the first lacks the activation version bit.
+        self.wait_until(lambda: next(t for t in node.getchaintips() if t["hash"] == old_tip)["status"] == "invalid")
+        assert_equal(node.getblockcount(), ACTIVATION_HEIGHT - 1)
+        assert_equal(self.state()["next_block"]["height"], ACTIVATION_HEIGHT)
+
+        self.log.info("It then follows the chain that applies BIP 462, and computes the same state")
+        node.reconsiderblock(activation_block)
+        assert_equal(node.getbestblockhash(), tip)
         assert_equal(self.state(recorded_height), recorded)
-        assert_equal(self.state()["height"], last_valid)
-        assert_greater_than(recorded["index"], self.state()["index"])
 
 
 if __name__ == '__main__':

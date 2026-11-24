@@ -34,10 +34,14 @@ namespace Consensus {
  *                   height of the coins it spends, and every input is valued
  *                   at the demurrage index of that height.
  * @param[out] ref_height_out If BIP 462 applies, set to the transaction's reference height.
+ * @param[out] input_values_out If BIP 462 applies and the inputs are valid, set
+ *                   to the value of each input at the index of the
+ *                   transaction's reference height, in input order.
  * Preconditions: tx.IsCoinBase() is false.
  */
 [[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee,
-                                 const demurrage::TxContext* demurrage_ctx = nullptr, uint32_t* ref_height_out = nullptr);
+                                 const demurrage::TxContext* demurrage_ctx = nullptr, uint32_t* ref_height_out = nullptr,
+                                 std::vector<CAmount>* input_values_out = nullptr);
 } // namespace Consensus
 
 /** Auxiliary functions for transaction validation (ideally should not be exposed) */

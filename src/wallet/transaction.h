@@ -135,6 +135,9 @@ struct DemurrageDebit {
     uint32_t ref_height;
     //! The wallet's inputs, valued at the transaction's reference height.
     CAmount debit;
+    //! Whether a taproot key-path input is signed with SIGHASH_DEMURRAGE. The
+    //! transaction is then invalid on a chain that does not apply BIP 462.
+    bool demurrage_signed{false};
 };
 
 /**

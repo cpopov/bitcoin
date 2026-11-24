@@ -1035,8 +1035,19 @@ bool BlockManager::WriteBlockUndo(const CBlockUndo& blockundo, BlockValidationSt
     const BlockfileType type = BlockfileTypeForHeight(block.nHeight);
     auto& cursor = *Assert(m_blockfile_cursors[type]);
 
+    // Undo data is a function of the block and of the UTXO set below it, so a
+    // block that already has it does not get it again. BIP 462 adds the
+    // reference heights of the coins spent: a block first connected by a node
+    // that did not apply BIP 462 (see Chainstate::RewindForDemurrage) has undo
+    // data without them, which is replaced when the block is connected again.
+    bool stale{false};
+    if (!block.GetUndoPos().IsNull() && demurrage::IsActive(block.nHeight, GetConsensus())) {
+        CBlockUndo existing;
+        stale = !ReadBlockUndo(existing, block) || (HashWriter{} << existing).GetHash() != (HashWriter{} << blockundo).GetHash();
+    }
+
     // Write undo information to disk
-    if (block.GetUndoPos().IsNull()) {
+    if (block.GetUndoPos().IsNull() || stale) {
         FlatFilePos pos;
         const auto blockundo_size{static_cast<uint32_t>(GetSerializeSize(blockundo))};
         if (!FindUndoPos(state, block.nFile, pos, blockundo_size + UNDO_DATA_DISK_OVERHEAD)) {

@@ -122,6 +122,8 @@ bilingual_str PSBTErrorString(PSBTError err)
             return Untranslated("Input needs additional signatures or other data");
         case PSBTError::INVALID_TX:
             return Untranslated("The transaction cannot be valid");
+        case PSBTError::DEMURRAGE_VALUES_MISSING:
+            return Untranslated("Signing with SIGHASH_DEMURRAGE needs the value of every input at the transaction's reference height (BIP 462), which the PSBT does not hold");
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }

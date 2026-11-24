@@ -7,13 +7,19 @@
 
 #include <arith_uint256.h>
 #include <consensus/amount.h>
+#include <script/script.h>
 #include <serialize.h>
 #include <uint256.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <vector>
+
+class CScript;
+class CTransaction;
 
 namespace Consensus {
 struct Params;
@@ -25,7 +31,7 @@ struct Params;
  * All arithmetic is fixed-point integer arithmetic, rounding down (towards
  * zero) at every step. No floating point is used.
  *
- * - The demurrage index I(h) and the per-block rate r_k are fixed-point
+ * - The demurrage index I(h) and the per-block rate r(h) are fixed-point
  *   numbers with scale INDEX_ONE, so that I = INDEX_ONE means 1.0. I(h) is
  *   INDEX_ONE for every height before activation.
  * - Every output has a reference height. A coinbase output's is the height of
@@ -41,22 +47,40 @@ namespace demurrage {
 /** Fixed-point scale of the demurrage index and of the per-block rate (1e18). */
 inline constexpr uint64_t INDEX_ONE{1'000'000'000'000'000'000ULL};
 
+/** INDEX_MIN: once the index is at or below it, the rate is zero, so the index
+ *  never reaches zero and every division by an index is defined. */
+inline constexpr uint64_t INDEX_MIN{1'000'000'000ULL};
+
+/** "Activation block": bit 31 of the header version, which the block at
+ *  ACTIVATION_HEIGHT must set and no other block can. */
+inline constexpr uint32_t ACTIVATION_VERSION_BIT{0x80000000U};
+
+/** "Block timestamps" (BIP 54): the first block of a difficulty adjustment
+ *  period may be at most this many seconds earlier than its parent. */
+inline constexpr int64_t MAX_TIMEWARP_SECONDS{7200};
+
+/** COMMITMENT_HEADER: the first four bytes of SHA256("BIP462"). */
+inline constexpr std::array<uint8_t, 4> COMMITMENT_HEADER{0x99, 0x96, 0xb0, 0xb3};
+
+/** Minimum size of the scriptPubKey that holds a demurrage commitment:
+ *  OP_RETURN, a push of 36 bytes, COMMITMENT_HEADER and the commitment. */
+inline constexpr size_t MINIMUM_COMMITMENT_SCRIPT_SIZE{38};
+
 /** True if BIP 462 rules apply to the block at @p height. */
 bool IsActive(int height, const Consensus::Params& params);
 
-/** True if @p height begins a rate period (ACTIVATION_HEIGHT + k * RATE_PERIOD). */
-bool IsRatePeriodStart(int height, const Consensus::Params& params);
-
 /**
- * Per-block rate r_k for a rate period:
- *   target    = floor(U * RATE_PERIOD * TARGET_NUM / TARGET_DEN)
- *   shortfall = max(0, target - covered)
- *   r         = floor(shortfall * INDEX_ONE / (RATE_PERIOD * U))
- * @param[in] utxo_value U_k, the effective value of the UTXO set at H_k - 1.
- * @param[in] covered    the block subsidy schedule over the previous rate period.
- * Returns 0 when U_k is 0. The result never exceeds the target rate.
+ * Rate r(h) of a block:
+ *   target    = floor(U * TARGET_NUM / TARGET_DEN)
+ *   shortfall = max(0, target - subsidy)
+ *   r         = floor(shortfall * INDEX_ONE / U)
+ * @param[in] utxo_value U(h - 1), the effective value of the UTXO set after the block's parent.
+ * @param[in] subsidy    block_subsidy(h), the amount the halving schedule entitles the block to.
+ * @param[in] prev_index I(h - 1)
+ * Returns 0 when U is 0 or when I(h - 1) <= INDEX_MIN. The result never
+ * exceeds the target rate.
  */
-uint64_t ComputeRate(CAmount utxo_value, CAmount covered, const Consensus::Params& params);
+uint64_t ComputeRate(CAmount utxo_value, CAmount subsidy, uint64_t prev_index, const Consensus::Params& params);
 
 /** I(h) = floor(I(h-1) * (INDEX_ONE - r) / INDEX_ONE). */
 uint64_t NextIndex(uint64_t prev_index, uint64_t rate);
@@ -88,7 +112,7 @@ CAmount Dividend(uint64_t rate, CAmount utxo_value);
 struct BlockState {
     //! I(h), the demurrage index after this block.
     uint64_t index{INDEX_ONE};
-    //! r_k, the per-block rate of the rate period containing this block.
+    //! r(h), the rate of this block.
     uint64_t rate{0};
     //! N(h), the normalized value of the UTXO set after this block.
     arith_uint256 normalized_utxo{};
@@ -120,20 +144,17 @@ BlockState BaselineState(CAmount utxo_value);
 struct BlockContext {
     //! I(h)
     uint64_t index{INDEX_ONE};
-    //! r_k
+    //! r(h)
     uint64_t rate{0};
     //! U(h-1)
     CAmount prev_utxo_value{0};
     //! demurrage_dividend(h)
     CAmount dividend{0};
-    //! True if this block begins a rate period (and @ref rate was recomputed).
-    bool period_start{false};
 };
 
-/** Compute the context of the post-activation block at @p height from the
- *  state after its parent. @p covered (the block subsidy schedule over the
- *  previous rate period) is only used if @p height begins a rate period. */
-BlockContext ComputeBlockContext(const BlockState& prev, int height, CAmount covered, const Consensus::Params& params);
+/** Compute the context of a post-activation block from the state after its
+ *  parent and from @p subsidy, the block's subsidy under the halving schedule. */
+BlockContext ComputeBlockContext(const BlockState& prev, CAmount subsidy, const Consensus::Params& params);
 
 /** Normalized values of the outputs a block spends and adds to the UTXO set. */
 struct BlockTotals {
@@ -150,7 +171,46 @@ struct InputValues {
     uint32_t ref_height{0};
     //! Each input's value at the transaction's reference height, in input order.
     std::vector<CAmount> values;
+    //! The reference height of the output each input spends, in input order.
+    std::vector<uint32_t> ref_heights;
+    //! The scriptPubKey of the output each input spends, in input order.
+    std::vector<CScript> script_pubkeys;
 };
+
+/** A reference height in committed form: every height below ACTIVATION_HEIGHT
+ *  is written as ACTIVATION_HEIGHT - 1, since all of them are equivalent. */
+uint32_t CommittedRefHeight(uint32_t ref_height, int activation_height);
+
+/** leaf(tx) = SHA256d(txid || reference height in committed form). */
+uint256 CommitmentLeaf(const uint256& txid, uint32_t committed_ref_height);
+
+/** The leaf of the coinbase of the block at @p height: 32 zero bytes in place
+ *  of its txid, and the block's height as its reference height. */
+uint256 CoinbaseCommitmentLeaf(int height);
+
+/**
+ * commitment(h) = SHA256d(I(h) || r(h) || N(h - 1) || ref_height_root), where
+ * ref_height_root is the Merkle root of @p leaves, computed as the block's
+ * transaction Merkle root is.
+ * @param[in] prev   state after the block's parent
+ * @param[in] ctx    context of the block
+ * @param[in] leaves the leaf of each of the block's transactions, in block order
+ */
+uint256 Commitment(const BlockState& prev, const BlockContext& ctx, std::vector<uint256> leaves);
+
+/** scriptPubKey of the coinbase output that holds @p commitment. */
+CScript CommitmentScript(const uint256& commitment);
+
+/** True if @p script has the form of a demurrage commitment: at least 38
+ *  bytes, beginning with OP_RETURN, a push of 36 bytes and COMMITMENT_HEADER. */
+bool IsCommitmentScript(const CScript& script);
+
+/** Index of the coinbase output that holds the block's demurrage commitment
+ *  (the last one that matches), or nullopt if there is none. */
+std::optional<size_t> GetCommitmentIndex(const CTransaction& coinbase);
+
+/** The commitment a coinbase carries, or nullopt if it has none. */
+std::optional<uint256> GetCommitment(const CTransaction& coinbase);
 
 /** Returns I(h) for a height on the chain being validated, or nullopt if unknown. */
 using IndexLookup = std::function<std::optional<uint64_t>(int height)>;

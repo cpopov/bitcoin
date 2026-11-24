@@ -72,6 +72,14 @@ public:
     /** The fee necessary to bump this UTXO's ancestor transactions to the target feerate */
     CAmount ancestor_bump_fees{0};
 
+    /** BIP 462: whether the output is separated, i.e. exists only on a chain
+     *  that applies BIP 462, so that a transaction that spends it is invalid on
+     *  any other. It is if it descends from a coinbase mined at or after
+     *  activation (its reference height is at or above the activation height),
+     *  or from a wallet transaction with a SIGHASH_DEMURRAGE signature (see
+     *  TxDescendsFromDemurrageSignature()). */
+    bool separated{false};
+
     COutput(const COutPoint& outpoint, const CTxOut& txout, int depth, int input_bytes, bool solvable, bool safe, int64_t time, bool from_me, const std::optional<CFeeRate> feerate = std::nullopt)
         : outpoint{outpoint},
           txout{txout},
@@ -172,6 +180,14 @@ struct CoinSelectionParams {
     uint32_t m_version{CTransaction::CURRENT_VERSION};
     /** The maximum weight for this transaction. */
     std::optional<int> m_max_tx_weight{std::nullopt};
+    /** BIP 462: prefer an input set with a coin that makes the transaction
+     *  invalid on a chain that does not apply BIP 462, and so protects it from
+     *  replay: a separated output (COutput::separated) or, with
+     *  m_taproot_avoids_replay, a taproot output. See AutomaticCoinSelection(). */
+    bool m_avoid_replay{false};
+    /** BIP 462: whether a taproot input protects the transaction, because the
+     *  wallet signs it with SIGHASH_DEMURRAGE (-walletdemurragesighash). */
+    bool m_taproot_avoids_replay{false};
 
     CoinSelectionParams(FastRandomContext& rng_fast, int change_output_size, int change_spend_size,
                         CAmount min_change_target, CFeeRate effective_feerate,
