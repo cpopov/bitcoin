@@ -68,7 +68,8 @@ static CAmount GetReceived(const CWallet& wallet, const UniValue& params, bool b
 
         for (const CTxOut& txout : wtx.GetTx()->vout) {
             if (output_scripts.contains(txout.scriptPubKey)) {
-                amount += txout.nValue;
+                // BIP 462: outputs are valued at the wallet's last block, like balances.
+                amount += GetEffectiveTxOutValue(wallet, wtx, txout.nValue);
             }
         }
     }

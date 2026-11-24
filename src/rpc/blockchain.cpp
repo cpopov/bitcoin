@@ -14,6 +14,7 @@
 #include <coins.h>
 #include <common/args.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
@@ -1065,7 +1066,8 @@ static RPCMethod gettxoutsetinfo()
                         {RPCResult::Type::STR_HEX, "muhash", /*optional=*/true, "The serialized hash (only present if 'muhash' hash_type is chosen)"},
                         {RPCResult::Type::NUM, "transactions", /*optional=*/true, "The number of transactions with unspent outputs (not available when coinstatsindex is used)"},
                         {RPCResult::Type::NUM, "disk_size", /*optional=*/true, "The estimated size of the chainstate on disk (not available when coinstatsindex is used)"},
-                        {RPCResult::Type::STR_AMOUNT, "total_amount", "The total amount of coins in the UTXO set"},
+                        {RPCResult::Type::STR_AMOUNT, "total_amount", "The total amount of coins in the UTXO set (nominal values)"},
+                        {RPCResult::Type::STR_AMOUNT, "effective_total_amount", /*optional=*/true, "BIP 462 effective value U(height) of the UTXO set (only from ACTIVATION_HEIGHT - 1)"},
                         {RPCResult::Type::STR_AMOUNT, "total_unspendable_amount", /*optional=*/true, "The total amount of coins permanently excluded from the UTXO set (only available if coinstatsindex is used)"},
                         {RPCResult::Type::OBJ, "block_info", /*optional=*/true, "Info on amounts in the block at this block height (only available if coinstatsindex is used)",
                         {
@@ -1151,6 +1153,14 @@ static RPCMethod gettxoutsetinfo()
         }
         CHECK_NONFATAL(stats.total_amount.has_value());
         ret.pushKV("total_amount", ValueFromAmount(stats.total_amount.value()));
+        {
+            // BIP 462: U(height) is part of the demurrage state of the block.
+            LOCK(::cs_main);
+            const CBlockIndex* stats_block{blockman.LookupBlockIndex(stats.hashBlock)};
+            if (const demurrage::BlockState* demurrage_state{stats_block ? blockman.GetDemurrageState(*stats_block) : nullptr}) {
+                ret.pushKV("effective_total_amount", ValueFromAmount(demurrage_state->UtxoValue()));
+            }
+        }
         if (!stats.index_used) {
             ret.pushKV("transactions", stats.nTransactions);
             ret.pushKV("disk_size", stats.nDiskSize);
@@ -1230,6 +1240,8 @@ static RPCMethod gettxout()
                     {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
                 }},
                 {RPCResult::Type::BOOL, "coinbase", "Coinbase or not"},
+                {RPCResult::Type::NUM, "ref_height", /*optional=*/true, "BIP 462 reference height of the output: the height of its block for a coinbase output, otherwise the highest reference height among the outputs its transaction spent. Below the activation height, every reference height has index 1. (only once BIP 462 is active for the next block)"},
+                {RPCResult::Type::STR_AMOUNT, "effective_value", /*optional=*/true, "BIP 462 effective value in " + CURRENCY_UNIT + " at the demurrage index of the chain tip (only once BIP 462 is active for the next block)"},
             }},
         },
         RPCExamples{
@@ -1279,6 +1291,105 @@ static RPCMethod gettxout()
     ret.pushKV("scriptPubKey", std::move(o));
     ret.pushKV("coinbase", coin->IsCoinBase());
 
+    // BIP 462
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    if (demurrage::IsActive(pindex->nHeight + 1, consensus)) {
+        ret.pushKV("ref_height", static_cast<uint64_t>(coin->nRefHeight));
+        const std::optional<uint64_t> tip_index{GetDemurrageIndex(active_chainstate.m_blockman, *pindex, pindex->nHeight, consensus)};
+        const std::optional<uint64_t> coin_index{coin->nRefHeight == MEMPOOL_HEIGHT ? std::nullopt :
+                                                 GetDemurrageIndex(active_chainstate.m_blockman, *pindex, static_cast<int>(coin->nRefHeight), consensus)};
+        if (tip_index && coin_index) {
+            ret.pushKV("effective_value", ValueFromAmount(demurrage::EffectiveValue(coin->out.nValue, *coin_index, *tip_index)));
+        }
+    }
+
+    return ret;
+},
+    };
+}
+
+static RPCMethod getdemurrageinfo()
+{
+    return RPCMethod{
+        "getdemurrageinfo",
+        "Returns the BIP 462 (target-based demurrage) state of the active chain at a height, and the values that apply to the next block.\n"
+        "Fixed-point values (index, rate) are integers scaled by index_scale.\n",
+        {
+            {"height", RPCArg::Type::NUM, RPCArg::DefaultHint{"the chain tip"}, "Height of the block whose state to return"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "ACTIVATION_HEIGHT (omitted if BIP 462 is not scheduled)"},
+                {RPCResult::Type::NUM, "target_rate_num", "TARGET_RATE_PER_BLOCK numerator"},
+                {RPCResult::Type::NUM, "target_rate_den", "TARGET_RATE_PER_BLOCK denominator"},
+                {RPCResult::Type::NUM, "index_scale", "Fixed-point scale of index and rate (1.0)"},
+                {RPCResult::Type::NUM, "index_min", "INDEX_MIN: the rate is zero once the index is at or below it"},
+                {RPCResult::Type::NUM, "height", "Height of the block"},
+                {RPCResult::Type::STR_HEX, "blockhash", "Hash of the block"},
+                {RPCResult::Type::BOOL, "active", "Whether BIP 462 rules applied to this block"},
+                {RPCResult::Type::NUM, "index", /*optional=*/true, "Demurrage index I(height)"},
+                {RPCResult::Type::NUM, "rate", /*optional=*/true, "Demurrage rate r(height) of this block"},
+                {RPCResult::Type::STR_AMOUNT, "utxo_value", /*optional=*/true, "Effective value U(height) of the UTXO set after this block (from ACTIVATION_HEIGHT - 1, and from the earlier block at which this node first computed it)"},
+                {RPCResult::Type::STR_HEX, "normalized_utxo", /*optional=*/true, "Normalized value N(height) of the UTXO set after this block, as a big-endian hex number (known for the same blocks as utxo_value). The next block's demurrage commitment commits to it"},
+                {RPCResult::Type::OBJ, "next_block", /*optional=*/true, "Values for the block after the chain tip (only when height is the tip and BIP 462 is active for the next block)", {
+                    {RPCResult::Type::NUM, "height", "Height of the next block"},
+                    {RPCResult::Type::NUM, "index", "Demurrage index of the next block"},
+                    {RPCResult::Type::NUM, "rate", "Demurrage rate of the next block"},
+                    {RPCResult::Type::STR_AMOUNT, "subsidy", "Block subsidy"},
+                    {RPCResult::Type::STR_AMOUNT, "dividend", "Demurrage dividend"},
+                    {RPCResult::Type::STR_AMOUNT, "coinbase_limit_before_fees", "subsidy + dividend. The coinbase may also claim the fee_effective of each transaction in the block"},
+                }},
+            }},
+        RPCExamples{
+            HelpExampleCli("getdemurrageinfo", "")
+            + HelpExampleRpc("getdemurrageinfo", "")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    const CChain& chain{chainman.ActiveChain()};
+    const CBlockIndex* tip{chain.Tip()};
+    const CBlockIndex* block{tip};
+    if (!request.params[0].isNull()) {
+        const int height{request.params[0].getInt<int>()};
+        if (height < 0 || height > tip->nHeight) throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+        block = chain[height];
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    if (consensus.DemurrageHeight != std::numeric_limits<int>::max()) ret.pushKV("activation_height", consensus.DemurrageHeight);
+    ret.pushKV("target_rate_num", consensus.nDemurrageTargetRateNum);
+    ret.pushKV("target_rate_den", consensus.nDemurrageTargetRateDen);
+    ret.pushKV("index_scale", demurrage::INDEX_ONE);
+    ret.pushKV("index_min", demurrage::INDEX_MIN);
+    ret.pushKV("height", block->nHeight);
+    ret.pushKV("blockhash", block->GetBlockHash().GetHex());
+    ret.pushKV("active", demurrage::IsActive(block->nHeight, consensus));
+    const node::BlockManager& blockman{chainman.m_blockman};
+    if (const demurrage::BlockState* state{blockman.GetDemurrageState(*block)}) {
+        ret.pushKV("index", state->index);
+        ret.pushKV("rate", state->rate);
+        ret.pushKV("utxo_value", ValueFromAmount(state->UtxoValue()));
+        ret.pushKV("normalized_utxo", state->normalized_utxo.GetHex());
+    } else if (!demurrage::IsActive(block->nHeight, consensus)) {
+        ret.pushKV("index", demurrage::INDEX_ONE);
+        ret.pushKV("rate", 0);
+    }
+    if (block == tip) {
+        if (const std::optional<demurrage::BlockContext> next{GetNextDemurrageBlockContext(blockman, *tip, consensus)}) {
+            const CAmount subsidy{GetBlockSubsidy(tip->nHeight + 1, consensus)};
+            UniValue n(UniValue::VOBJ);
+            n.pushKV("height", tip->nHeight + 1);
+            n.pushKV("index", next->index);
+            n.pushKV("rate", next->rate);
+            n.pushKV("subsidy", ValueFromAmount(subsidy));
+            n.pushKV("dividend", ValueFromAmount(next->dividend));
+            n.pushKV("coinbase_limit_before_fees", ValueFromAmount(subsidy + next->dividend));
+            ret.pushKV("next_block", std::move(n));
+        }
+    }
     return ret;
 },
     };
@@ -2388,9 +2499,12 @@ static RPCMethod scantxoutset()
                         {RPCResult::Type::NUM, "height", "Height of the unspent transaction output"},
                         {RPCResult::Type::STR_HEX, "blockhash", "Blockhash of the unspent transaction output"},
                         {RPCResult::Type::NUM, "confirmations", "Number of confirmations of the unspent transaction output when the scan was done"},
+                        {RPCResult::Type::NUM, "ref_height", /*optional=*/true, "BIP 462 reference height of the output (only once BIP 462 is active for the next block)"},
+                        {RPCResult::Type::STR_AMOUNT, "effective_value", /*optional=*/true, "BIP 462 effective value in " + CURRENCY_UNIT + " at the demurrage index of the scanned block (only once BIP 462 is active for the next block)"},
                     }},
                 }},
                 {RPCResult::Type::STR_AMOUNT, "total_amount", "The total amount of all found unspent outputs in " + CURRENCY_UNIT},
+                {RPCResult::Type::STR_AMOUNT, "effective_total_amount", /*optional=*/true, "The total effective value of all found unspent outputs in " + CURRENCY_UNIT + " (only once BIP 462 is active for the next block)"},
             }},
             scan_result_abort,
             scan_result_status_some,
@@ -2474,6 +2588,20 @@ static RPCMethod scantxoutset()
         result.pushKV("height", tip->nHeight);
         result.pushKV("bestblock", tip->GetBlockHash().GetHex());
 
+        // BIP 462: effective values at the index of the scanned block.
+        const ChainstateManager& chainman{EnsureChainman(node)};
+        const bool demurrage_active{demurrage::IsActive(tip->nHeight + 1, chainman.GetConsensus())};
+        std::map<COutPoint, CAmount> effective_values;
+        if (demurrage_active) {
+            LOCK(cs_main);
+            for (const auto& [outpoint, coin] : coins) {
+                if (const auto value{GetDemurrageEffectiveValue(chainman.m_blockman, *tip, coin, chainman.GetConsensus())}) {
+                    effective_values.emplace(outpoint, *value);
+                }
+            }
+        }
+        CAmount effective_total{0};
+
         for (const auto& it : coins) {
             const COutPoint& outpoint = it.first;
             const Coin& coin = it.second;
@@ -2492,11 +2620,19 @@ static RPCMethod scantxoutset()
             unspent.pushKV("height", coin.nHeight);
             unspent.pushKV("blockhash", coinb_block.GetBlockHash().GetHex());
             unspent.pushKV("confirmations", tip->nHeight - coin.nHeight + 1);
+            if (demurrage_active) {
+                unspent.pushKV("ref_height", static_cast<uint64_t>(coin.nRefHeight));
+                const auto effective_value{effective_values.find(outpoint)};
+                CHECK_NONFATAL(effective_value != effective_values.end());
+                unspent.pushKV("effective_value", ValueFromAmount(effective_value->second));
+                effective_total += effective_value->second;
+            }
 
             unspents.push_back(std::move(unspent));
         }
         result.pushKV("unspents", std::move(unspents));
         result.pushKV("total_amount", ValueFromAmount(total_in));
+        if (demurrage_active) result.pushKV("effective_total_amount", ValueFromAmount(effective_total));
     } else {
         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid action '%s'", action));
     }
@@ -3114,6 +3250,7 @@ static RPCMethod dumptxoutset()
                     {RPCResult::Type::STR, "path", "the absolute path that the snapshot was written to"},
                     {RPCResult::Type::STR_HEX, "txoutset_hash", "the hash of the UTXO set contents"},
                     {RPCResult::Type::NUM, "nchaintx", "the number of transactions in the chain up to and including the base block"},
+                    {RPCResult::Type::STR_HEX, "demurrage_states_hash", /*optional=*/true, "the hash of the BIP 462 demurrage states the snapshot carries (only if the base block is at or above ACTIVATION_HEIGHT)"},
                 }
         },
         RPCExamples{
@@ -3135,10 +3272,15 @@ static RPCMethod dumptxoutset()
         }
         target_index = ParseHashOrHeight(options["rollback"], *node.chainman);
     } else if (snapshot_type == "rollback") {
-        auto snapshot_heights = node.chainman->GetParams().GetAvailableSnapshotHeights();
-        CHECK_NONFATAL(snapshot_heights.size() > 0);
-        auto max_height = std::max_element(snapshot_heights.begin(), snapshot_heights.end());
-        target_index = ParseHashOrHeight(*max_height, *node.chainman);
+        // The latest snapshot height the chain has reached.
+        std::optional<int> target_height;
+        for (const int height : node.chainman->GetParams().GetAvailableSnapshotHeights()) {
+            if (height <= tip->nHeight && (!target_height || height > *target_height)) target_height = height;
+        }
+        if (!target_height) {
+            throw JSONRPCError(RPC_MISC_ERROR, "No assumeutxo snapshot height at or below the chain tip");
+        }
+        target_index = ParseHashOrHeight(*target_height, *node.chainman);
     } else if (snapshot_type == "latest") {
         target_index = tip;
     } else {
@@ -3414,7 +3556,21 @@ UniValue WriteUTXOSnapshot(
         tip->nHeight, tip->GetBlockHash().ToString(),
         fs::PathToString(path), fs::PathToString(temppath)));
 
-    SnapshotMetadata metadata{chainstate.m_chainman.GetParams().MessageStart(), tip->GetBlockHash(), maybe_stats->coins_count};
+    // BIP 462: a snapshot whose base is at or above ACTIVATION_HEIGHT carries the
+    // demurrage state after each block from ACTIVATION_HEIGHT - 1 to its base.
+    std::vector<demurrage::BlockState> demurrage_states;
+    const Consensus::Params& consensus{chainstate.m_chainman.GetConsensus()};
+    if (demurrage::IsActive(tip->nHeight, consensus)) {
+        LOCK(::cs_main);
+        for (int height{consensus.DemurrageHeight - 1}; height <= tip->nHeight; ++height) {
+            const demurrage::BlockState* state{chainstate.m_blockman.GetDemurrageState(*CHECK_NONFATAL(tip->GetAncestor(height)))};
+            if (!state) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Missing BIP 462 demurrage state at height %d", height));
+            demurrage_states.push_back(*state);
+        }
+    }
+    const uint256 demurrage_states_hash{demurrage_states.empty() ? uint256{} : node::DemurrageStatesHash(demurrage_states)};
+
+    SnapshotMetadata metadata{chainstate.m_chainman.GetParams().MessageStart(), tip->GetBlockHash(), maybe_stats->coins_count, std::move(demurrage_states)};
 
     afile << metadata;
 
@@ -3476,6 +3632,7 @@ UniValue WriteUTXOSnapshot(
     result.pushKV("path", path.utf8string());
     result.pushKV("txoutset_hash", maybe_stats->hashSerialized.ToString());
     result.pushKV("nchaintx", tip->m_chain_tx_count);
+    if (!demurrage_states_hash.IsNull()) result.pushKV("demurrage_states_hash", demurrage_states_hash.ToString());
     return result;
 }
 
@@ -3658,6 +3815,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getchaintxstats},
         {"blockchain", &getblockstats},
         {"blockchain", &getbestblockhash},
+        {"blockchain", &getdemurrageinfo},
         {"blockchain", &getblockcount},
         {"blockchain", &getblock},
         {"blockchain", &getblockfrompeer},

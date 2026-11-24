@@ -26,6 +26,9 @@ enum class PSBTError {
     UNSUPPORTED,
     INCOMPLETE,
     INVALID_TX,
+    //! BIP 462: SIGHASH_DEMURRAGE was requested, but the PSBT lacks the BIP 462
+    //! values of the inputs.
+    DEMURRAGE_VALUES_MISSING,
 };
 /**
  * Instructions for how a PSBT should be signed or filled with information.

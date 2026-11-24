@@ -6,6 +6,7 @@
 
 #include <coins.h>
 #include <common/system.h>
+#include <consensus/demurrage.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
 #include <policy/policy.h>
@@ -17,6 +18,9 @@
 #include <wallet/receive.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+
+#include <algorithm>
+#include <optional>
 
 namespace wallet {
 //! Check whether transaction has descendant in wallet or mempool, or has been
@@ -215,6 +219,35 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
         spent_outputs.push_back(coin.out);
     }
 
+    // BIP 462: the transaction's amounts are expressed at the demurrage index
+    // of its reference height, the lowest index among the coins it spends, and
+    // consensus values those coins at that index.
+    std::optional<uint64_t> tx_index;
+    std::optional<uint64_t> wallet_index;
+    {
+        std::vector<COutPoint> outpoints;
+        outpoints.reserve(tx->vin.size());
+        for (const CTxIn& txin : tx->vin) outpoints.push_back(txin.prevout);
+        if (const auto valuation{GetDemurrageValuation(wallet, outpoints)}) {
+            uint64_t index{demurrage::INDEX_ONE};
+            for (const COutPoint& outpoint : outpoints) {
+                const auto it{valuation->coins.find(outpoint)};
+                if (it == valuation->coins.end()) {
+                    errors.emplace_back(Untranslated(strprintf("Unable to value %s:%u for BIP 462", outpoint.hash.GetHex(), outpoint.n)));
+                    return Result::MISC_ERROR;
+                }
+                index = std::min(index, it->second.index_created);
+            }
+            input_value = 0;
+            for (const COutPoint& outpoint : outpoints) {
+                const DemurrageValuation::CoinInfo& coin{valuation->coins.at(outpoint)};
+                input_value += demurrage::EffectiveValue(coin.nominal, coin.index_created, index);
+            }
+            tx_index = index;
+            wallet_index = valuation->index;
+        }
+    }
+
     // Figure out if we need to compute the input weight, and do so if necessary
     PrecomputedTransactionData txdata;
     txdata.Init(*tx, std::move(spent_outputs), /* force=*/ true);
@@ -266,6 +299,10 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
             new_coin_control.destChange = dest;
         } else {
             CRecipient recipient = {dest, output.nValue, false};
+            // BIP 462: the original outputs are nominal amounts at the original
+            // transaction's reference height, and keep those amounts. Outputs
+            // given by the user are effective values, like any other payment.
+            if (outputs.empty()) recipient.demurrage_index = tx_index;
             recipients.push_back(recipient);
         }
         new_outputs_value += output.nValue;
@@ -277,6 +314,17 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
         if (std::get_if<CNoDestination>(&new_coin_control.destChange)) {
             errors.emplace_back(Untranslated("Unable to create transaction. Transaction must have at least one recipient"));
             return Result::INVALID_PARAMETER;
+        }
+
+        // BIP 462: the fee is deducted from this amount, so express the original
+        // outputs' total as an effective value at the wallet's last block.
+        if (outputs.empty() && tx_index) {
+            const std::optional<CAmount> effective_value{demurrage::ConvertValue(new_outputs_value, *tx_index, *wallet_index)};
+            if (!effective_value) {
+                errors.emplace_back(Untranslated("Unable to value the transaction's outputs for BIP 462"));
+                return Result::MISC_ERROR;
+            }
+            new_outputs_value = *effective_value;
         }
 
         // Add change as recipient with SFFO flag enabled, so fees are deduced from it.
@@ -329,6 +377,34 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
     const auto& txr = *res;
     // Write back new fee if successful
     new_fee = txr.fee;
+    // BIP 462: the wallet computed that fee at its last block. Report it as
+    // the fee of the replaced transaction is reported: as consensus values the
+    // inputs, at the transaction's reference height.
+    {
+        std::vector<COutPoint> outpoints;
+        outpoints.reserve(txr.tx->vin.size());
+        for (const CTxIn& txin : txr.tx->vin) outpoints.push_back(txin.prevout);
+        if (const auto valuation{GetDemurrageValuation(wallet, outpoints)}) {
+            uint64_t index{demurrage::INDEX_ONE};
+            bool known{true};
+            for (const COutPoint& outpoint : outpoints) {
+                const auto it{valuation->coins.find(outpoint)};
+                if (it == valuation->coins.end()) {
+                    known = false;
+                    break;
+                }
+                index = std::min(index, it->second.index_created);
+            }
+            if (known) {
+                CAmount value_in{0};
+                for (const COutPoint& outpoint : outpoints) {
+                    const DemurrageValuation::CoinInfo& coin{valuation->coins.at(outpoint)};
+                    value_in += demurrage::EffectiveValue(coin.nominal, coin.index_created, index);
+                }
+                new_fee = value_in - txr.tx->GetValueOut();
+            }
+        }
+    }
 
     // Write back transaction
     mtx = CMutableTransaction(*txr.tx);

@@ -7,6 +7,7 @@
 #include <common/messages.h>
 #include <common/system.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
 #include <node/types.h>
@@ -31,6 +32,9 @@
 #include <wallet/wallet.h>
 
 #include <cmath>
+#include <iterator>
+#include <map>
+#include <set>
 #include <vector>
 
 using common::StringForFeeReason;
@@ -280,6 +284,14 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
                 input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
             }
             const CWalletTx& parent_tx = txo->GetWalletTx();
+            // BIP 462: value the input at its effective value at the wallet's last block.
+            if (const auto valuation{GetDemurrageValuation(wallet, {outpoint})}) {
+                const std::optional<CAmount> effective_value{GetEffectiveOutputValue(outpoint, *valuation)};
+                if (!effective_value) {
+                    return util::Error{strprintf(_("Pre-selected input %s was not found in the UTXO set or the mempool"), outpoint.ToString())};
+                }
+                txout.nValue = *effective_value;
+            }
             if (wallet.GetTxDepthInMainChain(parent_tx) == 0) {
                 if (parent_tx.GetTx()->version == TRUC_VERSION && coin_control.m_version != TRUC_VERSION) {
                     return util::Error{strprintf(_("Can't spend unconfirmed version 3 pre-selected input with a version %d tx"), coin_control.m_version)};
@@ -333,12 +345,25 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const bool can_grind_r = wallet.CanGrindR();
     std::vector<COutPoint> outpoints;
 
+    // BIP 462: coins are offered at their effective value at the wallet's last block.
+    std::vector<COutPoint> demurrage_outpoints;
+    demurrage_outpoints.reserve(wallet.GetTXOs().size());
+    for (const auto& [outpoint, txo] : wallet.GetTXOs()) demurrage_outpoints.push_back(outpoint);
+    const std::optional<DemurrageValuation> demurrage_valuation{GetDemurrageValuation(wallet, demurrage_outpoints)};
+    const std::optional<int> demurrage_activation_height{demurrage_valuation ? std::optional{wallet.chain().getDemurrageActivationHeight()} : std::nullopt};
+    std::map<Txid, bool> demurrage_signed_txs;
+
     std::set<Txid> trusted_parents;
     // Cache for whether each tx passes the tx level checks (first bool), and whether the transaction is "safe" (second bool)
     std::unordered_map<Txid, std::pair<bool, bool>, SaltedTxidHasher> tx_safe_cache;
     for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
         const CWalletTx& wtx = txo.GetWalletTx();
-        const CTxOut& output = txo.GetTxOut();
+        CTxOut output{txo.GetTxOut()};
+        if (demurrage_valuation) {
+            const std::optional<CAmount> effective_value{GetEffectiveOutputValue(outpoint, *demurrage_valuation)};
+            if (!effective_value) continue;
+            output.nValue = *effective_value;
+        }
 
         if (tx_safe_cache.contains(outpoint.hash) && !tx_safe_cache.at(outpoint.hash).first) {
             continue;
@@ -468,6 +493,15 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
         auto available_output_type = GetOutputType(type, is_from_p2sh);
         auto available_output = COutput(outpoint, output, nDepth, input_bytes, solvable, tx_safe, wtx.GetTxTime(), tx_from_me, feerate);
+        // BIP 462: a coinbase's reference height is its block's height, and a
+        // transaction's the highest among the coins it spends. Only coin
+        // selection's preference for replay protection uses this.
+        if (demurrage_valuation && wallet.m_demurrage_sighash) {
+            const auto coin{demurrage_valuation->coins.find(outpoint)};
+            available_output.separated = (coin != demurrage_valuation->coins.end() &&
+                                          coin->second.ref_height >= static_cast<uint32_t>(*demurrage_activation_height)) ||
+                                         TxDescendsFromDemurrageSignature(wallet, wtx, demurrage_signed_txs);
+        }
         if (wtx.GetTx()->version == TRUC_VERSION && nDepth == 0 && params.check_version_trucness) {
             unconfirmed_truc_coins.emplace_back(available_output_type, available_output);
             auto [it, _] = truc_txid_by_value.try_emplace(wtx.GetTx()->GetHash(), 0);
@@ -723,6 +757,88 @@ util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const C
     return util::Error();
 };
 
+static bool AvoidsReplay(const COutput& coin, const CoinSelectionParams& coin_selection_params)
+{
+    return coin.separated ||
+           (coin_selection_params.m_taproot_avoids_replay && coin.txout.scriptPubKey.IsPayToTaproot());
+}
+
+static bool AvoidsReplay(const OutputGroup& group, const CoinSelectionParams& coin_selection_params)
+{
+    return std::ranges::any_of(group.m_outputs, [&](const auto& coin) { return AvoidsReplay(*coin, coin_selection_params); });
+}
+
+static bool AvoidsReplay(const SelectionResult& result, const CoinSelectionParams& coin_selection_params)
+{
+    return std::ranges::any_of(result.GetInputSet(), [&](const auto& coin) { return AvoidsReplay(*coin, coin_selection_params); });
+}
+
+/** The group among @p groups of the largest amount that has a coin which protects
+ *  the transaction from replay, if any. */
+static const OutputGroup* LargestProtectingGroup(const Groups& groups, const CoinSelectionParams& coin_selection_params)
+{
+    const OutputGroup* largest{nullptr};
+    for (const OutputGroup& group : groups.positive_group) {
+        if (!AvoidsReplay(group, coin_selection_params)) continue;
+        if (!largest || group.GetSelectionAmount() > largest->GetSelectionAmount()) largest = &group;
+    }
+    return largest;
+}
+
+/** Spend @p forced, and select coins from the groups among @p groups that share
+ *  no output with it to make up the rest of the target. */
+static util::Result<SelectionResult> SelectWithGroup(interfaces::Chain& chain, const CAmount& nTargetValue, const Groups& groups,
+                                                     const OutputGroup& forced, const CoinSelectionParams& coin_selection_params)
+{
+    const CAmount forced_amount{forced.GetSelectionAmount()};
+    SelectionResult result{std::min(forced_amount, nTargetValue), SelectionAlgorithm::MANUAL};
+    result.AddInput(forced);
+    if (const CAmount rest_target{nTargetValue - forced_amount}; rest_target > 0) {
+        std::set<COutPoint> forced_outpoints;
+        for (const auto& coin : forced.m_outputs) forced_outpoints.insert(coin->outpoint);
+        const auto disjoint{[&](const OutputGroup& group) {
+            return std::ranges::none_of(group.m_outputs, [&](const auto& coin) { return forced_outpoints.contains(coin->outpoint); });
+        }};
+        Groups others;
+        std::ranges::copy_if(groups.positive_group, std::back_inserter(others.positive_group), disjoint);
+        std::ranges::copy_if(groups.mixed_group, std::back_inserter(others.mixed_group), disjoint);
+        auto rest{ChooseSelectionResult(chain, rest_target, others, coin_selection_params)};
+        if (!rest) return util::Error();
+        rest->Merge(result);
+        result = std::move(*rest);
+    }
+    result.RecalculateWaste(coin_selection_params.min_viable_change, coin_selection_params.m_cost_of_change, coin_selection_params.m_change_fee);
+    // The selection of the rest did not count the weight of the forced group.
+    const int max_inputs_weight{coin_selection_params.m_max_tx_weight.value_or(MAX_STANDARD_TX_WEIGHT) - coin_selection_params.tx_noinputs_size * WITNESS_SCALE_FACTOR};
+    if (result.GetWeight() > max_inputs_weight) return util::Error();
+    return result;
+}
+
+util::Result<SelectionResult> AttemptProtectedSelection(interfaces::Chain& chain, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
+                                                        const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types)
+{
+    // Errors are dropped: the caller then selects without the preference.
+    std::vector<SelectionResult> results;
+    for (auto& [type, group] : groups.groups_by_type) {
+        const OutputGroup* largest{LargestProtectingGroup(group, coin_selection_params)};
+        if (!largest) continue;
+        if (auto result{ChooseSelectionResult(chain, nTargetValue, group, coin_selection_params)}; result && AvoidsReplay(*result, coin_selection_params)) {
+            results.push_back(*result);
+        } else if (auto forced{SelectWithGroup(chain, nTargetValue, group, *largest, coin_selection_params)}) {
+            results.push_back(*forced);
+        }
+    }
+    if (!results.empty()) return *std::min_element(results.begin(), results.end());
+
+    if (!allow_mixed_output_types || groups.TypesCount() <= 1) return util::Error();
+    const OutputGroup* largest{LargestProtectingGroup(groups.all_groups, coin_selection_params)};
+    if (!largest) return util::Error();
+    if (auto mixed{ChooseSelectionResult(chain, nTargetValue, groups.all_groups, coin_selection_params)}; mixed && AvoidsReplay(*mixed, coin_selection_params)) {
+        return mixed;
+    }
+    return SelectWithGroup(chain, nTargetValue, groups.all_groups, *largest, coin_selection_params);
+}
+
 util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, const CAmount& nTargetValue, Groups& groups, const CoinSelectionParams& coin_selection_params)
 {
     // Vector of results. We will choose the best one based on waste.
@@ -948,24 +1064,36 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
         // Walk-through the filters until the solution gets found.
         // If no solution is found, return the first detailed error (if any).
         // future: add "error level" so the worst one can be picked instead.
+        // BIP 462: to protect the transaction from replay, first walk through
+        // them for an input set with a coin that does (see AttemptProtectedSelection()).
         std::vector<util::Result<SelectionResult>> res_detailed_errors;
-        CoinSelectionParams updated_selection_params = coin_selection_params;
-        for (const auto& select_filter : ordered_filters) {
-            auto it = filtered_groups.find(select_filter.filter);
-            if (it == filtered_groups.end()) continue;
-            if (updated_selection_params.m_version == TRUC_VERSION && (select_filter.filter.conf_mine == 0 || select_filter.filter.conf_theirs == 0)) {
-                if (updated_selection_params.m_max_tx_weight > (TRUC_CHILD_MAX_WEIGHT)) {
-                    updated_selection_params.m_max_tx_weight = TRUC_CHILD_MAX_WEIGHT;
+        for (const bool protect : {true, false}) {
+            if (protect && !coin_selection_params.m_avoid_replay) continue;
+            CoinSelectionParams updated_selection_params = coin_selection_params;
+            for (const auto& select_filter : ordered_filters) {
+                auto it = filtered_groups.find(select_filter.filter);
+                if (it == filtered_groups.end()) continue;
+                if (updated_selection_params.m_version == TRUC_VERSION && (select_filter.filter.conf_mine == 0 || select_filter.filter.conf_theirs == 0)) {
+                    if (updated_selection_params.m_max_tx_weight > (TRUC_CHILD_MAX_WEIGHT)) {
+                        updated_selection_params.m_max_tx_weight = TRUC_CHILD_MAX_WEIGHT;
+                    }
                 }
-            }
-            if (auto res{AttemptSelection(wallet.chain(), value_to_select, it->second,
-                                          updated_selection_params, select_filter.allow_mixed_output_types)}) {
-                return res; // result found
-            } else {
-                // If any specific error message appears here, then something particularly wrong might have happened.
-                // Save the error and continue the selection process. So if no solutions gets found, we can return
-                // the detailed error to the upper layers.
-                if (HasErrorMsg(res)) res_detailed_errors.emplace_back(std::move(res));
+                if (protect) {
+                    if (auto res{AttemptProtectedSelection(wallet.chain(), value_to_select, it->second,
+                                                           updated_selection_params, select_filter.allow_mixed_output_types)}) {
+                        return res;
+                    }
+                    continue;
+                }
+                if (auto res{AttemptSelection(wallet.chain(), value_to_select, it->second,
+                                              updated_selection_params, select_filter.allow_mixed_output_types)}) {
+                    return res; // result found
+                } else {
+                    // If any specific error message appears here, then something particularly wrong might have happened.
+                    // Save the error and continue the selection process. So if no solutions gets found, we can return
+                    // the detailed error to the upper layers.
+                    if (HasErrorMsg(res)) res_detailed_errors.emplace_back(std::move(res));
+                }
             }
         }
 
@@ -1058,14 +1186,75 @@ bool IsDust(const CRecipient& recipient, const CFeeRate& dustRelayFee)
     return ::IsDust(CTxOut(recipient.nAmount, GetScriptForDestination(recipient.dest)), dustRelayFee);
 }
 
+/**
+ * BIP 462: with -walletdemurragesighash, prefer an input set that protects the
+ * transaction from replay on a chain that does not apply BIP 462, once BIP 462
+ * applies. One input is enough:
+ * - a taproot input, which the wallet signs with SIGHASH_ALL|SIGHASH_DEMURRAGE
+ *   (see CWallet::GetOwnTransactionSighash()), if it has private keys;
+ * - a separated output, which the other chain does not have, whoever signs:
+ *   one descended from a coinbase mined at or after activation, or from a
+ *   wallet transaction with a SIGHASH_DEMURRAGE signature.
+ * There is no preference if a preselected input is one.
+ */
+static void PreferReplayProtection(const CWallet& wallet, const CoinsResult& preset_inputs, CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (!wallet.m_demurrage_sighash) return;
+    // Before BIP 462 applies, there is no other chain to protect the transaction from.
+    if (!GetDemurrageWalletIndex(wallet)) return;
+    const bool taproot{!wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)};
+    std::vector<COutPoint> outpoints;
+    std::map<Txid, bool> demurrage_signed_txs;
+    for (const COutput& coin : preset_inputs.All()) {
+        if (taproot && coin.txout.scriptPubKey.IsPayToTaproot() && wallet.GetTXO(coin.outpoint)) return;
+        if (const CWalletTx* wtx{wallet.GetWalletTx(coin.outpoint.hash)}; wtx && TxDescendsFromDemurrageSignature(wallet, *wtx, demurrage_signed_txs)) return;
+        outpoints.push_back(coin.outpoint);
+    }
+    if (const auto valuation{GetDemurrageValuation(wallet, outpoints)}) {
+        const auto activation_height{static_cast<uint32_t>(wallet.chain().getDemurrageActivationHeight())};
+        for (const auto& [outpoint, coin] : valuation->coins) {
+            if (coin.ref_height >= activation_height) return;
+        }
+    }
+    coin_selection_params.m_avoid_replay = true;
+    coin_selection_params.m_taproot_avoids_replay = taproot;
+}
+
 static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         CWallet& wallet,
-        const std::vector<CRecipient>& vecSend,
+        const std::vector<CRecipient>& recipients,
         std::optional<unsigned int> change_pos,
         const CCoinControl& coin_control,
         bool sign) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
+
+    // BIP 462: until the outputs are converted below, amounts are effective
+    // values at the wallet's last block. A recipient whose amount is nominal at
+    // a given index (see CRecipient::demurrage_index) takes part at its
+    // effective value, rounded up, and gets its exact amount back, re-expressed
+    // at the transaction's reference height, when the outputs are converted.
+    // Rounding up means the fee is never lower than it was computed to be.
+    std::vector<CRecipient> vecSend{recipients};
+    std::map<unsigned int, DemurrageFixedOutput> fixed_recipients;
+    std::optional<uint64_t> wallet_index;
+    for (unsigned int i{0}; i < vecSend.size(); ++i) {
+        CRecipient& recipient{vecSend[i]};
+        if (!recipient.demurrage_index) continue;
+        if (recipient.fSubtractFeeFromAmount) {
+            return util::Error{Untranslated(STR_INTERNAL_BUG("A recipient with a fixed nominal amount cannot pay the fee"))};
+        }
+        if (!wallet_index) wallet_index = GetDemurrageWalletIndex(wallet);
+        const CAmount nominal{recipient.nAmount};
+        std::optional<CAmount> effective{wallet_index ? demurrage::ConvertValue(nominal, *recipient.demurrage_index, *wallet_index) : std::nullopt};
+        if (!effective) {
+            return util::Error{_("Unable to value the transaction's outputs for BIP 462")};
+        }
+        if (demurrage::ConvertValue(*effective, *wallet_index, *recipient.demurrage_index).value_or(nominal) < nominal) ++*effective;
+        fixed_recipients.emplace(i, DemurrageFixedOutput{.nominal = nominal, .index = *recipient.demurrage_index});
+        recipient.nAmount = *effective;
+    }
 
     FastRandomContext rng_fast;
     CMutableTransaction txNew; // The resulting transaction that we make
@@ -1209,6 +1398,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         if (!res_fetch_inputs) return util::Error{util::ErrorString(res_fetch_inputs)};
         preset_inputs = *res_fetch_inputs;
     }
+    PreferReplayProtection(wallet, preset_inputs, coin_selection_params);
 
     // Fetch wallet available coins if "other inputs" are
     // allowed (coins automatically selected by the wallet)
@@ -1402,6 +1592,29 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Give up if change keypool ran out and change is required
     if (scriptChange.empty() && change_pos) {
         return util::Error{error};
+    }
+
+    // BIP 462: coins were selected, and amounts computed, at their effective
+    // value at the wallet's last block. The transaction's reference height is
+    // the highest among its inputs, so express its outputs at that height.
+    std::vector<COutPoint> input_outpoints;
+    for (const CTxIn& txin : txNew.vin) input_outpoints.push_back(txin.prevout);
+    if (const auto valuation{GetDemurrageValuation(wallet, input_outpoints)}) {
+        std::optional<unsigned int> change_index;
+        if (change_pos) change_index = static_cast<unsigned int>(*change_pos);
+        // Recipients are in order, with the change output inserted at change_pos.
+        std::map<unsigned int, DemurrageFixedOutput> fixed_outputs;
+        for (const auto& [recipient_pos, fixed] : fixed_recipients) {
+            fixed_outputs.emplace(change_index && recipient_pos >= *change_index ? recipient_pos + 1 : recipient_pos, fixed);
+        }
+        // The mempool measures the fee as fee_effective in the next block.
+        std::optional<DemurrageFeeFloor> fee_floor;
+        if (const auto next_index{wallet.chain().getDemurrageIndex(valuation->height + 1)}) {
+            fee_floor = DemurrageFeeFloor{.fee = current_fee, .index = *next_index};
+        }
+        if (!ConvertOutputsToRefHeight(txNew, *valuation, change_index, fixed_outputs, fee_floor)) {
+            return util::Error{_("Unable to value the transaction's inputs for BIP 462")};
+        }
     }
 
     if (sign && !wallet.SignTransaction(txNew)) {

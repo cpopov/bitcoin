@@ -1351,6 +1351,145 @@ BOOST_AUTO_TEST_CASE(SelectCoins_effective_value_test)
     BOOST_CHECK(!result);
 }
 
+struct TypedCoin {
+    CAmount value;
+    OutputType type;
+    int depth{144};
+    //! Exists only on a chain that applies BIP 462 (COutput::separated).
+    bool separated{false};
+};
+
+BOOST_AUTO_TEST_CASE(replay_protection_selection_test)
+{
+    // BIP 462: with m_avoid_replay, coin selection returns an input set with a
+    // coin that protects the transaction from replay whenever it can find one:
+    // a taproot output if m_taproot_avoids_replay, or a separated output (one
+    // descended from a post-activation coinbase or a DEMURRAGE-signed transaction).
+    FastRandomContext rand;
+    const auto params{[&](CFeeRate feerate, bool avoid_replay, bool taproot = true) {
+        CoinSelectionParams cs_params{
+            rand,
+            /*change_output_size=*/43,
+            /*change_spend_size=*/58,
+            /*min_change_target=*/CENT,
+            /*effective_feerate=*/feerate,
+            /*long_term_feerate=*/CFeeRate{10'000},
+            /*discard_feerate=*/CFeeRate{3'000},
+            /*tx_noinputs_size=*/10 + 43,
+            /*avoid_partial=*/false,
+        };
+        cs_params.m_change_fee = feerate.GetFee(cs_params.change_output_size);
+        cs_params.m_cost_of_change = cs_params.m_discard_feerate.GetFee(cs_params.change_spend_size) + cs_params.m_change_fee;
+        cs_params.min_viable_change = cs_params.m_discard_feerate.GetFee(cs_params.change_spend_size) + 1;
+        cs_params.m_avoid_replay = avoid_replay;
+        cs_params.m_taproot_avoids_replay = avoid_replay && taproot;
+        return cs_params;
+    }};
+    const auto select{[&](const CoinSelectionParams& cs_params, CAmount target, const std::vector<TypedCoin>& coins) {
+        std::unique_ptr<CWallet> wallet = NewWallet(m_node);
+        LOCK(wallet->cs_wallet);
+        CoinsResult available_coins;
+        for (const TypedCoin& coin : coins) {
+            CMutableTransaction tx;
+            tx.nLockTime = nextLockTime++;
+            tx.vout.emplace_back(coin.value, GetScriptForDestination(*Assert(wallet->GetNewDestination(coin.type, ""))));
+            const Txid txid{tx.GetHash()};
+            const CWalletTx& wtx{wallet->mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(txid),
+                                                           std::forward_as_tuple(MakeTransactionRef(std::move(tx)), TxStateInactive{})).first->second};
+            const CTxOut& txout{wtx.GetTx()->vout.at(0)};
+            COutput output{COutPoint{txid, 0}, txout, coin.depth, CalculateMaximumSignedInputSize(txout, wallet.get(), /*coin_control=*/nullptr),
+                           /*solvable=*/true, /*safe=*/true, wtx.GetTxTime(), /*from_me=*/false, cs_params.m_effective_feerate};
+            output.separated = coin.separated;
+            available_coins.Add(coin.type, output);
+        }
+        auto result{SelectCoins(*wallet, available_coins, /*pre_set_inputs=*/{}, target, CCoinControl{}, cs_params)};
+        BOOST_REQUIRE(result);
+        BOOST_CHECK_GE(result->GetSelectedEffectiveValue(), target);
+        return *result;
+    }};
+    const auto taproot_inputs{[](const SelectionResult& result) {
+        return std::ranges::count_if(result.GetInputSet(), [](const auto& coin) { return coin->txout.scriptPubKey.IsPayToTaproot(); });
+    }};
+    const auto separated_inputs{[](const SelectionResult& result) {
+        return std::ranges::count_if(result.GetInputSet(), [](const auto& coin) { return coin->separated; });
+    }};
+    const CFeeRate low{1'000};
+    const CFeeRate high{20'000};
+
+    // A taproot output, although an output of another type wastes less (below
+    // the long term feerate, a larger input does).
+    {
+        const std::vector<TypedCoin> coins{{1 * COIN, OutputType::BECH32}, {1 * COIN, OutputType::BECH32M}};
+        BOOST_CHECK_EQUAL(taproot_inputs(select(params(low, false), COIN / 2, coins)), 0);
+        const SelectionResult result{select(params(low, true), COIN / 2, coins)};
+        BOOST_CHECK_EQUAL(result.GetInputSet().size(), 1);
+        BOOST_CHECK_EQUAL(taproot_inputs(result), 1);
+    }
+
+    // A taproot output with fewer confirmations, under a looser eligibility filter.
+    {
+        const std::vector<TypedCoin> coins{{1 * COIN, OutputType::BECH32}, {1 * COIN, OutputType::BECH32M, /*depth=*/2}};
+        BOOST_CHECK_EQUAL(taproot_inputs(select(params(high, false), COIN / 2, coins)), 0);
+        BOOST_CHECK_EQUAL(taproot_inputs(select(params(high, true), COIN / 2, coins)), 1);
+    }
+
+    // No type can fund the transaction alone, and the best mix spends no
+    // taproot output (above the long term feerate, fewer inputs waste less):
+    // the taproot output is added to the outputs of other types.
+    const std::vector<TypedCoin> mixed{{3 * COIN, OutputType::BECH32}, {3 * COIN, OutputType::P2SH_SEGWIT}, {COIN / 5, OutputType::BECH32M}};
+    const SelectionResult without_taproot{select(params(high, false), 5 * COIN, mixed)};
+    BOOST_CHECK_EQUAL(without_taproot.GetInputSet().size(), 2);
+    BOOST_CHECK_EQUAL(taproot_inputs(without_taproot), 0);
+    {
+        const SelectionResult result{select(params(high, true), 5 * COIN, mixed)};
+        BOOST_CHECK_EQUAL(result.GetInputSet().size(), 3);
+        BOOST_CHECK_EQUAL(taproot_inputs(result), 1);
+        BOOST_CHECK_EQUAL(result.GetWeight(), without_taproot.GetWeight() + 58 * WITNESS_SCALE_FACTOR);
+    }
+
+    // If the taproot output does not fit in the maximum weight, the selection
+    // is the one without the preference.
+    {
+        CoinSelectionParams cs_params{params(high, true)};
+        cs_params.m_max_tx_weight = (cs_params.tx_noinputs_size + cs_params.change_output_size) * WITNESS_SCALE_FACTOR + without_taproot.GetWeight();
+        BOOST_CHECK_EQUAL(taproot_inputs(select(cs_params, 5 * COIN, mixed)), 0);
+    }
+
+    // Without a taproot output, a separated output, although an output of
+    // another type wastes less.
+    {
+        const std::vector<TypedCoin> coins{{1 * COIN, OutputType::P2SH_SEGWIT}, {.value = 1 * COIN, .type = OutputType::BECH32, .separated = true}};
+        BOOST_CHECK_EQUAL(separated_inputs(select(params(low, false), COIN / 2, coins)), 0);
+        const SelectionResult result{select(params(low, true), COIN / 2, coins)};
+        BOOST_CHECK_EQUAL(result.GetInputSet().size(), 1);
+        BOOST_CHECK_EQUAL(separated_inputs(result), 1);
+    }
+
+    // The best input set of its type does not spend it, and it cannot pay
+    // alone: it is added to that set, without mixing types.
+    {
+        const std::vector<TypedCoin> coins{{1 * COIN, OutputType::BECH32}, {.value = COIN / 5, .type = OutputType::BECH32, .separated = true},
+                                           {1 * COIN, OutputType::P2SH_SEGWIT}};
+        BOOST_CHECK_EQUAL(separated_inputs(select(params(high, false), COIN / 2, coins)), 0);
+        const SelectionResult result{select(params(high, true), COIN / 2, coins)};
+        BOOST_CHECK_EQUAL(result.GetInputSet().size(), 2);
+        BOOST_CHECK_EQUAL(separated_inputs(result), 1);
+        BOOST_CHECK(std::ranges::all_of(result.GetInputSet(), [](const auto& coin) { return !coin->txout.scriptPubKey.IsPayToScriptHash(); }));
+    }
+
+    // Either kind protects the transaction, and the input set that wastes the
+    // least is chosen (above the long term feerate, the smaller taproot input).
+    // A wallet that does not sign with SIGHASH_DEMURRAGE spends the separated output.
+    {
+        const std::vector<TypedCoin> coins{{1 * COIN, OutputType::BECH32M}, {.value = 1 * COIN, .type = OutputType::BECH32, .separated = true}};
+        BOOST_CHECK_EQUAL(taproot_inputs(select(params(high, true), COIN / 2, coins)), 1);
+        BOOST_CHECK_EQUAL(separated_inputs(select(params(high, true, /*taproot=*/false), COIN / 2, coins)), 1);
+    }
+
+    // Without a coin that protects the transaction, the preference has no effect.
+    BOOST_CHECK_EQUAL(select(params(low, true), COIN / 2, {{1 * COIN, OutputType::BECH32}}).GetInputSet().size(), 1);
+}
+
 BOOST_FIXTURE_TEST_CASE(wallet_coinsresult_test, BasicTestingSetup)
 {
     // Test case to verify CoinsResult object sanity.

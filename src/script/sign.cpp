@@ -67,7 +67,9 @@ bool MutableTransactionSignatureCreator::CreateSig(const SigningProvider& provid
     if (sigversion == SigVersion::WITNESS_V0 && !MoneyRange(amount)) return false;
 
     // BASE/WITNESS_V0 signatures don't support explicit SIGHASH_DEFAULT, use SIGHASH_ALL instead.
-    const int hashtype = m_options.sighash_type == SIGHASH_DEFAULT ? SIGHASH_ALL : m_options.sighash_type;
+    // Nor BIP 462's SIGHASH_DEMURRAGE, which is for taproot signatures only: they
+    // use the hash type without it.
+    const int hashtype = m_options.sighash_type == SIGHASH_DEFAULT ? SIGHASH_ALL : (m_options.sighash_type & ~SIGHASH_DEMURRAGE);
 
     // If an input is signed with SIGHASH_SINGLE but there is no output at the same index, the
     // signature commits to no output at all. Which means such a signature stays valid if the
@@ -1047,7 +1049,14 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
     }
     if (spent_outputs.size() == mtx.vin.size()) {
         txdata.Init(txConst, std::move(spent_outputs), true);
+        // BIP 462: signatures that use SIGHASH_DEMURRAGE commit to these values.
+        if (options.demurrage && options.demurrage->input_values.size() == mtx.vin.size()) {
+            txdata.SetDemurrage(options.demurrage->input_values, options.demurrage->committed_ref_height);
+        }
     }
+    // The demurrage data is in txdata; each input's signature creator needs the hash type only.
+    const SignOptions input_options{.sighash_type = options.sighash_type};
+    const bool demurrage_missing{(options.sighash_type & SIGHASH_DEMURRAGE) && !txdata.m_demurrage_ready};
 
     // Sign what we can:
     for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
@@ -1061,7 +1070,7 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
         const CAmount& amount = coin->second.out.nValue;
 
         SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out);
-        ProduceSignature(*keystore, MutableTransactionSignatureCreator(mtx, i, amount, &txdata, options), prevPubKey, sigdata);
+        ProduceSignature(*keystore, MutableTransactionSignatureCreator(mtx, i, amount, &txdata, input_options), prevPubKey, sigdata);
 
         UpdateInput(txin, sigdata);
 
@@ -1073,7 +1082,9 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
 
         ScriptError serror = SCRIPT_ERR_OK;
         if (!sigdata.complete && !VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL), &serror)) {
-            if (serror == SCRIPT_ERR_INVALID_STACK_OPERATION) {
+            if (demurrage_missing && prevPubKey.IsPayToTaproot()) {
+                input_errors[i] = Untranslated("Unable to sign with SIGHASH_DEMURRAGE: the values of the inputs at the transaction's reference height (BIP 462) are unknown");
+            } else if (serror == SCRIPT_ERR_INVALID_STACK_OPERATION) {
                 // Unable to sign input and verification failed (possible attempt to partially sign).
                 input_errors[i] = Untranslated("Unable to sign input, invalid stack size (possibly missing key)");
             } else if (serror == SCRIPT_ERR_SIG_NULLFAIL) {

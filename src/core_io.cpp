@@ -271,6 +271,10 @@ util::Result<int> SighashFromStr(const std::string& sighash)
         {std::string("NONE|ANYONECANPAY"), int(SIGHASH_NONE|SIGHASH_ANYONECANPAY)},
         {std::string("SINGLE"), int(SIGHASH_SINGLE)},
         {std::string("SINGLE|ANYONECANPAY"), int(SIGHASH_SINGLE|SIGHASH_ANYONECANPAY)},
+        // BIP 462. Not combined with ANYONECANPAY.
+        {std::string("ALL|DEMURRAGE"), int(SIGHASH_ALL|SIGHASH_DEMURRAGE)},
+        {std::string("NONE|DEMURRAGE"), int(SIGHASH_NONE|SIGHASH_DEMURRAGE)},
+        {std::string("SINGLE|DEMURRAGE"), int(SIGHASH_SINGLE|SIGHASH_DEMURRAGE)},
     };
     const auto& it = map_sighash_values.find(sighash);
     if (it != map_sighash_values.end()) {
@@ -336,6 +340,9 @@ const std::map<unsigned char, std::string> mapSigHashTypes = {
     {static_cast<unsigned char>(SIGHASH_NONE|SIGHASH_ANYONECANPAY), std::string("NONE|ANYONECANPAY")},
     {static_cast<unsigned char>(SIGHASH_SINGLE), std::string("SINGLE")},
     {static_cast<unsigned char>(SIGHASH_SINGLE|SIGHASH_ANYONECANPAY), std::string("SINGLE|ANYONECANPAY")},
+    {static_cast<unsigned char>(SIGHASH_ALL|SIGHASH_DEMURRAGE), std::string("ALL|DEMURRAGE")},
+    {static_cast<unsigned char>(SIGHASH_NONE|SIGHASH_DEMURRAGE), std::string("NONE|DEMURRAGE")},
+    {static_cast<unsigned char>(SIGHASH_SINGLE|SIGHASH_DEMURRAGE), std::string("SINGLE|DEMURRAGE")},
 };
 
 std::string SighashToStr(int32_t sighash_type)

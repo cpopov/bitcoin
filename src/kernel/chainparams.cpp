@@ -92,6 +92,9 @@ void CChainParams::ApplyDeploymentOptions(const DeploymentOptions& opts)
         case Consensus::BuriedDeployment::DEPLOYMENT_CSV:
             consensus.CSVHeight = int{height};
             break;
+        case Consensus::BuriedDeployment::DEPLOYMENT_DEMURRAGE:
+            consensus.DemurrageHeight = int{height};
+            break;
         }
     }
 
@@ -599,6 +602,12 @@ public:
         consensus.BIP66Height = 1;  // Always active unless overridden
         consensus.CSVHeight = 1;    // Always active unless overridden
         consensus.SegwitHeight = 0; // Always active unless overridden
+        // BIP 462: not active unless overridden with -testactivationheight=demurrage@<height>.
+        // A much higher target than mainnet, so that demurrage is non-zero
+        // while regtest's fast-halving subsidy still exists.
+        consensus.DemurrageHeight = std::numeric_limits<int>::max();
+        consensus.nDemurrageTargetRateNum = 1; // 0.2% per block
+        consensus.nDemurrageTargetRateDen = 500;
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 24 * 60 * 60; // one day
@@ -660,6 +669,16 @@ public:
                 .hash_serialized = AssumeutxoHash{uint256{"106b2c56233e378a824cf0d5ff2be42ed32c72f1605c9be288d00942908a40ac"}},
                 .m_chain_tx_count = 334,
                 .blockhash = uint256{"0c552ced4721c249a389eb9b08cb8da261cd46f0e7b5f9d064d48f3113406853"},
+            },
+            {
+                // For use by test/functional/feature_demurrage_assumeutxo.py, whose
+                // chain applies BIP 462 from height 432
+                // (-testactivationheight=demurrage@432).
+                .height = 600,
+                .hash_serialized = AssumeutxoHash{uint256{"f418caab799076e6a9fcbff721b5322a41cd3269466a9a13676594b55d7e6ca9"}},
+                .m_chain_tx_count = 1001,
+                .blockhash = uint256{"599b7245b716a63ef11dc2062b2e5a128391c1ce6a54c6fd19942342f06e0c46"},
+                .demurrage_states_hash = uint256{"205495c5730195916cce83a05e93d02cb9b1fc12935dec643ae7acaf332160fd"},
             },
         };
 

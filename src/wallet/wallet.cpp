@@ -67,6 +67,7 @@
 #include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
+#include <wallet/receive.h>
 #include <wallet/scan.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/transaction.h>
@@ -1988,16 +1989,42 @@ bool CWallet::SignTransaction(CMutableTransaction& tx) const
         coins[input.prevout] = Coin(wtx.GetTx()->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
     }
     std::map<int, bilingual_str> input_errors;
-    return SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors);
+    return SignTransaction(tx, coins, GetOwnTransactionSighash(tx.vin), input_errors);
+}
+
+int CWallet::GetOwnTransactionSighash(const std::vector<CTxIn>& inputs) const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_demurrage_sighash) return SIGHASH_DEFAULT;
+    // Before BIP 462 applies, a SIGHASH_DEMURRAGE signature is invalid, and
+    // there is no other chain to protect the transaction from. Without the
+    // values of the inputs, the wallet cannot make one.
+    std::vector<COutPoint> outpoints;
+    outpoints.reserve(inputs.size());
+    for (const CTxIn& txin : inputs) outpoints.push_back(txin.prevout);
+    if (!GetDemurrageInputFields(*this, outpoints)) return SIGHASH_DEFAULT;
+    return SIGHASH_ALL | SIGHASH_DEMURRAGE;
 }
 
 bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
 {
+    SignOptions options{.sighash_type = sighash};
+    // BIP 462: signatures that use SIGHASH_DEMURRAGE commit to the values of
+    // the inputs at the transaction's reference height.
+    if (sighash & SIGHASH_DEMURRAGE) {
+        LOCK(cs_wallet);
+        std::vector<COutPoint> outpoints;
+        for (const CTxIn& txin : tx.vin) outpoints.push_back(txin.prevout);
+        if (const std::optional<DemurrageInputFields> fields{GetDemurrageInputFields(*this, outpoints)}) {
+            options.demurrage = DemurrageSigningData{.input_values = fields->values, .committed_ref_height = fields->committed_ref_height};
+        }
+    }
+
     // Try to sign with all ScriptPubKeyMans
     for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
         // spk_man->SignTransaction will return true if the transaction is complete,
         // so we can exit early and return true if that happens
-        if (spk_man->SignTransaction(tx, coins, sighash, input_errors)) {
+        if (spk_man->SignTransaction(tx, coins, options, input_errors)) {
             return true;
         }
     }
@@ -2027,6 +2054,19 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, co
                 // We only need the non_witness_utxo, which is a superset of the witness_utxo.
                 //   The signing code will switch to the smaller witness_utxo if this is ok.
                 input.non_witness_utxo = wtx.GetTx();
+            }
+        }
+    }
+
+    // BIP 462: record each input's reference height and its value at the
+    // transaction's reference height. A signer needs them to sign with
+    // SIGHASH_DEMURRAGE, and to know the fee.
+    {
+        std::vector<COutPoint> outpoints;
+        for (const PSBTInput& input : psbtx.inputs) outpoints.push_back(input.GetOutPoint());
+        if (const std::optional<DemurrageInputFields> fields{GetDemurrageInputFields(*this, outpoints)}) {
+            for (size_t i{0}; i < psbtx.inputs.size(); ++i) {
+                SetDemurrageFields(psbtx.inputs[i], fields->ref_heights[i], fields->values[i]);
             }
         }
     }
@@ -2936,6 +2976,7 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
         warnings.push_back(_("-walletrbf is deprecated and will be fully removed in the next release."));
         wallet->m_signal_rbf = *value;
     }
+    wallet->m_demurrage_sighash = args.GetBoolArg("-walletdemurragesighash", DEFAULT_WALLET_DEMURRAGE_SIGHASH);
 
     wallet->m_keypool_size = std::max(args.GetIntArg("-keypool", DEFAULT_KEYPOOL_SIZE), int64_t{1});
     wallet->m_notify_tx_changed_script = args.GetArg("-walletnotify", "");

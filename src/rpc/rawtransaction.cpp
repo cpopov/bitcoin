@@ -57,6 +57,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <util/vector.h>
+#include <util/any.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -78,6 +79,76 @@ using node::AnalyzePSBT;
 using node::FindCoins;
 using node::GetTransaction;
 using node::NodeContext;
+
+namespace {
+/** BIP 462: the inputs of a transaction, valued as consensus values them in the
+ *  block after the chain tip. */
+struct DemurrageInputs {
+    //! Whether BIP 462 applies to the block after the chain tip.
+    bool applies{false};
+    //! ACTIVATION_HEIGHT
+    int activation_height{0};
+    //! The inputs, valued at the transaction's reference height, if every coin
+    //! the transaction spends is in the UTXO set or the mempool.
+    std::optional<demurrage::InputValues> inputs;
+};
+
+DemurrageInputs GetDemurrageInputs(const std::any& context, const CTransaction& tx)
+{
+    const NodeContext* node{util::AnyPtr<NodeContext>(context)};
+    if (!node || !node->chainman) return {};
+    ChainstateManager& chainman{*node->chainman};
+    LOCK(cs_main);
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    if (!tip || !demurrage::IsActive(tip->nHeight + 1, chainman.GetConsensus())) return {};
+    return DemurrageInputs{
+        .applies = true,
+        .activation_height = chainman.GetConsensus().DemurrageHeight,
+        .inputs = GetMempoolDemurrageInputValues(chainman.ActiveChainstate(), node->mempool.get(), tx),
+    };
+}
+
+/** BIP 462: the fee of a transaction, with its inputs valued as consensus values them. */
+struct DemurrageFee {
+    //! Whether BIP 462 applies to the block after the chain tip.
+    bool applies{false};
+    //! The fee, with the inputs valued at the transaction's reference height, if
+    //! every coin it spends is in the UTXO set or the mempool.
+    std::optional<CAmount> fee;
+};
+
+CAmount SumValues(const std::vector<CAmount>& values)
+{
+    CAmount total{0};
+    for (const CAmount value : values) total += value;
+    return total;
+}
+
+/** BIP 462: the fee of @p tx in the block after the chain tip. */
+DemurrageFee GetDemurrageFee(const std::any& context, const CTransaction& tx)
+{
+    const DemurrageInputs demurrage{GetDemurrageInputs(context, tx)};
+    DemurrageFee result{.applies = demurrage.applies, .fee = std::nullopt};
+    if (demurrage.inputs) result.fee = SumValues(demurrage.inputs->values) - tx.GetValueOut();
+    return result;
+}
+
+/** BIP 462: the fee of a PSBT's transaction, from the PSBT's BIP 462 input fields. */
+std::optional<CAmount> GetPSBTDemurrageFee(const PartiallySignedTransaction& psbtx)
+{
+    const std::optional<DemurrageSigningData> data{GetDemurrageSigningData(psbtx)};
+    const std::optional<CMutableTransaction> unsigned_tx{psbtx.GetUnsignedTx()};
+    if (!data || !unsigned_tx) return std::nullopt;
+    CAmount value_out{0};
+    for (const CTxOut& txout : unsigned_tx->vout) {
+        if (!MoneyRange(txout.nValue) || !MoneyRange(value_out + txout.nValue)) return std::nullopt;
+        value_out += txout.nValue;
+    }
+    const CAmount value_in{SumValues(data->input_values)};
+    if (!MoneyRange(value_in) || value_in < value_out) return std::nullopt;
+    return value_in - value_out;
+}
+} // namespace
 using node::PSBTAnalysis;
 
 static constexpr decltype(CTransaction::version) DEFAULT_RAWTX_VERSION{CTransaction::CURRENT_VERSION};
@@ -198,6 +269,18 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         }
     }
 
+    // BIP 462: record each input's reference height and its value at the
+    // transaction's reference height, if BIP 462 applies to the next block. A
+    // signer needs them to sign with SIGHASH_DEMURRAGE, and to know the fee.
+    if (const std::optional<CMutableTransaction> unsigned_tx{psbtx.GetUnsignedTx()}) {
+        const DemurrageInputs demurrage{GetDemurrageInputs(context, CTransaction{*unsigned_tx})};
+        if (demurrage.inputs && demurrage.inputs->values.size() == psbtx.inputs.size()) {
+            for (size_t i{0}; i < psbtx.inputs.size(); ++i) {
+                SetDemurrageFields(psbtx.inputs[i], demurrage::CommittedRefHeight(demurrage.inputs->ref_heights[i], demurrage.activation_height), demurrage.inputs->values[i]);
+            }
+        }
+    }
+
     std::optional<PrecomputedTransactionData> txdata_res = PrecomputePSBTData(psbtx);
     if (!txdata_res) {
         throw JSONRPCPSBTError(common::PSBTError::INVALID_TX);
@@ -215,8 +298,9 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         // information, as is the case with `descriptorprocesspsbt`
         // Only error for mismatching sighash types as it is critical that the sighash to sign with matches the PSBT's
         const auto sign_result = SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, {.sighash_type = sighash_type, .finalize = finalize}, /*out_sigdata=*/nullptr);
-        if (!sign_result.has_value() && sign_result.error() == common::PSBTError::SIGHASH_MISMATCH) {
-            throw JSONRPCPSBTError(common::PSBTError::SIGHASH_MISMATCH);
+        if (!sign_result.has_value() && (sign_result.error() == common::PSBTError::SIGHASH_MISMATCH ||
+                                         sign_result.error() == common::PSBTError::DEMURRAGE_VALUES_MISSING)) {
+            throw JSONRPCPSBTError(sign_result.error());
         }
     }
 
@@ -964,6 +1048,11 @@ const RPCResult& DecodePSBTInputs()
                 {
                     {RPCResult::Type::STR_HEX, "key", "(key-value pair) An unknown key-value pair"},
                 }},
+                {RPCResult::Type::OBJ, "demurrage", /*optional=*/true, "The BIP 462 fields (proprietary keys with identifier \"bip462\")",
+                {
+                    {RPCResult::Type::NUM, "ref_height", /*optional=*/true, "The reference height of the output spent, in committed form"},
+                    {RPCResult::Type::STR_AMOUNT, "value", /*optional=*/true, "The input's value at the transaction's reference height, in " + CURRENCY_UNIT},
+                }},
                 {RPCResult::Type::ARR, "proprietary", /*optional=*/true, "The input proprietary map",
                 {
                     {RPCResult::Type::OBJ, "", "",
@@ -1113,7 +1202,8 @@ static RPCMethod decodepsbt()
                         }},
                         DecodePSBTInputs(),
                         DecodePSBTOutputs(),
-                        {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The transaction fee paid if all UTXOs slots in the PSBT have been filled."},
+                        {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The transaction fee paid if all UTXOs slots in the PSBT have been filled.\n"
+                            "Once BIP 462 applies to the next block, the inputs are valued at the transaction's reference height, and the fee is shown only if the coins it spends are in the UTXO set or the mempool."},
                     }
                 },
                 RPCExamples{
@@ -1452,6 +1542,16 @@ static RPCMethod decodepsbt()
             in.pushKV("musig2_partial_sigs", musig_partial_sigs);
         }
 
+        // BIP 462
+        const std::optional<uint32_t> demurrage_ref_height{GetDemurrageRefHeight(input)};
+        const std::optional<CAmount> demurrage_value{GetDemurrageValue(input)};
+        if (demurrage_ref_height || demurrage_value) {
+            UniValue demurrage(UniValue::VOBJ);
+            if (demurrage_ref_height) demurrage.pushKV("ref_height", *demurrage_ref_height);
+            if (demurrage_value) demurrage.pushKV("value", ValueFromAmount(*demurrage_value));
+            in.pushKV("demurrage", std::move(demurrage));
+        }
+
         // Proprietary
         if (!input.m_proprietary.empty()) {
             UniValue proprietary(UniValue::VARR);
@@ -1606,7 +1706,19 @@ static RPCMethod decodepsbt()
     }
     result.pushKV("outputs", std::move(outputs));
     if (have_all_utxos) {
-        result.pushKV("fee", ValueFromAmount(total_in - output_value));
+        // BIP 462: once it applies, the inputs are worth their value at the
+        // transaction's reference height. The node values them if it finds the
+        // coins; otherwise the PSBT's BIP 462 fields, if it has them, give it.
+        const std::optional<CMutableTransaction> unsigned_tx{psbtx.GetUnsignedTx()};
+        const DemurrageFee demurrage_fee{unsigned_tx ? GetDemurrageFee(request.context, CTransaction{*unsigned_tx}) : DemurrageFee{}};
+        const std::optional<CAmount> psbt_fee{GetPSBTDemurrageFee(psbtx)};
+        if (demurrage_fee.fee) {
+            result.pushKV("fee", ValueFromAmount(*demurrage_fee.fee));
+        } else if (psbt_fee) {
+            result.pushKV("fee", ValueFromAmount(*psbt_fee));
+        } else if (!demurrage_fee.applies) {
+            result.pushKV("fee", ValueFromAmount(total_in - output_value));
+        }
     }
 
     return result;
@@ -1993,7 +2105,8 @@ static RPCMethod analyzepsbt()
                     }},
                     {RPCResult::Type::NUM, "estimated_vsize", /*optional=*/true, "Estimated vsize of the final signed transaction"},
                     {RPCResult::Type::STR_AMOUNT, "estimated_feerate", /*optional=*/true, "Estimated feerate of the final signed transaction in " + CURRENCY_UNIT + "/kvB. Shown only if all UTXO slots in the PSBT have been filled"},
-                    {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The transaction fee paid. Shown only if all UTXO slots in the PSBT have been filled"},
+                    {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The transaction fee paid. Shown only if all UTXO slots in the PSBT have been filled.\n"
+                        "Once BIP 462 applies to the next block, the inputs are valued at the transaction's reference height, and the fee and feerate are shown only if the coins it spends are in the UTXO set or the mempool."},
                     {RPCResult::Type::STR, "next", "Role of the next person that this psbt needs to go to"},
                     {RPCResult::Type::STR, "error", /*optional=*/true, "Error message (if there is one)"},
                 }
@@ -2011,6 +2124,19 @@ static RPCMethod analyzepsbt()
     const PartiallySignedTransaction& psbtx = *psbt_res;
 
     PSBTAnalysis psbta = AnalyzePSBT(psbtx);
+    // BIP 462: once it applies, value the inputs at the transaction's reference
+    // height: as the node values them if it finds the coins, or as the PSBT's
+    // BIP 462 fields do.
+    if (psbta.fee) {
+        const std::optional<CMutableTransaction> unsigned_tx{psbtx.GetUnsignedTx()};
+        const DemurrageFee demurrage_fee{unsigned_tx ? GetDemurrageFee(request.context, CTransaction{*unsigned_tx}) : DemurrageFee{}};
+        const std::optional<CAmount> psbt_fee{GetPSBTDemurrageFee(psbtx)};
+        if (demurrage_fee.applies || psbt_fee) {
+            psbta.fee = demurrage_fee.fee ? demurrage_fee.fee : psbt_fee;
+            psbta.estimated_feerate = std::nullopt;
+            if (psbta.fee && psbta.estimated_vsize) psbta.estimated_feerate = CFeeRate(*psbta.fee, *psbta.estimated_vsize);
+        }
+    }
 
     UniValue result(UniValue::VOBJ);
     UniValue inputs_result(UniValue::VARR);
@@ -2090,7 +2216,12 @@ RPCMethod descriptorprocesspsbt()
             "       \"SINGLE\"\n"
             "       \"ALL|ANYONECANPAY\"\n"
             "       \"NONE|ANYONECANPAY\"\n"
-            "       \"SINGLE|ANYONECANPAY\""},
+            "       \"SINGLE|ANYONECANPAY\"\n"
+            "       \"ALL|DEMURRAGE\"\n"
+            "       \"NONE|DEMURRAGE\"\n"
+            "       \"SINGLE|DEMURRAGE\"\n"
+            "The DEMURRAGE types (BIP 462) sign taproot inputs with SIGHASH_DEMURRAGE, which commits to the value of every input at the\n"
+            "transaction's reference height, and sign other inputs without it. They are valid once BIP 462 applies to the next block."},
                     {"bip32derivs", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include BIP 32 derivation paths for public keys if we know them"},
                     {"finalize", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also finalize inputs if possible"},
                 },

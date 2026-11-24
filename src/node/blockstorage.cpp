@@ -60,6 +60,7 @@ static constexpr uint8_t DB_BLOCK_INDEX{'b'};
 static constexpr uint8_t DB_FLAG{'F'};
 static constexpr uint8_t DB_REINDEX_FLAG{'R'};
 static constexpr uint8_t DB_LAST_BLOCK{'l'};
+static constexpr uint8_t DB_DEMURRAGE_STATE{'D'};
 // Keys used in previous version that might still be found in the DB:
 // BlockTreeDB::DB_TXINDEX_BLOCK{'T'};
 // BlockTreeDB::DB_TXINDEX{'t'}
@@ -89,7 +90,8 @@ bool BlockTreeDB::ReadLastBlockFile(int& nFile)
     return Read(DB_LAST_BLOCK, nFile);
 }
 
-void BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo)
+void BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo,
+                                 const std::vector<std::pair<uint256, const demurrage::BlockState*>>& demurrage_states)
 {
     CDBBatch batch(*this);
     for (const auto& [file, info] : fileInfo) {
@@ -99,7 +101,29 @@ void BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
     for (const CBlockIndex* bi : blockinfo) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, bi->GetBlockHash()), CDiskBlockIndex{bi});
     }
+    for (const auto& [hash, state] : demurrage_states) {
+        batch.Write(std::make_pair(DB_DEMURRAGE_STATE, hash), *state);
+    }
     WriteBatch(batch, true);
+}
+
+bool BlockTreeDB::LoadDemurrageStates(const std::function<void(const uint256&, const demurrage::BlockState&)>& insert)
+{
+    AssertLockHeld(::cs_main);
+    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    pcursor->Seek(std::make_pair(DB_DEMURRAGE_STATE, uint256()));
+    while (pcursor->Valid()) {
+        std::pair<uint8_t, uint256> key;
+        if (!pcursor->GetKey(key) || key.first != DB_DEMURRAGE_STATE) break;
+        demurrage::BlockState state;
+        if (!pcursor->GetValue(state)) {
+            LogError("%s: failed to read demurrage state\n", __func__);
+            return false;
+        }
+        insert(key.second, state);
+        pcursor->Next();
+    }
+    return true;
 }
 
 void BlockTreeDB::WriteFlag(const std::string& name, bool fValue)
@@ -541,8 +565,28 @@ void BlockManager::WriteBlockIndexDB()
         vBlocks.push_back(*it);
         m_dirty_blockindex.erase(it++);
     }
+    std::vector<std::pair<uint256, const demurrage::BlockState*>> demurrage_states;
+    demurrage_states.reserve(m_dirty_demurrage.size());
+    for (const CBlockIndex* block : m_dirty_demurrage) {
+        demurrage_states.emplace_back(block->GetBlockHash(), &m_demurrage_states.at(block));
+    }
+    m_dirty_demurrage.clear();
     int max_blockfile{this->MaxBlockfileNum()};
-    m_block_tree_db->WriteBatchSync(vFiles, max_blockfile, vBlocks);
+    m_block_tree_db->WriteBatchSync(vFiles, max_blockfile, vBlocks, demurrage_states);
+}
+
+const demurrage::BlockState* BlockManager::GetDemurrageState(const CBlockIndex& block) const
+{
+    AssertLockHeld(::cs_main);
+    const auto it{m_demurrage_states.find(&block)};
+    return it == m_demurrage_states.end() ? nullptr : &it->second;
+}
+
+void BlockManager::SetDemurrageState(const CBlockIndex& block, const demurrage::BlockState& state)
+{
+    AssertLockHeld(::cs_main);
+    m_demurrage_states.insert_or_assign(&block, state);
+    m_dirty_demurrage.insert(&block);
 }
 
 bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
@@ -551,6 +595,13 @@ bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_block
     if (!LoadBlockIndex(snapshot_blockhash)) {
         return false;
     }
+    // BIP 462 per-block demurrage states
+    if (!m_block_tree_db->LoadDemurrageStates([&](const uint256& hash, const demurrage::BlockState& state) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+            if (const CBlockIndex* block{LookupBlockIndex(hash)}) m_demurrage_states.insert_or_assign(block, state);
+        })) {
+        return false;
+    }
+    if (!m_demurrage_states.empty()) LogInfo("Loaded %u BIP 462 demurrage states", m_demurrage_states.size());
     int max_blockfile_num{0};
 
     // Load block file info
@@ -984,8 +1035,19 @@ bool BlockManager::WriteBlockUndo(const CBlockUndo& blockundo, BlockValidationSt
     const BlockfileType type = BlockfileTypeForHeight(block.nHeight);
     auto& cursor = *Assert(m_blockfile_cursors[type]);
 
+    // Undo data is a function of the block and of the UTXO set below it, so a
+    // block that already has it does not get it again. BIP 462 adds the
+    // reference heights of the coins spent: a block first connected by a node
+    // that did not apply BIP 462 (see Chainstate::RewindForDemurrage) has undo
+    // data without them, which is replaced when the block is connected again.
+    bool stale{false};
+    if (!block.GetUndoPos().IsNull() && demurrage::IsActive(block.nHeight, GetConsensus())) {
+        CBlockUndo existing;
+        stale = !ReadBlockUndo(existing, block) || (HashWriter{} << existing).GetHash() != (HashWriter{} << blockundo).GetHash();
+    }
+
     // Write undo information to disk
-    if (block.GetUndoPos().IsNull()) {
+    if (block.GetUndoPos().IsNull() || stale) {
         FlatFilePos pos;
         const auto blockundo_size{static_cast<uint32_t>(GetSerializeSize(blockundo))};
         if (!FindUndoPos(state, block.nFile, pos, blockundo_size + UNDO_DATA_DISK_OVERHEAD)) {

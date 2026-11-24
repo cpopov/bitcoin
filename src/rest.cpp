@@ -8,6 +8,7 @@
 #include <blockfilter.h>
 #include <chain.h>
 #include <coins.h>
+#include <consensus/demurrage.h>
 #include <consensus/params.h>
 #include <core_io.h>
 #include <crypto/hex_base.h>
@@ -1052,12 +1053,27 @@ static bool rest_getutxos(const std::any& context, HTTPRequest* req, const std::
     ChainstateManager& chainman = *maybe_chainman;
     decltype(chainman.ActiveHeight()) active_height;
     uint256 active_hash;
+    // BIP 462: reference height and effective value at the chain tip of each
+    // output found, once BIP 462 is active for the next block (JSON only; the
+    // binary format is unchanged).
+    std::vector<std::optional<std::pair<uint32_t, CAmount>>> demurrage_values;
     {
-        auto process_utxos = [&vOutPoints, &outs, &hits, &active_height, &active_hash, &chainman](const CCoinsView& view, const CTxMemPool* mempool) EXCLUSIVE_LOCKS_REQUIRED(chainman.GetMutex()) {
+        auto process_utxos = [&vOutPoints, &outs, &hits, &active_height, &active_hash, &chainman, &demurrage_values](const CCoinsView& view, const CTxMemPool* mempool) EXCLUSIVE_LOCKS_REQUIRED(chainman.GetMutex()) {
+            const CBlockIndex& tip{*chainman.ActiveTip()};
+            const bool demurrage_active{demurrage::IsActive(tip.nHeight + 1, chainman.GetConsensus())};
             for (const COutPoint& vOutPoint : vOutPoints) {
                 auto coin = !mempool || !mempool->isSpent(vOutPoint) ? view.GetCoin(vOutPoint) : std::nullopt;
                 hits.push_back(coin.has_value());
-                if (coin) outs.emplace_back(std::move(*coin));
+                if (coin) {
+                    std::optional<std::pair<uint32_t, CAmount>> demurrage_value;
+                    if (demurrage_active) {
+                        if (const auto value{GetDemurrageEffectiveValue(chainman.m_blockman, tip, *coin, chainman.GetConsensus())}) {
+                            demurrage_value.emplace(coin->nRefHeight, *value);
+                        }
+                    }
+                    demurrage_values.push_back(demurrage_value);
+                    outs.emplace_back(std::move(*coin));
+                }
             }
             active_height = chainman.ActiveHeight();
             active_hash = chainman.ActiveTip()->GetBlockHash();
@@ -1117,10 +1133,15 @@ static bool rest_getutxos(const std::any& context, HTTPRequest* req, const std::
         objGetUTXOResponse.pushKV("bitmap", bitmapStringRepresentation);
 
         UniValue utxos(UniValue::VARR);
-        for (const CCoin& coin : outs) {
+        for (size_t i{0}; i < outs.size(); ++i) {
+            const CCoin& coin{outs[i]};
             UniValue utxo(UniValue::VOBJ);
             utxo.pushKV("height", coin.nHeight);
             utxo.pushKV("value", ValueFromAmount(coin.out.nValue));
+            if (const auto& demurrage_value{demurrage_values.at(i)}) {
+                utxo.pushKV("ref_height", static_cast<uint64_t>(demurrage_value->first));
+                utxo.pushKV("effective_value", ValueFromAmount(demurrage_value->second));
+            }
 
             // include the script in a json output
             UniValue o(UniValue::VOBJ);

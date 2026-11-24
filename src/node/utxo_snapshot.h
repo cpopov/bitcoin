@@ -6,6 +6,8 @@
 #ifndef BITCOIN_NODE_UTXO_SNAPSHOT_H
 #define BITCOIN_NODE_UTXO_SNAPSHOT_H
 
+#include <consensus/demurrage.h>
+#include <hash.h>
 #include <kernel/chainparams.h>
 #include <kernel/cs_main.h>
 #include <kernel/messagestartchars.h>
@@ -23,6 +25,8 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // UTXO set snapshot magic bytes
 inline constexpr std::array<uint8_t, 5> SNAPSHOT_MAGIC_BYTES = {'u', 't', 'x', 'o', 0xff};
@@ -37,7 +41,11 @@ namespace node {
 class SnapshotMetadata
 {
     static constexpr uint16_t VERSION{2};
-    const std::set<uint16_t> m_supported_versions{VERSION};
+    //! Version 3 adds the BIP 462 demurrage states. It is written only for
+    //! snapshots whose base is at or above ACTIVATION_HEIGHT, so that other
+    //! snapshots keep the version 2 format.
+    static constexpr uint16_t DEMURRAGE_VERSION{3};
+    const std::set<uint16_t> m_supported_versions{VERSION, DEMURRAGE_VERSION};
     const MessageStartChars m_network_magic;
 public:
     //! The hash of the block that reflects the tip of the chain for the
@@ -49,24 +57,32 @@ public:
     //! during snapshot load to estimate progress of UTXO set reconstruction.
     uint64_t m_coins_count = 0;
 
+    //! BIP 462: the demurrage state after each block from ACTIVATION_HEIGHT - 1
+    //! to the base block, in height order (empty if the base block is below
+    //! ACTIVATION_HEIGHT). The assumeutxo data commits to their hash.
+    std::vector<demurrage::BlockState> m_demurrage_states;
+
     SnapshotMetadata(
         const MessageStartChars network_magic) :
             m_network_magic(network_magic) { }
     SnapshotMetadata(
         const MessageStartChars network_magic,
         const uint256& base_blockhash,
-        uint64_t coins_count) :
+        uint64_t coins_count,
+        std::vector<demurrage::BlockState> demurrage_states = {}) :
             m_network_magic(network_magic),
             m_base_blockhash(base_blockhash),
-            m_coins_count(coins_count) { }
+            m_coins_count(coins_count),
+            m_demurrage_states(std::move(demurrage_states)) { }
 
     template <typename Stream>
     inline void Serialize(Stream& s) const {
         s << SNAPSHOT_MAGIC_BYTES;
-        s << VERSION;
+        s << (m_demurrage_states.empty() ? VERSION : DEMURRAGE_VERSION);
         s << m_network_magic;
         s << m_base_blockhash;
         s << m_coins_count;
+        if (!m_demurrage_states.empty()) s << m_demurrage_states;
     }
 
     template <typename Stream>
@@ -102,8 +118,22 @@ public:
 
         s >> m_base_blockhash;
         s >> m_coins_count;
+        if (version == DEMURRAGE_VERSION) {
+            s >> m_demurrage_states;
+            if (m_demurrage_states.empty()) {
+                throw std::ios_base::failure("Version 3 snapshot without BIP 462 demurrage states.");
+            }
+        }
     }
 };
+
+//! BIP 462: the hash of a snapshot's demurrage states, which assumeutxo data commits to.
+inline uint256 DemurrageStatesHash(const std::vector<demurrage::BlockState>& states)
+{
+    HashWriter hasher{};
+    hasher << states;
+    return hasher.GetHash();
+}
 
 //! The file in the snapshot chainstate dir which stores the base blockhash. This is
 //! needed to reconstruct snapshot chainstates on init.

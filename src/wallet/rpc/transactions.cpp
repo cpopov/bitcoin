@@ -39,6 +39,9 @@ static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue
     }
     entry.pushKV("txid", wtx.GetHash().GetHex());
     entry.pushKV("wtxid", wtx.GetWitnessHash().GetHex());
+    if (const auto demurrage_debit{CachedTxGetDemurrageDebit(wallet, wtx)}) {
+        entry.pushKV("ref_height", static_cast<uint64_t>(demurrage_debit->ref_height));
+    }
     UniValue alternate_wtxids(UniValue::VARR);
     for (const auto& [wtxid, _] : wtx.GetTxs()) {
         if (wtxid == wtx.GetWitnessHash()) continue;
@@ -130,7 +133,8 @@ static UniValue ListReceived(const CWallet& wallet, const UniValue& params, cons
                 continue;
 
             tallyitem& item = mapTally[address];
-            item.nAmount += txout.nValue;
+            // BIP 462: outputs are valued at the wallet's last block, like balances.
+            item.nAmount += GetEffectiveTxOutValue(wallet, wtx, txout.nValue);
             item.nConf = std::min(item.nConf, nDepth);
             item.txids.push_back(wtx.GetHash());
         }
@@ -398,6 +402,8 @@ static void PushTxAmountAndFee(const CWallet& wallet, const CWalletTx& wtx, UniV
 {
     CAmount credit = CachedTxGetCredit(wallet, wtx, /*avoid_reuse=*/false);
     CAmount debit = CachedTxGetDebit(wallet, wtx, /*avoid_reuse=*/false);
+    // BIP 462: value the inputs as consensus does, at the transaction's reference height.
+    if (const auto demurrage_debit{CachedTxGetDemurrageDebit(wallet, wtx)}) debit = demurrage_debit->debit;
     CAmount net = credit - debit;
     bool is_from_me = CachedTxIsFromMe(wallet, wtx);
     CAmount fee = (is_from_me ? wtx.GetTx()->GetValueOut() - debit : 0);
@@ -463,6 +469,8 @@ static std::vector<RPCResult> TransactionDescriptionString(bool include_parent_d
            {RPCResult::Type::NUM_TIME, "blocktime", /*optional=*/true, "The block time expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::STR_HEX, "txid", "The transaction id."},
            {RPCResult::Type::STR_HEX, "wtxid", "The hash of serialized transaction, including witness data."},
+           {RPCResult::Type::NUM, "ref_height", /*optional=*/true, "BIP 462 reference height of the transaction. Its amounts and fee are expressed at the\n"
+               "demurrage index of this height, as consensus values them (only if BIP 462 applies to the transaction and its inputs can be valued)."},
            {RPCResult::Type::ARR, "alternate_wtxids", "The wtxids of transactions with different witness data but the same txid.",
            {
                {RPCResult::Type::STR_HEX, "wtxid", "The witness transaction id."},

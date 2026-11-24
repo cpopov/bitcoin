@@ -613,6 +613,7 @@ SIGHASH_ALL = 1
 SIGHASH_NONE = 2
 SIGHASH_SINGLE = 3
 SIGHASH_ANYONECANPAY = 0x80
+SIGHASH_DEMURRAGE = 0x40 # BIP 462, taproot only
 
 def FindAndDelete(script, sig):
     """Consensus critical, see FindAndDelete() in Satoshi codebase"""
@@ -814,7 +815,12 @@ def BIP341_sha_sequences(txTo):
 def BIP341_sha_outputs(txTo):
     return sha256(b"".join(o.serialize() for o in txTo.vout))
 
-def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpath=False, leaf_script=None, codeseparator_pos=-1, annex=None, leaf_ver=LEAF_VERSION_TAPSCRIPT):
+def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpath=False, leaf_script=None, codeseparator_pos=-1, annex=None, leaf_ver=LEAF_VERSION_TAPSCRIPT, demurrage_values=None, ref_height=None):
+    """The BIP 341 signature message.
+
+    BIP 462: with SIGHASH_DEMURRAGE, demurrage_values holds the value of each
+    input at the index of the transaction's reference height, and ref_height
+    that height in committed form."""
     assert_equal(len(txTo.vin), len(spent_utxos))
     assert input_index < len(txTo.vin)
     out_type = SIGHASH_ALL if hash_type == 0 else hash_type & 3
@@ -828,6 +834,12 @@ def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpa
         ss += BIP341_sha_amounts(spent_utxos)
         ss += BIP341_sha_scriptpubkeys(spent_utxos)
         ss += BIP341_sha_sequences(txTo)
+    # Without the values, the message is the one that BIP 341 defines, as for
+    # any other hash type that it does not allow.
+    demurrage = bool(hash_type & SIGHASH_DEMURRAGE) and demurrage_values is not None
+    if demurrage:
+        ss += sha256(b"".join(value.to_bytes(8, "little", signed=True) for value in demurrage_values))
+        ss += ref_height.to_bytes(4, "little")
     if out_type == SIGHASH_ALL:
         ss += BIP341_sha_outputs(txTo)
     spend_type = 0
@@ -854,7 +866,7 @@ def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpa
         ss += TaggedHash("TapLeaf", bytes([leaf_ver]) + ser_string(leaf_script))
         ss += bytes([0])
         ss += codeseparator_pos.to_bytes(4, "little", signed=False)
-    assert_equal(len(ss), 175 - (in_type == SIGHASH_ANYONECANPAY) * 49 - (out_type != SIGHASH_ALL and out_type != SIGHASH_SINGLE) * 32 + (annex is not None) * 32 + scriptpath * 37)
+    assert_equal(len(ss), 175 - (in_type == SIGHASH_ANYONECANPAY) * 49 - (out_type != SIGHASH_ALL and out_type != SIGHASH_SINGLE) * 32 + (annex is not None) * 32 + scriptpath * 37 + demurrage * 36)
     return ss
 
 def TaprootSignatureHash(*args, **kwargs):

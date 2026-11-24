@@ -13,6 +13,7 @@
 #include <clientversion.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
@@ -293,6 +294,18 @@ static bool IsCurrentForFeeEstimation(Chainstate& active_chainstate) EXCLUSIVE_L
     return true;
 }
 
+/** BIP 462: whether a witness of @p tx holds what may be a taproot signature
+ *  that uses SIGHASH_DEMURRAGE: 65 bytes that end with 0x41, 0x42 or 0x43. */
+static bool MayUseSighashDemurrage(const CTransaction& tx)
+{
+    for (const CTxIn& txin : tx.vin) {
+        for (const auto& element : txin.scriptWitness.stack) {
+            if (element.size() == 65 && element.back() >= 0x41 && element.back() <= 0x43) return true;
+        }
+    }
+    return false;
+}
+
 void Chainstate::MaybeUpdateMempoolForReorg(
     DisconnectedBlockTransactions& disconnectpool,
     bool fAddToMempool)
@@ -365,6 +378,43 @@ void Chainstate::MaybeUpdateMempoolForReorg(
             } else {
                 return true;
             }
+        }
+
+        // BIP 462: the inputs, valued at the transaction's reference height on
+        // the new chain, must still cover the outputs. A reorganisation can only
+        // change the index at a reference height if it is at least
+        // COINBASE_MATURITY blocks deep.
+        const Consensus::Params& consensus{m_chainman.GetConsensus()};
+        // Signatures that use SIGHASH_DEMURRAGE commit to those values and to
+        // the reference height, and are valid only from activation, so they
+        // are verified again. The result is cached if nothing changed.
+        const bool demurrage_sighash{MayUseSighashDemurrage(tx)};
+        if (demurrage::IsActive(m_chain.Height() + 1, consensus)) {
+            const std::optional<demurrage::BlockContext> next_block{GetNextDemurrageBlockContext(m_blockman, *m_chain.Tip(), consensus)};
+            if (!next_block) return true;
+            const demurrage::TxContext demurrage_tx{MakeDemurrageTxContext(m_blockman, *m_chain.Tip(), next_block->index, consensus)};
+            CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
+            CCoinsViewCache view{&view_mempool};
+            TxValidationState demurrage_state;
+            CAmount fee;
+            uint32_t ref_height{0};
+            std::vector<CAmount> input_values;
+            if (!Consensus::CheckTxInputs(tx, demurrage_state, view, m_chain.Height() + 1, fee, &demurrage_tx, &ref_height, &input_values)) return true;
+            if (demurrage_sighash) {
+                PrecomputedTransactionData txdata;
+                txdata.SetDemurrage(input_values, demurrage::CommittedRefHeight(ref_height, consensus.DemurrageHeight));
+                TxValidationState script_state;
+                if (!CheckInputScripts(tx, script_state, view, GetBlockScriptFlags(*m_chain.Tip(), m_chainman), CheckInputScriptsFor::Mempool,
+                                       /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata, m_chainman.m_validation_cache)) return true;
+            }
+        } else if (demurrage_sighash) {
+            CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
+            CCoinsViewCache view{&view_mempool};
+            if (!view.HaveInputs(tx)) return true;
+            PrecomputedTransactionData txdata;
+            TxValidationState script_state;
+            if (!CheckInputScripts(tx, script_state, view, GetBlockScriptFlags(*m_chain.Tip(), m_chainman), CheckInputScriptsFor::Mempool,
+                                   /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata, m_chainman.m_validation_cache)) return true;
         }
 
         // If the transaction spends any coinbase outputs, it must be mature.
@@ -810,6 +860,20 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-final");
     }
 
+    // BIP 462: transaction context for valuing inputs in the next block. A
+    // transaction's reference height, and so its validity, does not depend on
+    // the height at which it is mined.
+    const CBlockIndex& demurrage_tip{*Assert(m_active_chainstate.m_chain.Tip())};
+    const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+    std::optional<demurrage::TxContext> demurrage_tx;
+    if (DeploymentActiveAfter(&demurrage_tip, m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_DEMURRAGE)) {
+        const std::optional<demurrage::BlockContext> next_block{GetNextDemurrageBlockContext(m_active_chainstate.m_blockman, demurrage_tip, consensus)};
+        if (!next_block) {
+            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "demurrage-state-unavailable");
+        }
+        demurrage_tx = MakeDemurrageTxContext(m_active_chainstate.m_blockman, demurrage_tip, next_block->index, consensus);
+    }
+
     if (m_pool.exists(tx.GetWitnessHash())) {
         // Exact transaction already exists in the mempool.
         return state.Invalid(TxValidationResult::TX_CONFLICT, "txn-already-in-mempool");
@@ -879,8 +943,25 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
-    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, ws.m_base_fees)) {
+    // BIP 462: inputs are valued at the transaction's reference height, and
+    // CheckTxInputs returns fee(tx) at that height.
+    uint32_t demurrage_ref_height{0};
+    std::vector<CAmount> demurrage_input_values;
+    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, ws.m_base_fees, demurrage_tx ? &*demurrage_tx : nullptr, &demurrage_ref_height, &demurrage_input_values)) {
         return false; // state filled in by CheckTxInputs
+    }
+    if (demurrage_tx) {
+        // Signatures that use SIGHASH_DEMURRAGE commit to these values.
+        ws.m_precomputed_txdata.SetDemurrage(demurrage_input_values, demurrage::CommittedRefHeight(demurrage_ref_height, demurrage_tx->activation_height));
+        // The fees of transactions with different reference heights are not
+        // directly comparable. The mempool keeps fee_effective in the next
+        // block: what a block producer would claim for the transaction, and
+        // the amount to which thresholds such as the minimum relay fee apply.
+        // The ratio between two transactions' fee_effective is the same in
+        // every block, so the conversion is made once, here.
+        ws.m_base_fees = demurrage::EffectiveValue(ws.m_base_fees,
+                                                   *Assert(demurrage_tx->index_at(static_cast<int>(demurrage_ref_height))),
+                                                   *Assert(demurrage_tx->index_at(demurrage_tx->spend_height)));
     }
 
     if (m_pool.m_opts.require_standard) {
@@ -1837,6 +1918,185 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     return nSubsidy;
 }
 
+demurrage::TxContext MakeDemurrageTxContext(const node::BlockManager& blockman, const CBlockIndex& prev, uint64_t spend_index, const Consensus::Params& params)
+{
+    const int spend_height{prev.nHeight + 1};
+    return demurrage::TxContext{
+        .activation_height = params.DemurrageHeight,
+        .spend_height = spend_height,
+        .index_at = [&blockman, &prev, &params, spend_index, spend_height](int height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> std::optional<uint64_t> {
+            AssertLockHeld(::cs_main);
+            if (height > spend_height || height < 0) return std::nullopt;
+            if (height == spend_height) return spend_index;
+            return GetDemurrageIndex(blockman, prev, height, params);
+        },
+    };
+}
+
+std::optional<uint64_t> GetDemurrageIndex(const node::BlockManager& blockman, const CBlockIndex& tip, int height, const Consensus::Params& params)
+{
+    AssertLockHeld(::cs_main);
+    if (height > tip.nHeight || height < 0) return std::nullopt;
+    // I(h) = 1 for every height before activation.
+    if (!demurrage::IsActive(height, params)) return demurrage::INDEX_ONE;
+    const CBlockIndex* block{tip.GetAncestor(height)};
+    if (!block) return std::nullopt;
+    const demurrage::BlockState* state{blockman.GetDemurrageState(*block)};
+    if (!state) return std::nullopt;
+    return state->index;
+}
+
+std::optional<CAmount> GetDemurrageEffectiveValue(const node::BlockManager& blockman, const CBlockIndex& tip, const Coin& coin, const Consensus::Params& params)
+{
+    AssertLockHeld(::cs_main);
+    if (coin.nRefHeight > static_cast<uint32_t>(tip.nHeight)) return std::nullopt;
+    const std::optional<uint64_t> index_created{GetDemurrageIndex(blockman, tip, static_cast<int>(coin.nRefHeight), params)};
+    const std::optional<uint64_t> index_at{GetDemurrageIndex(blockman, tip, tip.nHeight, params)};
+    if (!index_created || !index_at) return std::nullopt;
+    return demurrage::EffectiveValue(coin.out.nValue, *index_created, *index_at);
+}
+
+std::optional<demurrage::InputValues> GetDemurrageInputValues(const node::BlockManager& blockman, const CBlockIndex& tip, const std::vector<Coin>& coins, const Consensus::Params& params)
+{
+    AssertLockHeld(::cs_main);
+    if (coins.empty()) return std::nullopt;
+    demurrage::InputValues result;
+    for (const Coin& coin : coins) result.ref_height = std::max(result.ref_height, coin.nRefHeight);
+    if (result.ref_height > static_cast<uint32_t>(tip.nHeight)) return std::nullopt;
+    const std::optional<uint64_t> tx_index{GetDemurrageIndex(blockman, tip, static_cast<int>(result.ref_height), params)};
+    if (!tx_index) return std::nullopt;
+    for (const Coin& coin : coins) {
+        const std::optional<uint64_t> coin_index{GetDemurrageIndex(blockman, tip, static_cast<int>(coin.nRefHeight), params)};
+        if (!coin_index) return std::nullopt;
+        result.values.push_back(demurrage::EffectiveValue(coin.out.nValue, *coin_index, *tx_index));
+        result.ref_heights.push_back(coin.nRefHeight);
+        result.script_pubkeys.push_back(coin.out.scriptPubKey);
+    }
+    return result;
+}
+
+std::optional<demurrage::InputValues> GetMempoolDemurrageInputValues(Chainstate& chainstate, const CTxMemPool* mempool, const CTransaction& tx)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* tip{chainstate.m_chain.Tip()};
+    if (!tip || tx.IsCoinBase()) return std::nullopt;
+    std::vector<Coin> coins;
+    coins.reserve(tx.vin.size());
+    if (mempool) {
+        LOCK(mempool->cs);
+        CCoinsViewMemPool view{&chainstate.CoinsTip(), *mempool};
+        for (const CTxIn& txin : tx.vin) {
+            std::optional<Coin> coin{view.GetCoin(txin.prevout)};
+            if (!coin) return std::nullopt;
+            coins.push_back(std::move(*coin));
+        }
+    } else {
+        for (const CTxIn& txin : tx.vin) {
+            std::optional<Coin> coin{chainstate.CoinsTip().GetCoin(txin.prevout)};
+            if (!coin) return std::nullopt;
+            coins.push_back(std::move(*coin));
+        }
+    }
+    return GetDemurrageInputValues(chainstate.m_blockman, *tip, coins, chainstate.m_chainman.GetConsensus());
+}
+
+/** BIP 462: context of the block at @p height, whose parent's state is @p prev. */
+static demurrage::BlockContext DemurrageBlockContext(const demurrage::BlockState& prev, int height, const Consensus::Params& params)
+{
+    Assert(demurrage::IsActive(height, params));
+    return demurrage::ComputeBlockContext(prev, GetBlockSubsidy(height, params), params);
+}
+
+std::optional<demurrage::BlockContext> GetNextDemurrageBlockContext(const node::BlockManager& blockman, const CBlockIndex& tip, const Consensus::Params& params)
+{
+    AssertLockHeld(::cs_main);
+    if (!demurrage::IsActive(tip.nHeight + 1, params)) return std::nullopt;
+    const demurrage::BlockState* state{blockman.GetDemurrageState(tip)};
+    if (!state) return std::nullopt;
+    return DemurrageBlockContext(*state, tip.nHeight + 1, params);
+}
+
+static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txundo, int nHeight, std::optional<uint32_t> ref_height);
+
+std::optional<std::vector<CAmount>> GetDemurrageBlockFees(Chainstate& chainstate, const std::vector<CTransactionRef>& txs, uint256* commitment)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex& tip{*Assert(chainstate.m_chain.Tip())};
+    const Consensus::Params& params{chainstate.m_chainman.GetConsensus()};
+    const demurrage::BlockState* prev_state{chainstate.m_blockman.GetDemurrageState(tip)};
+    const std::optional<demurrage::BlockContext> next_block{GetNextDemurrageBlockContext(chainstate.m_blockman, tip, params)};
+    if (!prev_state || !next_block) return std::nullopt;
+    const int height{tip.nHeight + 1};
+    const demurrage::TxContext ctx{MakeDemurrageTxContext(chainstate.m_blockman, tip, next_block->index, params)};
+    CCoinsViewCache view{&chainstate.CoinsTip()};
+    std::vector<CAmount> fees;
+    fees.reserve(txs.size());
+    std::vector<uint256> leaves{demurrage::CoinbaseCommitmentLeaf(height)};
+    leaves.reserve(txs.size() + 1);
+    for (const CTransactionRef& tx : txs) {
+        TxValidationState state;
+        CAmount fee{0};
+        uint32_t ref_height{0};
+        if (!Consensus::CheckTxInputs(*tx, state, view, height, fee, &ctx, &ref_height)) return std::nullopt;
+        // fee_effective(tx, h) = fee(tx) * I(h) / I(ref_height)
+        fees.push_back(demurrage::EffectiveValue(fee, *Assert(ctx.index_at(static_cast<int>(ref_height))), next_block->index));
+        leaves.push_back(demurrage::CommitmentLeaf(tx->GetHash().ToUint256(), demurrage::CommittedRefHeight(ref_height, params.DemurrageHeight)));
+        CTxUndo undo;
+        UpdateCoins(*tx, view, undo, height, ref_height);
+    }
+    if (commitment) *commitment = demurrage::Commitment(*prev_state, *next_block, std::move(leaves));
+    return fees;
+}
+
+bool CheckDemurrageBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockValidationResult result, const CBlockIndex& prev, const Consensus::Params& params)
+{
+    const int height{prev.nHeight + 1};
+    if (!demurrage::IsActive(height, params)) return true;
+
+    // "Activation block": the block at ACTIVATION_HEIGHT sets bit 31 of its
+    // version, so that nodes which do not apply BIP 462 reject it.
+    if (height == params.DemurrageHeight && !(static_cast<uint32_t>(block.nVersion) & demurrage::ACTIVATION_VERSION_BIT)) {
+        return state.Invalid(result, strprintf("bad-version(0x%08x)", block.nVersion),
+                             strprintf("the BIP 462 activation block must set bit 31 of its version (nVersion=0x%08x)", block.nVersion));
+    }
+
+    // "Block timestamps": the two rules of BIP 54, which close the timewarp attack.
+    const int interval{static_cast<int>(params.DifficultyAdjustmentInterval())};
+    if (height % interval == 0 && block.GetBlockTime() < prev.GetBlockTime() - demurrage::MAX_TIMEWARP_SECONDS) {
+        return state.Invalid(result, "time-timewarp-attack", "block's timestamp is too early on diff adjustment block");
+    }
+    if (height % interval == interval - 1) {
+        const CBlockIndex* first{Assert(prev.GetAncestor(height - interval + 1))};
+        if (block.GetBlockTime() < first->GetBlockTime()) {
+            return state.Invalid(result, "time-timewarp-attack", "the last block of a difficulty adjustment period is earlier than its first block");
+        }
+    }
+    return true;
+}
+
+std::optional<CAmount> GetDemurrageCoinbaseLimit(const node::BlockManager& blockman, const CBlockIndex& index, const CBlock& block, const CBlockUndo& undo, const Consensus::Params& params)
+{
+    AssertLockHeld(::cs_main);
+    if (!index.pprev || undo.vtxundo.size() + 1 != block.vtx.size()) return std::nullopt;
+    const CBlockIndex& prev{*index.pprev};
+    const std::optional<demurrage::BlockContext> ctx{GetNextDemurrageBlockContext(blockman, prev, params)};
+    if (!ctx) return std::nullopt;
+    CAmount limit{GetBlockSubsidy(index.nHeight, params) + ctx->dividend};
+    for (size_t i{1}; i < block.vtx.size(); ++i) {
+        // The coins a transaction spent, with their reference heights, are its undo data.
+        const std::optional<demurrage::InputValues> inputs{GetDemurrageInputValues(blockman, prev, undo.vtxundo[i - 1].vprevout, params)};
+        if (!inputs) return std::nullopt;
+        const std::optional<uint64_t> ref_index{GetDemurrageIndex(blockman, prev, static_cast<int>(inputs->ref_height), params)};
+        if (!ref_index) return std::nullopt;
+        CAmount fee{-block.vtx[i]->GetValueOut()};
+        for (const CAmount value : inputs->values) fee += value;
+        if (fee < 0) return std::nullopt;
+        // fee_effective(tx, h) = fee(tx) * I(h) / I(ref_height)
+        limit += demurrage::EffectiveValue(fee, *ref_index, ctx->index);
+    }
+    return limit;
+}
+
 CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
     : m_dbview{std::move(db_params), std::move(options)},
       m_catcherview(&m_dbview) {}
@@ -1989,7 +2249,9 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
     }
 }
 
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
+/** Spend the inputs of @p tx and add its outputs, with BIP 462 reference
+ *  height @p ref_height (the inclusion height if not given). */
+static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txundo, int nHeight, std::optional<uint32_t> ref_height)
 {
     // mark inputs spent
     if (!tx.IsCoinBase()) {
@@ -2001,7 +2263,12 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
         }
     }
     // add outputs
-    AddCoins(inputs, tx, nHeight);
+    AddCoins(inputs, tx, nHeight, /*check=*/false, ref_height);
+}
+
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
+{
+    UpdateCoins(tx, inputs, txundo, nHeight, std::nullopt);
 }
 
 std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
@@ -2066,7 +2333,15 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // transaction).
     uint256 hashCacheEntry;
     CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
-    hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
+    hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags));
+    if (txdata.m_demurrage_ready) {
+        // BIP 462: signatures that use SIGHASH_DEMURRAGE commit to the values
+        // of the inputs and to the transaction's reference height. Neither is
+        // determined by the witness hash, and such signatures are valid only
+        // from the activation height, so both are part of the cache key.
+        hasher.Write(txdata.m_demurrage_input_values_single_hash.begin(), 32).Write((unsigned char*)&txdata.m_demurrage_ref_height, sizeof(txdata.m_demurrage_ref_height));
+    }
+    hasher.Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, !cacheFullScriptStore)) {
         return true;
@@ -2151,6 +2426,7 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out)
         if (!alternate.IsSpent()) {
             undo.nHeight = alternate.nHeight;
             undo.fCoinBase = alternate.fCoinBase;
+            undo.nRefHeight = alternate.nRefHeight;
         } else {
             return DISCONNECT_FAILED; // adding output for transaction without known metadata
         }
@@ -2557,6 +2833,40 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // Get the script flags for this block
     script_verify_flags flags{GetBlockScriptFlags(*pindex, m_chainman)};
 
+    // BIP 462: demurrage state of the parent and context of this block.
+    const Consensus::Params& consensus{params.GetConsensus()};
+    const bool demurrage_active{demurrage::IsActive(pindex->nHeight, consensus)};
+    const demurrage::BlockState* demurrage_prev{demurrage_active ? m_blockman.GetDemurrageState(*pindex->pprev) : nullptr};
+    std::optional<demurrage::BlockContext> demurrage_block;
+    std::optional<demurrage::TxContext> demurrage_tx;
+    demurrage::BlockTotals demurrage_totals;
+    //! Leaves of the demurrage commitment: one per transaction, in block order.
+    std::vector<uint256> demurrage_leaves;
+    //! Ahead of activation, the value of the UTXO set is kept current from the
+    //! block at which this node first computed it (EnsureDemurrageBaseline()),
+    //! so that it is known at ACTIVATION_HEIGHT - 1 without a scan. Every
+    //! output then has I_created = 1.
+    const demurrage::BlockState* baseline_prev{nullptr};
+    if (!demurrage_active && pindex->nHeight >= consensus.DemurrageHeight - 1 - DEMURRAGE_BASELINE_LEAD) {
+        baseline_prev = m_blockman.GetDemurrageState(*pindex->pprev);
+    }
+    if (demurrage_active) {
+        if (!demurrage_prev) {
+            return FatalError(m_chainman.GetNotifications(), state,
+                              _("Missing BIP 462 demurrage state for the previous block. Restart with -reindex-chainstate."));
+        }
+        demurrage_block = DemurrageBlockContext(*demurrage_prev, pindex->nHeight, consensus);
+        demurrage_tx = MakeDemurrageTxContext(m_blockman, *pindex->pprev, demurrage_block->index, consensus);
+        // The header may have been accepted by a version of this node that did
+        // not apply BIP 462, so its header rules are checked here as well.
+        if (!CheckDemurrageBlockHeader(block, state, BlockValidationResult::BLOCK_CONSENSUS, *pindex->pprev, consensus)) {
+            LogWarning("Block validation error: %s", state.ToString());
+            return false;
+        }
+        demurrage_leaves.reserve(block.vtx.size());
+        demurrage_leaves.push_back(demurrage::CoinbaseCommitmentLeaf(pindex->nHeight));
+    }
+
     const auto time_2{SteadyClock::now()};
     m_chainman.time_forks += time_2 - time_1;
     LogDebug(BCLog::BENCH, "    - Fork checks: %.2fms [%.2fs (%.2fms/blk)]\n",
@@ -2600,16 +2910,43 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
         nInputs += tx.vin.size();
 
+        // BIP 462: reference height and index at which this transaction's
+        // outputs are created (the block's own for a coinbase).
+        uint32_t ref_height{static_cast<uint32_t>(pindex->nHeight)};
+        uint64_t output_index{demurrage::INDEX_ONE};
+        if (demurrage_active) output_index = demurrage_block->index;
+
         if (!tx.IsCoinBase())
         {
             CAmount txfee = 0;
             TxValidationState tx_state;
-            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
+            std::vector<CAmount> input_values;
+            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee, demurrage_tx ? &*demurrage_tx : nullptr, &ref_height, &input_values)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(),
                               tx_state.GetDebugMessage() + " in transaction " + tx.GetHash().ToString());
                 break;
+            }
+            if (demurrage_active) {
+                // CheckTxInputs returned the transaction's reference height and
+                // fee(tx) at it; the block producer may claim fee_effective(tx, h) =
+                // fee(tx) * I(h) / I(ref_height).
+                output_index = *Assert(demurrage_tx->index_at(static_cast<int>(ref_height)));
+                txfee = demurrage::EffectiveValue(txfee, output_index, demurrage_block->index);
+                const uint32_t committed_ref_height{demurrage::CommittedRefHeight(ref_height, consensus.DemurrageHeight)};
+                demurrage_leaves.push_back(demurrage::CommitmentLeaf(tx.GetHash().ToUint256(), committed_ref_height));
+                // Signatures that use SIGHASH_DEMURRAGE commit to these values.
+                txsdata[i].SetDemurrage(input_values, committed_ref_height);
+                for (const CTxIn& txin : tx.vin) {
+                    const Coin& coin{view.AccessCoin(txin.prevout)};
+                    const uint64_t coin_index{*Assert(demurrage_tx->index_at(static_cast<int>(coin.nRefHeight)))};
+                    demurrage_totals.normalized_spent += demurrage::NormalizedValue(coin.out.nValue, coin_index);
+                }
+            } else if (baseline_prev) {
+                for (const CTxIn& txin : tx.vin) {
+                    demurrage_totals.normalized_spent += demurrage::NormalizedValue(view.AccessCoin(txin.prevout).out.nValue, demurrage::INDEX_ONE);
+                }
             }
             nFees += txfee;
             if (!MoneyRange(nFees)) {
@@ -2665,11 +3002,21 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             }
         }
 
+        if (demurrage_active || baseline_prev) {
+            // Every output added to the UTXO set, with I_created = I(ref_height).
+            for (const CTxOut& txout : tx.vout) {
+                if (!txout.scriptPubKey.IsUnspendable()) {
+                    demurrage_totals.normalized_created += demurrage::NormalizedValue(txout.nValue, output_index);
+                }
+            }
+        }
+
         CTxUndo undoDummy;
         if (i > 0) {
             blockundo.vtxundo.emplace_back();
         }
-        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight,
+                    demurrage_active ? std::optional<uint32_t>{ref_height} : std::nullopt);
     }
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
@@ -2679,10 +3026,32 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(m_chainman.time_connect),
              Ticks<MillisecondsDouble>(m_chainman.time_connect) / m_chainman.num_blocks_total);
 
-    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
+    const CAmount block_subsidy{GetBlockSubsidy(pindex->nHeight, consensus)};
+    CAmount blockReward = nFees + block_subsidy;
+    if (demurrage_active) {
+        // BIP 462: the coinbase may claim the subsidy, the fees (as
+        // fee_effective) and the demurrage dividend.
+        blockReward = block_subsidy + nFees + demurrage_block->dividend;
+        if (!MoneyRange(blockReward) && state.IsValid()) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount", "coinbase limit out of range");
+        }
+    }
     if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
+    }
+    if (demurrage_active && state.IsValid()) {
+        // BIP 462: the coinbase commits to the demurrage state and to the
+        // reference height of each of the block's transactions.
+        Assert(demurrage_leaves.size() == block.vtx.size());
+        const std::optional<uint256> committed{demurrage::GetCommitment(*block.vtx[0])};
+        const uint256 expected{demurrage::Commitment(*demurrage_prev, *demurrage_block, std::move(demurrage_leaves))};
+        if (!committed) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-commitment-missing", "the coinbase has no BIP 462 demurrage commitment");
+        } else if (*committed != expected) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-demurrage-commitment",
+                          strprintf("BIP 462 demurrage commitment mismatch (actual=%s vs expected=%s)", HexStr(*committed), HexStr(expected)));
+        }
     }
     if (control) {
         auto parallel_result = control->Complete();
@@ -2722,6 +3091,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         m_blockman.m_dirty_blockindex.insert(pindex);
     }
 
+    if (demurrage_active) {
+        m_blockman.SetDemurrageState(*pindex, demurrage::ComputeBlockState(*demurrage_prev, *demurrage_block, demurrage_totals));
+    } else if (baseline_prev) {
+        // Index 1 and no rate: the state holds the value of the UTXO set only.
+        m_blockman.SetDemurrageState(*pindex, demurrage::ComputeBlockState(*baseline_prev, demurrage::BlockContext{}, demurrage_totals));
+    }
+
     // add this block to the view's block chain
     view.SetBestBlock(pindex->GetBlockHash());
 
@@ -2741,6 +3117,47 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         Ticks<std::chrono::nanoseconds>(time_5 - time_start)
     );
 
+    return true;
+}
+
+bool Chainstate::EnsureDemurrageBaseline(const CBlockIndex& prev, BlockValidationState& state)
+{
+    AssertLockHeld(cs_main);
+    const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    const int activation_height{consensus.DemurrageHeight};
+    if (prev.nHeight >= activation_height) return true;
+    if (prev.nHeight + 1 != activation_height) {
+        // Ahead of activation: scanning the UTXO set at the block before
+        // activation would stall every node at the same block. Scan it once at
+        // an earlier height instead, from which ConnectBlock() keeps the
+        // value current.
+        const int first_height{std::max(0, activation_height - 1 - DEMURRAGE_BASELINE_LEAD)};
+        if (prev.nHeight < first_height) return true;
+        if (!m_demurrage_scan_height) {
+            const int last_height{first_height + (activation_height - 1 - first_height) / 2};
+            m_demurrage_scan_height = first_height + static_cast<int>(FastRandomContext{}.randrange(static_cast<uint64_t>(last_height - first_height + 1)));
+        }
+        if (prev.nHeight < *m_demurrage_scan_height) return true;
+    }
+    // The background chainstate of a snapshot computes the baseline itself,
+    // rather than use the one the snapshot carried, so that
+    // MaybeValidateSnapshot() can check the snapshot's states.
+    const bool validating_snapshot{TargetBlock() && !m_demurrage_baseline_computed};
+    if (m_blockman.GetDemurrageState(prev) && !validating_snapshot) return true;
+    Assert(m_chain.Tip() == &prev);
+
+    // U(ACTIVATION_HEIGHT - 1) is the total value of the UTXO set, every output
+    // of which has I_created = I(ACTIVATION_HEIGHT - 1) = 1. Compute it once,
+    // from the flushed UTXO set.
+    LogInfo("BIP 462: computing the value of the UTXO set at height %d for demurrage activation at height %d", prev.nHeight, activation_height);
+    if (!FlushStateToDisk(state, FlushStateMode::FORCE_FLUSH)) return false;
+    const std::optional<kernel::CCoinsStats> stats{ComputeUTXOStats(kernel::CoinStatsHashType::NONE, CoinsDB(), m_blockman)};
+    if (!stats || !stats->total_amount || stats->hashBlock != prev.GetBlockHash()) {
+        return FatalError(m_chainman.GetNotifications(), state, _("Failed to compute the UTXO set value for BIP 462 activation."));
+    }
+    m_blockman.SetDemurrageState(prev, demurrage::BaselineState(*stats->total_amount));
+    m_demurrage_baseline_computed = true;
+    LogInfo("BIP 462: UTXO set value at height %d is %s", prev.nHeight, FormatMoney(*stats->total_amount));
     return true;
 }
 
@@ -3111,6 +3528,10 @@ bool Chainstate::ConnectTip(
     // num_blocks_total may be zero until the ConnectBlock() call below.
     LogDebug(BCLog::BENCH, "  - Load block from disk: %.2fms\n",
              Ticks<MillisecondsDouble>(time_2 - time_1));
+    // BIP 462: the activation block needs the value of the UTXO set below it.
+    if (pindexNew->pprev && !EnsureDemurrageBaseline(*pindexNew->pprev, state)) {
+        return false;
+    }
     {
         CoinsViewOverlay& view{*m_coins_views->m_connect_block_view};
         const auto reset_guard{view.StartFetching(*block_to_connect)};
@@ -3163,6 +3584,14 @@ bool Chainstate::ConnectTip(
         m_chainman.m_options.signals->MempoolTransactionsRemovedForBlock(block_to_connect, std::move(txs_removed_for_block), pindexNew->nHeight);
     }
     UpdateTip(pindexNew);
+
+    // BIP 462: the value of the UTXO set is needed as soon as the tip is the
+    // block before activation, so that transactions and block templates can
+    // be valued for the activation block. It is computed ahead of that block,
+    // and kept current since.
+    if (!EnsureDemurrageBaseline(*pindexNew, state)) {
+        return false;
+    }
 
     const auto time_6{SteadyClock::now()};
     m_chainman.time_post_connect += time_6 - time_5;
@@ -4190,10 +4619,17 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
     }
 
-    // Reject blocks with outdated version
-    if ((block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_HEIGHTINCB)) ||
+    // BIP 462: timestamp rules, and the version of the activation block.
+    if (!CheckDemurrageBlockHeader(block, state, BlockValidationResult::BLOCK_INVALID_HEADER, *pindexPrev, consensusParams)) return false;
+
+    // Reject blocks with outdated version. The block at the BIP 462
+    // ACTIVATION_HEIGHT sets bit 31 of its version, which makes it negative,
+    // so the rule does not apply to it. It applies to every other block, so
+    // none of them can set that bit.
+    if (nHeight != consensusParams.DemurrageHeight &&
+        ((block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_HEIGHTINCB)) ||
         (block.nVersion < 3 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_DERSIG)) ||
-        (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_CLTV))) {
+        (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_CLTV)))) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, strprintf("bad-version(0x%08x)", block.nVersion),
                                  strprintf("rejected nVersion=0x%08x block", block.nVersion));
     }
@@ -4600,6 +5036,12 @@ BlockValidationState TestBlockValidity(
         return state;
     }
 
+    // BIP 462: the activation block needs the value of the UTXO set below it.
+    if (!chainstate.EnsureDemurrageBaseline(*tip, state)) {
+        if (state.IsValid()) NONFATAL_UNREACHABLE();
+        return state;
+    }
+
     // We don't want ConnectBlock to update the actual chainstate, so create
     // a cache on top of it, along with a dummy block index.
     CBlockIndex index_dummy{block};
@@ -4850,14 +5292,30 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
         return false;
     }
 
-    for (const CTransactionRef& tx : block.vtx) {
+    // BIP 462: a transaction's outputs take the highest reference height among
+    // the coins it spends. Those coins may already be spent in the partially
+    // flushed database, so take them from the block's undo data.
+    const bool demurrage_active{demurrage::IsActive(pindex->nHeight, m_chainman.GetConsensus())};
+    CBlockUndo blockundo;
+    if (demurrage_active && (!m_blockman.ReadBlockUndo(blockundo, *pindex) || blockundo.vtxundo.size() + 1 != block.vtx.size())) {
+        LogError("ReplayBlock(): ReadBlockUndo failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+        return false;
+    }
+
+    for (size_t i{0}; i < block.vtx.size(); ++i) {
+        const CTransactionRef& tx{block.vtx[i]};
+        std::optional<uint32_t> ref_height;
         if (!tx->IsCoinBase()) {
             for (const CTxIn &txin : tx->vin) {
                 inputs.SpendCoin(txin.prevout);
             }
+            if (demurrage_active) {
+                ref_height = 0;
+                for (const Coin& spent : blockundo.vtxundo[i - 1].vprevout) ref_height = std::max(*ref_height, spent.nRefHeight);
+            }
         }
         // Pass check = true as every addition may be an overwrite.
-        AddCoins(inputs, *tx, pindex->nHeight, true);
+        AddCoins(inputs, *tx, pindex->nHeight, true, ref_height);
     }
     return true;
 }
@@ -4965,6 +5423,43 @@ bool Chainstate::NeedsRedownload() const
     }
 
     return false;
+}
+
+util::Result<void> Chainstate::RewindForDemurrage()
+{
+    AssertLockHeld(cs_main);
+    const int activation_height{m_chainman.GetConsensus().DemurrageHeight};
+    const CBlockIndex* tip{m_chain.Tip()};
+    if (!tip || tip->nHeight < activation_height || m_blockman.GetDemurrageState(*tip)) return {};
+
+    // A snapshot chainstate cannot be rewound below its base.
+    if (m_from_snapshot_blockhash) {
+        const CBlockIndex* base{m_blockman.LookupBlockIndex(*m_from_snapshot_blockhash)};
+        if (!base || base->nHeight >= activation_height) {
+            return util::Error{strprintf(_("The UTXO snapshot was loaded without the BIP 462 demurrage state, which applies from height %d. Please restart with -reindex."), activation_height)};
+        }
+    }
+    for (const CBlockIndex* block{tip}; block->nHeight >= activation_height; block = block->pprev) {
+        if (!(block->nStatus & BLOCK_HAVE_DATA) || !(block->nStatus & BLOCK_HAVE_UNDO)) {
+            return util::Error{strprintf(_("Blocks from height %d must be validated again under BIP 462 rules, but some of them have been pruned. Please restart with -reindex."), activation_height)};
+        }
+    }
+
+    LogInfo("BIP 462: blocks from height %d to %d were connected without BIP 462 rules; disconnecting them to validate them again",
+            activation_height, tip->nHeight);
+    LOCK(MempoolMutex());
+    BlockValidationState state;
+    while (m_chain.Height() >= activation_height) {
+        if (!DisconnectTip(state, /*disconnectpool=*/nullptr)) {
+            return util::Error{strprintf(_("Failed to disconnect block %d for BIP 462 validation: %s"), m_chain.Height(), state.ToString())};
+        }
+    }
+    if (!FlushStateToDisk(state, FlushStateMode::FORCE_FLUSH)) {
+        return util::Error{strprintf(_("Failed to write the chainstate for BIP 462 validation: %s"), state.ToString())};
+    }
+    // The disconnected blocks remain candidates, and are connected again under
+    // BIP 462 rules when the best chain is activated.
+    return {};
 }
 
 void Chainstate::ClearBlockIndexCandidates()
@@ -5872,6 +6367,44 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
 
     const AssumeutxoData& au_data = *maybe_au_data;
 
+    // BIP 462: a snapshot whose base is at or above ACTIVATION_HEIGHT carries
+    // the demurrage state after each block from ACTIVATION_HEIGHT - 1 to its
+    // base, which the assumeutxo data commits to. Its coins must add up to the
+    // normalized UTXO total of the base block's state.
+    const Consensus::Params& consensus{GetConsensus()};
+    const bool demurrage_active{demurrage::IsActive(base_height, consensus)};
+    const std::vector<demurrage::BlockState>& demurrage_states{metadata.m_demurrage_states};
+    if (demurrage_active) {
+        if (demurrage_states.size() != static_cast<size_t>(base_height - consensus.DemurrageHeight + 2)) {
+            return util::Error{Untranslated(strprintf("Bad snapshot - expected %d BIP 462 demurrage states, got %d",
+                      base_height - consensus.DemurrageHeight + 2, demurrage_states.size()))};
+        }
+        const uint256 demurrage_states_hash{node::DemurrageStatesHash(demurrage_states)};
+        if (au_data.demurrage_states_hash.IsNull() || demurrage_states_hash != au_data.demurrage_states_hash) {
+            return util::Error{Untranslated(strprintf("Bad snapshot BIP 462 demurrage state hash: expected %s, got %s",
+                      au_data.demurrage_states_hash.ToString(), demurrage_states_hash.ToString()))};
+        }
+    } else if (!demurrage_states.empty()) {
+        return util::Error{Untranslated("Bad snapshot - unexpected BIP 462 demurrage states below activation")};
+    }
+    // States already computed by validating blocks are authoritative.
+    {
+        LOCK(::cs_main);
+        for (size_t i{0}; i < demurrage_states.size(); ++i) {
+            const CBlockIndex* block{snapshot_start_block->GetAncestor(consensus.DemurrageHeight - 1 + static_cast<int>(i))};
+            const demurrage::BlockState* existing{m_blockman.GetDemurrageState(*Assert(block))};
+            if (existing && *existing != demurrage_states[i]) {
+                return util::Error{Untranslated(strprintf("Bad snapshot - its BIP 462 demurrage state at height %d conflicts with the validated chain", block->nHeight))};
+            }
+        }
+    }
+    // I(h) at a reference height no higher than the base block.
+    const auto demurrage_index_at = [&](uint32_t height) -> uint64_t {
+        if (!demurrage_active || height < static_cast<uint32_t>(consensus.DemurrageHeight)) return demurrage::INDEX_ONE;
+        return demurrage_states.at(height - (consensus.DemurrageHeight - 1)).index;
+    };
+    arith_uint256 normalized_utxo{};
+
     // This work comparison is a duplicate check with the one performed later in
     // ActivateSnapshot(), but is done so that we avoid doing the long work of staging
     // a snapshot that isn't actually usable.
@@ -5911,6 +6444,16 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
                 if (!MoneyRange(coin.out.nValue)) {
                     return util::Error{Untranslated(strprintf("Bad snapshot data after deserializing %d coins - bad tx out value",
                               coins_count - coins_left))};
+                }
+                // BIP 462: a reference height is never above the coin's height,
+                // and the UTXO set hash flags it in a bit that heights below
+                // 2^30 leave clear.
+                if (coin.nRefHeight > coin.nHeight || coin.nHeight >= (uint32_t{1} << 30)) {
+                    return util::Error{Untranslated(strprintf("Bad snapshot data after deserializing %d coins - bad reference height",
+                              coins_count - coins_left))};
+                }
+                if (demurrage_active) {
+                    normalized_utxo += demurrage::NormalizedValue(coin.out.nValue, demurrage_index_at(coin.nRefHeight));
                 }
                 coins_cache.EmplaceCoinInternalDANGER(outpoint, std::move(coin));
 
@@ -6004,6 +6547,9 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
         return util::Error{Untranslated(strprintf("Bad snapshot content hash: expected %s, got %s",
             au_data.hash_serialized.ToString(), maybe_stats->hashSerialized.ToString()))};
     }
+    if (demurrage_active && normalized_utxo != demurrage_states.back().normalized_utxo) {
+        return util::Error{Untranslated("Bad snapshot - the coins do not match the BIP 462 demurrage state of the base block")};
+    }
 
     snapshot_chainstate.m_chain.SetTip(*snapshot_start_block);
 
@@ -6038,6 +6584,14 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
     assert(index);
     assert(index == snapshot_start_block);
     index->m_chain_tx_count = au_data.m_chain_tx_count;
+
+    // BIP 462: record the demurrage states, which value the coins and the
+    // blocks after the base. The background chainstate computes them again
+    // and MaybeValidateSnapshot() checks them.
+    for (size_t i{0}; i < demurrage_states.size(); ++i) {
+        const CBlockIndex* block{snapshot_start_block->GetAncestor(consensus.DemurrageHeight - 1 + static_cast<int>(i))};
+        if (!m_blockman.GetDemurrageState(*Assert(block))) m_blockman.SetDemurrageState(*block, demurrage_states[i]);
+    }
 
     LogInfo("[snapshot] validated snapshot (%.2f MB)",
         coins_cache.DynamicMemoryUsage() / (1000 * 1000));
@@ -6155,6 +6709,27 @@ SnapshotCompletionResult ChainstateManager::MaybeValidateSnapshot(Chainstate& va
             au_data.hash_serialized.ToString());
         handle_invalid_snapshot();
         return SnapshotCompletionResult::HASH_MISMATCH;
+    }
+
+    // BIP 462: the demurrage states the background chainstate computed for the
+    // blocks up to the snapshot base, which replaced those the snapshot
+    // carried, must hash to the value the assumeutxo data commits to.
+    const Consensus::Params& consensus{GetConsensus()};
+    if (demurrage::IsActive(validated_cs.m_chain.Height(), consensus)) {
+        std::vector<demurrage::BlockState> demurrage_states;
+        for (int height{consensus.DemurrageHeight - 1}; height <= validated_cs.m_chain.Height(); ++height) {
+            const demurrage::BlockState* state{m_blockman.GetDemurrageState(*Assert(validated_cs.m_chain[height]))};
+            if (!state) break;
+            demurrage_states.push_back(*state);
+        }
+        const uint256 demurrage_states_hash{node::DemurrageStatesHash(demurrage_states)};
+        if (demurrage_states.size() != static_cast<size_t>(validated_cs.m_chain.Height() - consensus.DemurrageHeight + 2) ||
+            demurrage_states_hash != au_data.demurrage_states_hash) {
+            LogWarning("[snapshot] BIP 462 demurrage state hash mismatch: actual=%s, expected=%s",
+                demurrage_states_hash.ToString(), au_data.demurrage_states_hash.ToString());
+            handle_invalid_snapshot();
+            return SnapshotCompletionResult::HASH_MISMATCH;
+        }
     }
 
     LogInfo("[snapshot] snapshot beginning at %s has been fully validated",

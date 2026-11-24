@@ -5,6 +5,8 @@
 #include <psbt.h>
 
 #include <common/types.h>
+#include <consensus/amount.h>
+#include <crypto/common.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -619,6 +621,84 @@ void UpdatePSBTOutput(const SigningProvider& provider, PartiallySignedTransactio
     psbt_out.FromSignatureData(sigdata);
 }
 
+namespace {
+/** The key of a BIP 462 input field: a proprietary key with no key data. */
+std::vector<unsigned char> Bip462Key(uint64_t subtype)
+{
+    std::vector<unsigned char> key;
+    VectorWriter{key, 0} << CompactSizeWriter(PSBT_IN_PROPRIETARY) << PSBT_BIP462_IDENTIFIER << CompactSizeWriter(subtype);
+    return key;
+}
+
+const std::vector<unsigned char>* FindBip462Field(const PSBTInput& input, uint64_t subtype)
+{
+    const std::vector<unsigned char> key{Bip462Key(subtype)};
+    for (const PSBTProprietary& entry : input.m_proprietary) {
+        if (entry.key == key) return &entry.value;
+    }
+    return nullptr;
+}
+
+void SetBip462Field(PSBTInput& input, uint64_t subtype, std::vector<unsigned char> value)
+{
+    PSBTProprietary entry{.subtype = subtype, .identifier = PSBT_BIP462_IDENTIFIER, .key = Bip462Key(subtype), .value = std::move(value)};
+    input.m_proprietary.erase(entry);
+    input.m_proprietary.insert(std::move(entry));
+}
+} // namespace
+
+std::optional<uint32_t> GetDemurrageRefHeight(const PSBTInput& input)
+{
+    const std::vector<unsigned char>* value{FindBip462Field(input, PSBT_IN_BIP462_REF_HEIGHT)};
+    if (!value || value->size() != 4) return std::nullopt;
+    return ReadLE32(value->data());
+}
+
+std::optional<CAmount> GetDemurrageValue(const PSBTInput& input)
+{
+    const std::vector<unsigned char>* value{FindBip462Field(input, PSBT_IN_BIP462_VALUE)};
+    if (!value || value->size() != 8) return std::nullopt;
+    const CAmount amount{static_cast<CAmount>(ReadLE64(value->data()))};
+    if (!MoneyRange(amount)) return std::nullopt;
+    return amount;
+}
+
+void SetDemurrageFields(PSBTInput& input, uint32_t committed_ref_height, CAmount value)
+{
+    std::vector<unsigned char> ref_height_bytes(4);
+    WriteLE32(ref_height_bytes.data(), committed_ref_height);
+    SetBip462Field(input, PSBT_IN_BIP462_REF_HEIGHT, std::move(ref_height_bytes));
+    std::vector<unsigned char> value_bytes(8);
+    WriteLE64(value_bytes.data(), static_cast<uint64_t>(value));
+    SetBip462Field(input, PSBT_IN_BIP462_VALUE, std::move(value_bytes));
+}
+
+std::optional<DemurrageSigningData> GetDemurrageSigningData(const PartiallySignedTransaction& psbt)
+{
+    if (psbt.inputs.empty()) return std::nullopt;
+    std::vector<uint32_t> ref_heights;
+    std::vector<CAmount> nominal;
+    DemurrageSigningData data;
+    for (const PSBTInput& input : psbt.inputs) {
+        CTxOut utxo;
+        const std::optional<uint32_t> ref_height{GetDemurrageRefHeight(input)};
+        const std::optional<CAmount> value{GetDemurrageValue(input)};
+        if (!input.GetUTXO(utxo) || !ref_height || !value) return std::nullopt;
+        ref_heights.push_back(*ref_height);
+        nominal.push_back(utxo.nValue);
+        data.input_values.push_back(*value);
+    }
+    // The transaction's reference height is the highest among its inputs'.
+    data.committed_ref_height = *std::max_element(ref_heights.begin(), ref_heights.end());
+    for (size_t i{0}; i < ref_heights.size(); ++i) {
+        // An input is never worth more than its nominal value, and is worth
+        // exactly that at its own reference height.
+        if (data.input_values[i] > nominal[i]) return std::nullopt;
+        if (ref_heights[i] == data.committed_ref_height && data.input_values[i] != nominal[i]) return std::nullopt;
+    }
+    return data;
+}
+
 std::optional<PrecomputedTransactionData> PrecomputePSBTData(const PartiallySignedTransaction& psbt)
 {
     std::optional<CMutableTransaction> unsigned_tx = psbt.GetUnsignedTx();
@@ -634,6 +714,10 @@ std::optional<PrecomputedTransactionData> PrecomputePSBTData(const PartiallySign
     PrecomputedTransactionData txdata;
     if (have_all_spent_outputs) {
         txdata.Init(tx, std::move(utxos), true);
+        // BIP 462: signatures that use SIGHASH_DEMURRAGE commit to these values.
+        if (const std::optional<DemurrageSigningData> demurrage{GetDemurrageSigningData(psbt)}) {
+            txdata.SetDemurrage(demurrage->input_values, demurrage->committed_ref_height);
+        }
     } else {
         txdata.Init(tx, {}, true);
     }
@@ -688,6 +772,9 @@ util::Expected<void, PSBTError> SignPSBTInput(const SigningProvider& provider, P
     // for all input types, and not SIGHASH_ALL for non-taproot input types.
     // If neither are provided, use SIGHASH_DEFAULT if it is taproot, and SIGHASH_ALL for everything else.
     int sighash{options.sighash_type.value_or(utxo.scriptPubKey.IsPayToTaproot() ? SIGHASH_DEFAULT : SIGHASH_ALL)};
+    // BIP 462: SIGHASH_DEMURRAGE is for taproot signatures only. Other inputs
+    // are signed with the hash type without it.
+    if (!utxo.scriptPubKey.IsPayToTaproot()) sighash &= ~SIGHASH_DEMURRAGE;
 
     // For user safety, the desired sighash must be provided if the PSBT wants something other than the default set in the previous line.
     if (input.sighash_type && input.sighash_type != sighash) {
@@ -719,6 +806,12 @@ util::Expected<void, PSBTError> SignPSBTInput(const SigningProvider& provider, P
         for (const auto& [_, sig] : input.partial_sigs) {
             if (sig.second.back() != sighash) return util::Unexpected{PSBTError::SIGHASH_MISMATCH};
         }
+    }
+
+    // BIP 462: a signature that uses SIGHASH_DEMURRAGE commits to the values of
+    // the inputs, which are in txdata only if the PSBT holds them.
+    if (txdata && (sighash & SIGHASH_DEMURRAGE) && !txdata->m_demurrage_ready) {
+        return util::Unexpected{PSBTError::DEMURRAGE_VALUES_MISSING};
     }
 
     sigdata.witness = false;

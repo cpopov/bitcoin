@@ -532,8 +532,11 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         CAmount txfee = 0;
         assert(!tx.IsCoinBase());
         assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight, txfee));
+        // BIP 462: outputs take the highest reference height among the coins spent.
+        uint32_t ref_height{0};
+        for (const auto& input: tx.vin) ref_height = std::max(ref_height, mempoolDuplicate.AccessCoin(input.prevout).nRefHeight);
         for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
-        AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max());
+        AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max(), /*check=*/false, ref_height);
     }
     for (auto it = mapNextTx.cbegin(); it != mapNextTx.cend(); it++) {
         indexed_transaction_set::const_iterator it2 = it->second;
@@ -801,7 +804,8 @@ std::optional<Coin> CCoinsViewMemPool::GetCoin(const COutPoint& outpoint) const
     CTransactionRef ptx = mempool.get(outpoint.hash);
     if (ptx) {
         if (outpoint.n < ptx->vout.size()) {
-            Coin coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false);
+            // BIP 462: outputs of unconfirmed transactions carry their reference height.
+            Coin coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false, GetRefHeight(*ptx));
             m_non_base_coins.emplace(outpoint);
             return coin;
         }
@@ -810,10 +814,31 @@ std::optional<Coin> CCoinsViewMemPool::GetCoin(const COutPoint& outpoint) const
     return base->GetCoin(outpoint);
 }
 
+uint32_t CCoinsViewMemPool::GetRefHeight(const CTransaction& tx) const
+{
+    if (const auto it{m_ref_heights.find(tx.GetHash())}; it != m_ref_heights.end()) return it->second;
+    uint32_t ref_height{0};
+    for (const CTxIn& txin : tx.vin) {
+        std::optional<uint32_t> input_ref;
+        if (const auto it{m_temp_added.find(txin.prevout)}; it != m_temp_added.end()) {
+            input_ref = it->second.nRefHeight;
+        } else if (const CTransactionRef parent{mempool.get(txin.prevout.hash)}) {
+            input_ref = GetRefHeight(*parent);
+        } else if (const std::optional<Coin> coin{base->PeekCoin(txin.prevout)}) {
+            input_ref = coin->nRefHeight;
+        }
+        if (!input_ref || *input_ref == MEMPOOL_HEIGHT) return MEMPOOL_HEIGHT;
+        ref_height = std::max(ref_height, *input_ref);
+    }
+    m_ref_heights.emplace(tx.GetHash(), ref_height);
+    return ref_height;
+}
+
 void CCoinsViewMemPool::PackageAddTransaction(const CTransactionRef& tx)
 {
+    const uint32_t ref_height{GetRefHeight(*tx)};
     for (unsigned int n = 0; n < tx->vout.size(); ++n) {
-        m_temp_added.emplace(COutPoint(tx->GetHash(), n), Coin(tx->vout[n], MEMPOOL_HEIGHT, false));
+        m_temp_added.emplace(COutPoint(tx->GetHash(), n), Coin(tx->vout[n], MEMPOOL_HEIGHT, false, ref_height));
         m_non_base_coins.emplace(tx->GetHash(), n);
     }
 }

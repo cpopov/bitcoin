@@ -133,6 +133,8 @@ inline constexpr bool DEFAULT_WALLET_REJECT_LONG_CHAINS{true};
 inline constexpr unsigned int DEFAULT_TX_CONFIRM_TARGET = 6;
 //! -walletrbf default
 inline constexpr bool DEFAULT_WALLET_RBF = true;
+//! -walletdemurragesighash default
+inline constexpr bool DEFAULT_WALLET_DEMURRAGE_SIGHASH{false};
 inline constexpr bool DEFAULT_WALLETBROADCAST = true;
 inline constexpr bool DEFAULT_DISABLE_WALLET = false;
 inline constexpr bool DEFAULT_WALLETCROSSCHAIN = false;
@@ -308,6 +310,13 @@ struct CRecipient
     CTxDestination dest;
     CAmount nAmount;
     bool fSubtractFeeFromAmount;
+    //! BIP 462: if set, nAmount is a nominal amount expressed at this demurrage
+    //! index (an output of a transaction being replaced, for example), not an
+    //! effective value at the wallet's last block. The output keeps that
+    //! amount, re-expressed at the new transaction's reference height, so it is
+    //! unchanged if the reference height is. Cannot be combined with
+    //! fSubtractFeeFromAmount.
+    std::optional<uint64_t> demurrage_index{};
 };
 
 
@@ -639,8 +648,19 @@ public:
 
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 
-    /** Fetch the inputs and sign with SIGHASH_ALL. */
+    /** Fetch the inputs and sign with GetOwnTransactionSighash(). */
     bool SignTransaction(CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /**
+     * The hash type with which the wallet signs the transactions it sends.
+     *
+     * BIP 462: with -walletdemurragesighash, it is SIGHASH_ALL|SIGHASH_DEMURRAGE
+     * once BIP 462 applies to the next block and the wallet knows the value of
+     * every input at the transaction's reference height. A transaction with a
+     * taproot input that the wallet signs is then valid only on a chain that
+     * applies BIP 462, which protects it from replay on a chain that does not.
+     * Otherwise, it is SIGHASH_DEFAULT.
+     */
+    int GetOwnTransactionSighash(const std::vector<CTxIn>& inputs) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sign the tx given the input coins and sighash. */
     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
@@ -694,6 +714,10 @@ public:
      * cannot fund the transaction otherwise. */
     bool m_spend_zero_conf_change{DEFAULT_SPEND_ZEROCONF_CHANGE};
     bool m_signal_rbf{DEFAULT_WALLET_RBF};
+    /** BIP 462: sign the wallet's own transactions with SIGHASH_DEMURRAGE, and
+     *  prefer an input that protects them from replay in coin selection
+     *  (-walletdemurragesighash). */
+    bool m_demurrage_sighash{DEFAULT_WALLET_DEMURRAGE_SIGHASH};
     bool m_allow_fallback_fee{true}; //!< will be false if -fallbackfee=0
     CFeeRate m_min_fee{DEFAULT_TRANSACTION_MINFEE};
     /**
@@ -978,6 +1002,12 @@ public:
     bool HasEncryptionKeys() const override;
     bool HaveCryptedKeys() const;
 
+    /** Whether the wallet has processed a block, so that GetLastBlockHeight() can be called. */
+    bool HaveLastBlock() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        AssertLockHeld(cs_wallet);
+        return m_last_block_processed_height >= 0;
+    }
     /** Get last block processed height */
     int GetLastBlockHeight() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {

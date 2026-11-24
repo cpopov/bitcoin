@@ -162,6 +162,63 @@ def add_witness_commitment(block, nonce=0):
     block.hashMerkleRoot = block.calc_merkle_root()
 
 
+# BIP 462: the first four bytes of SHA256("BIP462"), and the bit of the header
+# version that the block at the activation height must set.
+DEMURRAGE_COMMITMENT_HEADER = bytes.fromhex("9996b0b3")
+DEMURRAGE_ACTIVATION_VERSION_BIT = 1 << 31
+
+
+def demurrage_activation_version(version=VERSIONBITS_LAST_OLD_BLOCK_VERSION):
+    """BIP 462: version with bit 31 set, as a signed 32-bit integer."""
+    return (version | DEMURRAGE_ACTIVATION_VERSION_BIT) - (1 << 32)
+
+
+def get_demurrage_commitment(*, index, rate, prev_normalized, height, activation_height, txs=()):
+    """BIP 462: the demurrage commitment of a block.
+
+    index and rate are I(height) and r(height), and prev_normalized is
+    N(height - 1). txs holds a (txid as an integer, reference height) pair for
+    each of the block's transactions but the coinbase, in block order."""
+    def leaf(txid, ref_height):
+        # Reference heights below activation are committed as ACTIVATION_HEIGHT - 1.
+        return hash256(ser_uint256(txid) + max(ref_height, activation_height - 1).to_bytes(4, "little"))
+
+    leaves = [hash256(bytes(32) + height.to_bytes(4, "little"))]
+    leaves += [leaf(txid, ref_height) for txid, ref_height in txs]
+    root = ser_uint256(CBlock.get_merkle_root(leaves))
+    state = index.to_bytes(8, "little") + rate.to_bytes(8, "little") + prev_normalized.to_bytes(32, "little")
+    return hash256(state + root)
+
+
+def get_demurrage_commitment_script(commitment):
+    return CScript([OP_RETURN, DEMURRAGE_COMMITMENT_HEADER + commitment])
+
+
+def add_demurrage_commitment(block, node=None, *, ref_heights=(), script=None):
+    """Add a BIP 462 demurrage commitment to the block's coinbase transaction.
+
+    Either pass the output script (for example a block template's
+    default_demurrage_commitment, if the block holds the template's
+    transactions), or pass the node whose tip the block extends, and the
+    reference height of each of the block's transactions but the coinbase."""
+    if script is None:
+        info = node.getdemurrageinfo()
+        next_block = info["next_block"]
+        assert_equal(len(ref_heights), len(block.vtx) - 1)
+        script = get_demurrage_commitment_script(get_demurrage_commitment(
+            index=next_block["index"],
+            rate=next_block["rate"],
+            prev_normalized=int(info["normalized_utxo"], 16),
+            height=next_block["height"],
+            activation_height=info["activation_height"],
+            txs=[(tx.txid_int, ref_height) for tx, ref_height in zip(block.vtx[1:], ref_heights)],
+        ))
+    elif isinstance(script, str):
+        script = bytes.fromhex(script)
+    block.vtx[0].vout.append(CTxOut(0, script))
+    block.hashMerkleRoot = block.calc_merkle_root()
+
+
 def script_BIP34_coinbase_height(height, *, padding=True):
     if height <= 16:
         res = CScriptOp.encode_op_n(height)

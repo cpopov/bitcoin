@@ -14,6 +14,7 @@
 #include <chainparamsbase.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
@@ -728,6 +729,7 @@ static RPCMethod getblocktemplate()
                 {RPCResult::Type::NUM, "height", "The height of the next block"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "Only on signet"},
                 {RPCResult::Type::STR_HEX, "default_witness_commitment", /*optional=*/true, "a valid witness commitment for the unmodified block template"},
+                {RPCResult::Type::STR_HEX, "default_demurrage_commitment", /*optional=*/true, "a valid BIP 462 demurrage commitment for the unmodified block template (from the BIP 462 activation height)"},
             }},
         },
         RPCExamples{
@@ -1055,9 +1057,13 @@ static RPCMethod getblocktemplate()
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
     }
 
-    if (const auto& coinbase{block_template->m_coinbase_tx}; coinbase.required_outputs.size() > 0) {
-        CHECK_NONFATAL(coinbase.required_outputs.size() == 1); // Only one output is currently expected
-        result.pushKV("default_witness_commitment", HexStr(coinbase.required_outputs[0].scriptPubKey));
+    // The witness commitment and, from the BIP 462 activation height, the
+    // demurrage commitment.
+    for (const CTxOut& output : block_template->m_coinbase_tx.required_outputs) {
+        const bool demurrage_commitment{demurrage::IsCommitmentScript(output.scriptPubKey)};
+        const std::string key{demurrage_commitment ? "default_demurrage_commitment" : "default_witness_commitment"};
+        CHECK_NONFATAL(!result.exists(key)); // One output of each kind is expected
+        result.pushKV(key, HexStr(output.scriptPubKey));
     }
 
     return result;

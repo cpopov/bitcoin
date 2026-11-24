@@ -73,6 +73,14 @@ inline constexpr uint8_t PSBT_IN_MUSIG2_PUB_NONCE = 0x1b;
 inline constexpr uint8_t PSBT_IN_MUSIG2_PARTIAL_SIG = 0x1c;
 inline constexpr uint8_t PSBT_IN_PROPRIETARY = 0xFC;
 
+// BIP 462 input fields. Their key types are not assigned yet, so they are
+// proprietary keys with identifier "bip462" and no key data.
+inline const std::vector<unsigned char> PSBT_BIP462_IDENTIFIER{'b', 'i', 'p', '4', '6', '2'};
+//! The reference height of the output spent, in committed form (4 bytes, little-endian).
+inline constexpr uint64_t PSBT_IN_BIP462_REF_HEIGHT = 0x00;
+//! The input's value at the transaction's reference height (8 bytes, little-endian).
+inline constexpr uint64_t PSBT_IN_BIP462_VALUE = 0x01;
+
 // Output types
 inline constexpr uint8_t PSBT_OUT_REDEEMSCRIPT = 0x00;
 inline constexpr uint8_t PSBT_OUT_WITNESSSCRIPT = 0x01;
@@ -1627,8 +1635,32 @@ enum class PSBTRole {
 
 std::string PSBTRoleName(PSBTRole role);
 
-/** Compute a PrecomputedTransactionData object from a psbt. */
+/** Compute a PrecomputedTransactionData object from a psbt. It holds the BIP 462
+ *  data of GetDemurrageSigningData() if the PSBT has it. */
 std::optional<PrecomputedTransactionData> PrecomputePSBTData(const PartiallySignedTransaction& psbt);
+
+/** BIP 462: the reference height, in committed form, of the output that @p input
+ *  spends, if the PSBT records it. */
+std::optional<uint32_t> GetDemurrageRefHeight(const PSBTInput& input);
+
+/** BIP 462: the value of @p input at the transaction's reference height, if the
+ *  PSBT records it. */
+std::optional<CAmount> GetDemurrageValue(const PSBTInput& input);
+
+/** BIP 462: record both fields of @p input, replacing any earlier ones. */
+void SetDemurrageFields(PSBTInput& input, uint32_t committed_ref_height, CAmount value);
+
+/**
+ * BIP 462: what signatures that use SIGHASH_DEMURRAGE commit to, from the
+ * PSBT's fields. Returns nullopt unless every input has both fields and its
+ * UTXO, and the values are consistent with the UTXOs: no input is worth more
+ * than its nominal value, and the inputs at the transaction's reference
+ * height (the highest of the inputs' reference heights) are worth exactly
+ * their nominal value. Values that pass these checks can still be wrong. A
+ * signature that commits to wrong values is invalid, so the fee a valid
+ * signature pays is the one these values give.
+ */
+std::optional<DemurrageSigningData> GetDemurrageSigningData(const PartiallySignedTransaction& psbt);
 
 /** Checks whether a PSBTInput is already signed by checking for non-null finalized fields. */
 bool PSBTInputSigned(const PSBTInput& input);

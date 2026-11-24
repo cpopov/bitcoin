@@ -74,6 +74,11 @@ struct CCoinsStats {
 
 uint64_t GetBogoSize(const CScript& script_pub_key);
 
+//! BIP 462: flag in a hashed coin's code marking a reference height that
+//! differs from the coin's height (see TxOutSer). UTXO snapshots with coins at
+//! or above height 2^30, which would set it, are rejected.
+inline constexpr uint32_t REF_HEIGHT_HASH_FLAG{uint32_t{1} << 31};
+
 void ApplyCoinHash(MuHash3072& muhash, const COutPoint& outpoint, const Coin& coin);
 void RemoveCoinHash(MuHash3072& muhash, const COutPoint& outpoint, const Coin& coin);
 

@@ -10,6 +10,7 @@
 #include <coins.h>
 #include <common/args.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <crypto/muhash.h>
 #include <dbwrapper.h>
 #include <index/base.h>
@@ -28,6 +29,7 @@
 #include <util/log.h>
 #include <validation.h>
 
+#include <algorithm>
 #include <compare>
 #include <limits>
 #include <string>
@@ -82,6 +84,22 @@ struct DBVal {
         SER_READ(obj, obj.total_coinbase_amount = UintToArith256(coinbase));
     }
 };
+
+/**
+ * BIP 462: the reference height of the outputs of transaction @p pos of
+ * @p block, as ConnectBlock recorded it in the UTXO set: the highest reference
+ * height among the coins the transaction spent, which the block's undo data
+ * holds. For a coinbase, and before activation, it is the block's height.
+ */
+uint32_t OutputRefHeight(const interfaces::BlockInfo& block, size_t pos)
+{
+    if (pos == 0 || !demurrage::IsActive(block.height, Params().GetConsensus())) return static_cast<uint32_t>(block.height);
+    uint32_t ref_height{0};
+    for (const Coin& spent : Assert(block.undo_data)->vtxundo.at(pos - 1).vprevout) {
+        ref_height = std::max(ref_height, spent.nRefHeight);
+    }
+    return ref_height;
+}
 }; // namespace
 
 std::unique_ptr<CoinStatsIndex> g_coin_stats_index;
@@ -131,9 +149,10 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
                 continue;
             }
 
+            const uint32_t ref_height{OutputRefHeight(block, i)};
             for (uint32_t j = 0; j < tx->vout.size(); ++j) {
                 const CTxOut& out{tx->vout[j]};
-                const Coin coin{out, block.height, is_coinbase};
+                const Coin coin{out, block.height, is_coinbase, ref_height};
                 const COutPoint outpoint{tx->GetHash(), j};
 
                 // Skip unspendable coins
@@ -182,10 +201,32 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
     // new outputs + coinbase + current unspendable amount this means
     // the miner did not claim the full block reward. Unclaimed block
     // rewards are also unspendable.
-    const CAmount temp_total_unspendable_amount{m_total_unspendables_genesis_block + m_total_unspendables_bip30 + m_total_unspendables_scripts + m_total_unspendables_unclaimed_rewards};
-    const arith_uint256 unclaimed_rewards{(m_total_prevout_spent_amount + m_total_subsidy) - (m_total_new_outputs_ex_coinbase_amount + m_total_coinbase_amount + temp_total_unspendable_amount)};
-    assert(unclaimed_rewards <= arith_uint256(std::numeric_limits<CAmount>::max()));
-    m_total_unspendables_unclaimed_rewards += static_cast<CAmount>(unclaimed_rewards.GetLow64());
+    if (block.height > 0 && demurrage::IsActive(block.height, Params().GetConsensus())) {
+        // BIP 462: the coinbase may claim the subsidy, each transaction's
+        // fee_effective and the demurrage dividend. The dividend is minted at
+        // face value and fees are converted between indexes, so nominal amounts
+        // no longer balance: the unclaimed amount is the coinbase limit less
+        // what the coinbase claimed.
+        std::optional<CAmount> limit;
+        {
+            LOCK(::cs_main);
+            const node::BlockManager& blockman{m_chainstate->m_blockman};
+            if (const CBlockIndex* index{blockman.LookupBlockIndex(block.hash)}) {
+                limit = GetDemurrageCoinbaseLimit(blockman, *index, *block.data, *Assert(block.undo_data), Params().GetConsensus());
+            }
+        }
+        const CAmount claimed{block.data->vtx.at(0)->GetValueOut()};
+        if (!limit || claimed > *limit) {
+            LogError("could not determine the BIP 462 coinbase limit of block %s", block.hash.ToString());
+            return false;
+        }
+        m_total_unspendables_unclaimed_rewards += *limit - claimed;
+    } else {
+        const CAmount temp_total_unspendable_amount{m_total_unspendables_genesis_block + m_total_unspendables_bip30 + m_total_unspendables_scripts + m_total_unspendables_unclaimed_rewards};
+        const arith_uint256 unclaimed_rewards{(m_total_prevout_spent_amount + m_total_subsidy) - (m_total_new_outputs_ex_coinbase_amount + m_total_coinbase_amount + temp_total_unspendable_amount)};
+        assert(unclaimed_rewards <= arith_uint256(std::numeric_limits<CAmount>::max()));
+        m_total_unspendables_unclaimed_rewards += static_cast<CAmount>(unclaimed_rewards.GetLow64());
+    }
 
     std::pair<uint256, DBVal> value;
     value.first = block.hash;
@@ -358,10 +399,11 @@ bool CoinStatsIndex::RevertBlock(const interfaces::BlockInfo& block)
             continue;
         }
 
+        const uint32_t ref_height{OutputRefHeight(block, i)};
         for (uint32_t j = 0; j < tx->vout.size(); ++j) {
             const CTxOut& out{tx->vout[j]};
             const COutPoint outpoint{tx->GetHash(), j};
-            const Coin coin{out, block.height, is_coinbase};
+            const Coin coin{out, block.height, is_coinbase, ref_height};
 
             if (!coin.out.scriptPubKey.IsUnspendable()) {
                 RemoveCoinHash(m_muhash, outpoint, coin);

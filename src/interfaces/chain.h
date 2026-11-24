@@ -8,6 +8,7 @@
 #include <blockfilter.h>
 #include <common/settings.h>
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <kernel/chain.h> // IWYU pragma: export
 #include <primitives/transaction.h>
 #include <util/expected.h>
@@ -125,6 +126,20 @@ public:
 
     //! Get block hash. Height must be valid or this function will abort.
     virtual uint256 getBlockHash(int height) = 0;
+
+    //! BIP 462: activation height of demurrage (std::numeric_limits<int>::max() if not scheduled).
+    virtual int getDemurrageActivationHeight() = 0;
+
+    //! BIP 462: demurrage index I(height) on the active chain, for heights up
+    //! to and including the block after the tip. Returns nullopt if unknown.
+    virtual std::optional<uint64_t> getDemurrageIndex(int height) = 0;
+
+    //! BIP 462: the values of @p tx's inputs, as consensus values them (at the
+    //! transaction's reference height). The coins it spends are read from the
+    //! undo data of @p block_hash, the active-chain block that contains it at
+    //! @p position_in_block, or, if @p block_hash is null, from the UTXO set
+    //! and the mempool. Returns nullopt if a coin or index is unknown.
+    virtual std::optional<demurrage::InputValues> getDemurrageInputValues(const CTransaction& tx, const uint256& block_hash, int position_in_block) = 0;
 
     //! Check that the block is available on disk (i.e. has not been
     //! pruned), and contains transactions.

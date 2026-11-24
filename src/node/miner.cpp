@@ -10,6 +10,7 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/tx_verify.h>
@@ -43,6 +44,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <numeric>
 #include <utility>
 
 namespace node {
@@ -89,6 +91,21 @@ void RegenerateCommitments(CBlock& block, ChainstateManager& chainman)
 {
     CMutableTransaction tx{*block.vtx.at(0)};
     tx.vout.erase(tx.vout.begin() + GetWitnessCommitmentIndex(block));
+    {
+        // BIP 462: the demurrage commitment covers the block's transactions
+        // too. It can be computed again only for a block that extends the tip.
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman.ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (tip && tip->GetBlockHash() == block.hashPrevBlock && demurrage::IsActive(tip->nHeight + 1, chainman.GetConsensus())) {
+            uint256 commitment;
+            const std::vector<CTransactionRef> txs(block.vtx.begin() + 1, block.vtx.end());
+            if (GetDemurrageBlockFees(chainstate, txs, &commitment)) {
+                std::erase_if(tx.vout, [](const CTxOut& out) { return demurrage::IsCommitmentScript(out.scriptPubKey); });
+                tx.vout.emplace_back(0, demurrage::CommitmentScript(commitment));
+            }
+        }
+    }
     block.vtx.at(0) = MakeTransactionRef(tx);
 
     const CBlockIndex* prev_block = WITH_LOCK(::cs_main, return chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock));
@@ -147,6 +164,10 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (chainparams.MineBlocksOnDemand()) {
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
     }
+    if (nHeight == chainparams.GetConsensus().DemurrageHeight) {
+        // BIP 462: the block at ACTIVATION_HEIGHT sets bit 31 of its version.
+        pblock->nVersion = static_cast<int32_t>(static_cast<uint32_t>(pblock->nVersion) | demurrage::ACTIVATION_VERSION_BIT);
+    }
 
     pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
@@ -179,7 +200,27 @@ util::NotNullUniquePtr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees
-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    if (demurrage::IsActive(nHeight, chainparams.GetConsensus())) {
+        // BIP 462: the coinbase claims the subsidy, each transaction's fee at
+        // this block's index (fee_effective) and the demurrage dividend.
+        // Mempool fees are at each transaction's reference height, so recompute them.
+        const std::optional<demurrage::BlockContext> demurrage_block{
+            GetNextDemurrageBlockContext(m_chainstate.m_blockman, *pindexPrev, chainparams.GetConsensus())};
+        const std::vector<CTransactionRef> txs(pblock->vtx.begin() + 1, pblock->vtx.end());
+        uint256 commitment;
+        const std::optional<std::vector<CAmount>> fees{GetDemurrageBlockFees(m_chainstate, txs, &commitment)};
+        if (!demurrage_block || !fees) {
+            throw std::runtime_error("BIP 462 demurrage state of the chain tip is unavailable");
+        }
+        pblocktemplate->vTxFees = *fees;
+        nFees = std::accumulate(fees->begin(), fees->end(), CAmount{0});
+        block_reward = GetBlockSubsidy(nHeight, chainparams.GetConsensus()) + nFees + demurrage_block->dividend;
+        // The coinbase commits to the demurrage state and to the reference
+        // height of each of the block's transactions.
+        coinbaseTx.vout.emplace_back(0, demurrage::CommitmentScript(commitment));
+        coinbase_tx.required_outputs.push_back(coinbaseTx.vout.back());
+    }
     coinbaseTx.vout[0].nValue = block_reward;
     coinbase_tx.block_reward_remaining = block_reward;
 
