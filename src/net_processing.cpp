@@ -1086,8 +1086,8 @@ private:
     /**
      * BIP 462b: the transactions to try when reconstructing the compact block
      * at pindex, besides those of the mempool. A claim transaction is never in
-     * a mempool, but the chain determines it. If the block extends the tip and
-     * needs one, it is built and added to vExtraTxnForCompact in with_claim.
+     * a mempool, but the chain determines it. If the block needs one and it
+     * can be built, it is added to vExtraTxnForCompact in with_claim.
      */
     const std::vector<std::pair<Wtxid, CTransactionRef>>& ExtraTxnForCompactBlock(const CBlockIndex& pindex, std::vector<std::pair<Wtxid, CTransactionRef>>& with_claim)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
@@ -2011,11 +2011,11 @@ std::vector<CTransactionRef> PeerManagerImpl::AbortPrivateBroadcast(const uint25
 const std::vector<std::pair<Wtxid, CTransactionRef>>& PeerManagerImpl::ExtraTxnForCompactBlock(const CBlockIndex& pindex, std::vector<std::pair<Wtxid, CTransactionRef>>& with_claim)
 {
     if (!pindex.pprev) return vExtraTxnForCompact;
-    const auto claim{m_chainman.ExpectedDemurrageClaim(*pindex.pprev)};
-    if (!claim || !*claim) return vExtraTxnForCompact;
+    const CTransactionRef claim{m_chainman.LikelyDemurrageClaim(*pindex.pprev)};
+    if (!claim) return vExtraTxnForCompact;
     with_claim.reserve(vExtraTxnForCompact.size() + 1);
     with_claim = vExtraTxnForCompact;
-    with_claim.emplace_back((*claim)->GetWitnessHash(), *claim);
+    with_claim.emplace_back(claim->GetWitnessHash(), claim);
     return with_claim;
 }
 

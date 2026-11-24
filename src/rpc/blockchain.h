@@ -17,6 +17,8 @@
 
 class CBlock;
 class CBlockIndex;
+class CTransaction;
+class CTxUndo;
 class CChain;
 class UniValue;
 class AutoFile;
@@ -39,7 +41,14 @@ inline constexpr int NUM_GETBLOCKSTATS_PERCENTILES = 5;
 double GetDifficulty(const CBlockIndex& blockindex);
 
 /** Block description to JSON */
-UniValue blockToJSON(node::BlockManager& blockman, const CBlock& block, const CBlockIndex& tip, const CBlockIndex& blockindex, TxVerbosity verbosity, uint256 pow_limit) LOCKS_EXCLUDED(cs_main);
+/**
+ * BIP 462b: add to the description of a confirmed transaction the demurrage
+ * charge that its inputs owed in its block, and its net fee. Does nothing for
+ * a block in which the index had not started.
+ */
+void DemurrageChargeToUniv(UniValue& entry, const CTransaction& tx, const CTxUndo& txundo, const CBlockIndex& blockindex, ChainstateManager& chainman) LOCKS_EXCLUDED(cs_main);
+
+UniValue blockToJSON(node::BlockManager& blockman, const CBlock& block, const CBlockIndex& tip, const CBlockIndex& blockindex, TxVerbosity verbosity, uint256 pow_limit, ChainstateManager* chainman = nullptr) LOCKS_EXCLUDED(cs_main);
 
 /** Block header to JSON */
 UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex, uint256 pow_limit) LOCKS_EXCLUDED(cs_main);

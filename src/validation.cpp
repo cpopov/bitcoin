@@ -6763,6 +6763,43 @@ std::optional<CTransactionRef> ChainstateManager::ExpectedDemurrageClaim(const C
     return MakeTransactionRef(demurrage::BuildClaimTransaction(pool_inputs, pool_value));
 }
 
+CTransactionRef ChainstateManager::LikelyDemurrageClaim(const CBlockIndex& prev)
+{
+    AssertLockHeld(::cs_main);
+    if (&prev == ActiveTip()) return ExpectedDemurrageClaim(prev).value_or(CTransactionRef{});
+    const auto activation{DemurrageActivationHeight(&prev)};
+    if (!activation) return nullptr;
+    std::vector<COutPoint> pool_inputs;
+    CAmount pool_value{0};
+    // The carry: output 0 of the claim transaction of prev. No record of the
+    // block's pool outputs is kept, since it may be invalid.
+    if (prev.nHeight >= *activation) {
+        if (!(prev.nStatus & BLOCK_HAVE_DATA)) return nullptr;
+        CBlock block;
+        if (!m_blockman.ReadBlock(block, prev)) return nullptr;
+        if (const auto carry{demurrage::FindBlockPoolOutputs(block).carry}) {
+            pool_inputs.push_back(*carry);
+            pool_value += block.vtx[1]->vout[0].nValue;
+        }
+    }
+    // The matured contribution, if its block is in the active chain and
+    // nothing has spent it there.
+    if (const int matured_height{prev.nHeight + 1 - COINBASE_MATURITY}; matured_height >= *activation) {
+        const CBlockIndex* matured{Assert(prev.GetAncestor(matured_height))};
+        if (!ActiveChain().Contains(*matured)) return nullptr;
+        const auto outputs{GetDemurragePoolOutputs(*matured)};
+        if (!outputs) return nullptr;
+        if (outputs->contribution) {
+            const auto coin{ActiveChainstate().CoinsTip().GetCoin(*outputs->contribution)};
+            if (!coin) return nullptr;
+            pool_inputs.push_back(*outputs->contribution);
+            pool_value += coin->out.nValue;
+        }
+    }
+    if (pool_inputs.empty()) return nullptr;
+    return MakeTransactionRef(demurrage::BuildClaimTransaction(pool_inputs, pool_value));
+}
+
 bool ChainstateManager::HasExpectedDemurrageClaim(const CBlock& block, const CBlockIndex& prev)
 {
     AssertLockHeld(::cs_main);

@@ -1423,6 +1423,7 @@ static RPCMethod submitpackage()
                         {RPCResult::Type::NUM, "vsize", /*optional=*/true, "(DEPRECATED) Was previously erroneously described as the BIP 141 vsize, but is actually sigops-adjusted vsize.\n"
                                                                     "Use vsize_bip141 to actually get that behavior or switch to the explicit vsize_adjusted for retained behavior."},
                         {RPCResult::Type::NUM, "vsize_bip141", /*optional=*/true, "Virtual transaction size as defined in BIP 141."},
+                        {RPCResult::Type::NUM, "chargeheight", /*optional=*/true, "BIP 462b evaluation height: the block height at which the policy charge was evaluated. Only once the height at which charges begin is known"},
                         {RPCResult::Type::OBJ, "fees", /*optional=*/true, "Transaction fees", {
                             {RPCResult::Type::STR_AMOUNT, "base", "transaction fee in " + CURRENCY_UNIT},
                             {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b policy charge: the demurrage charge of the transaction's inputs at chargeheight, in " + CURRENCY_UNIT + ". Only once the height at which charges begin is known"},
@@ -1573,6 +1574,7 @@ static RPCMethod submitpackage()
                     UniValue fees(UniValue::VOBJ);
                     fees.pushKV("base", ValueFromAmount(it->second.m_base_fees.value()));
                     if (const demurrage::PolicyCharge& charge{tx_result.m_demurrage_charge}; charge.evaluation_height != demurrage::NO_EVALUATION_HEIGHT) {
+                        result_inner.pushKV("chargeheight", charge.evaluation_height);
                         fees.pushKV("charge", ValueFromAmount(charge.charge));
                         fees.pushKV("net", ValueFromAmount(it->second.m_base_fees.value() - charge.charge));
                     }

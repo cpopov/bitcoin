@@ -1276,6 +1276,16 @@ public:
     std::optional<CTransactionRef> ExpectedDemurrageClaim(const CBlockIndex& prev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
+     * BIP 462b: the claim transaction that a block on top of prev most likely
+     * has at index 1, for the reconstruction of a compact block. For the
+     * active tip this is ExpectedDemurrageClaim(). For another block whose
+     * data is stored, the carry is read from that block, which may not have
+     * been validated, and the matured contribution from the active chain. A
+     * null reference if there is nothing to offer.
+     */
+    CTransactionRef LikelyDemurrageClaim(const CBlockIndex& prev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
      * BIP 462b: whether a block on top of prev has the claim transaction that
      * its pool inputs require at index 1. Blocks are checked with this before
      * they are announced ahead of full validation. Returns true if the check

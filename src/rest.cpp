@@ -491,7 +491,7 @@ static bool rest_block(const std::any& context,
         if (tx_verbosity) {
             CBlock block{};
             SpanReader{*block_data} >> TX_WITH_WITNESS(block);
-            UniValue objBlock = blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, *tx_verbosity, chainman.GetConsensus().powLimit);
+            UniValue objBlock = blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, *tx_verbosity, chainman.GetConsensus().powLimit, &chainman);
             std::string strJSON = objBlock.write() + "\n";
             req->WriteHeader("Cache-Control", REST_CACHE_NO_STORE);
             req->WriteHeader("Content-Type", "application/json");

@@ -445,7 +445,11 @@ std::vector<RPCResult> TxDoc(const TxDocOptions& opts)
         }},
     };
 
-    if (opts.fee) fields.emplace_back(RPCResult::Type::NUM, "fee", /*optional=*/true, fee_doc);
+    if (opts.fee) {
+        fields.emplace_back(RPCResult::Type::NUM, "fee", /*optional=*/true, fee_doc);
+        fields.emplace_back(RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b: the demurrage charge that the inputs owed in the transaction's block, in " + CURRENCY_UNIT + ". Only with the fee, for a block in which the index had started");
+        fields.emplace_back(RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT);
+    }
     if (opts.hex) fields.emplace_back(RPCResult::Type::STR_HEX, "hex", "The hex-encoded transaction data");
 
     if (opts.elision_mode != ElisionMode::None) {

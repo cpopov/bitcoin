@@ -13,6 +13,7 @@
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/scan.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
 
 using interfaces::FoundBlock;
@@ -329,6 +330,8 @@ static void ListTransactions(const CWallet& wallet, const CWalletTx& wtx, int nM
     std::list<COutputEntry> listSent;
 
     CachedTxGetAmounts(wallet, wtx, listReceived, listSent, nFee, include_change);
+    // BIP 462b: the part of the fee that is the demurrage charge of the inputs.
+    const std::optional<CAmount> demurrage_charge{listSent.empty() || filter_label.has_value() ? std::nullopt : GetWalletTxDemurrageCharge(wallet, wtx)};
 
     // Sent
     if (!filter_label.has_value())
@@ -345,6 +348,10 @@ static void ListTransactions(const CWallet& wallet, const CWalletTx& wtx, int nM
             }
             entry.pushKV("vout", s.vout);
             entry.pushKV("fee", ValueFromAmount(-nFee));
+            if (demurrage_charge) {
+                entry.pushKV("charge", ValueFromAmount(-*demurrage_charge));
+                entry.pushKV("net_fee", ValueFromAmount(*demurrage_charge - nFee));
+            }
             if (fLong)
                 WalletTxToJSON(wallet, wtx, entry);
             entry.pushKV("abandoned", wtx.isAbandoned());
@@ -403,8 +410,14 @@ static void PushTxAmountAndFee(const CWallet& wallet, const CWalletTx& wtx, UniV
     CAmount fee = (is_from_me ? wtx.GetTx()->GetValueOut() - debit : 0);
 
     entry.pushKV("amount", ValueFromAmount(net - fee));
-    if (is_from_me)
+    if (is_from_me) {
         entry.pushKV("fee", ValueFromAmount(fee));
+        // BIP 462b: the part of the fee that is the demurrage charge of the inputs.
+        if (const auto charge{GetWalletTxDemurrageCharge(wallet, wtx)}) {
+            entry.pushKV("charge", ValueFromAmount(-*charge));
+            entry.pushKV("net_fee", ValueFromAmount(fee + *charge));
+        }
+    }
 }
 
 static void PushTxDecoded(const CWallet& wallet, const CWalletTx& wtx, UniValue& entry)
@@ -527,6 +540,8 @@ RPCMethod listtransactions()
                             {RPCResult::Type::NUM, "vout", "the vout value"},
                             {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the\n"
                                  "'send' category of transactions."},
+                            {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b: the part of the fee that is the demurrage charge of the inputs, in " + CURRENCY_UNIT + ": what they owed in the block that confirmed the transaction, or its policy charge while it is unconfirmed. This is negative. Only once the height at which charges begin is known, and if the wallet knows every output that the transaction spends."},
+                            {RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT + ". This is negative. Only present with the charge."},
                         },
                         TransactionDescriptionString()),
                         {
@@ -615,6 +630,8 @@ RPCMethod listrawtransactions()
                         "zero means a pure self-transfer (e.g. consolidation)."},
                     {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The fee paid in " + CURRENCY_UNIT + ". "
                         "This is negative and only present when the wallet funded the transaction."},
+                    {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b: the part of the fee that is the demurrage charge of the inputs, in " + CURRENCY_UNIT + ": what they owed in the block that confirmed the transaction, or its policy charge while it is unconfirmed. This is negative. Only once the height at which charges begin is known, and if the wallet knows every output that the transaction spends."},
+                    {RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT + ". This is negative. Only present with the charge."},
                 },
                 Cat(TransactionDescriptionString(/*include_parent_descs=*/false),
                 {
@@ -691,6 +708,8 @@ static std::vector<RPCResult> ListSinceBlockTxFields()
             {RPCResult::Type::NUM, "vout", "the vout value"},
             {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the\n"
                  "'send' category of transactions."},
+            {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b: the part of the fee that is the demurrage charge of the inputs, in " + CURRENCY_UNIT + ": what they owed in the block that confirmed the transaction, or its policy charge while it is unconfirmed. This is negative. Only once the height at which charges begin is known, and if the wallet knows every output that the transaction spends."},
+            {RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT + ". This is negative. Only present with the charge."},
         },
         Cat(
             TransactionDescriptionString(),
@@ -837,6 +856,8 @@ RPCMethod gettransaction()
                         {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT},
                         {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the\n"
                                      "'send' category of transactions."},
+                        {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b: the part of the fee that is the demurrage charge of the inputs, in " + CURRENCY_UNIT + ": what they owed in the block that confirmed the transaction, or its policy charge while it is unconfirmed. This is negative. Only once the height at which charges begin is known, and if the wallet knows every output that the transaction spends."},
+                        {RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT + ". This is negative. Only present with the charge."},
                     },
                     TransactionDescriptionString()),
                     {
@@ -856,6 +877,8 @@ RPCMethod gettransaction()
                                 {RPCResult::Type::NUM, "vout", "the vout value"},
                                 {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the \n"
                                     "'send' category of transactions."},
+                                {RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true, "BIP 462b: the part of the fee that is the demurrage charge of the inputs, in " + CURRENCY_UNIT + ": what they owed in the block that confirmed the transaction, or its policy charge while it is unconfirmed. This is negative. Only once the height at which charges begin is known, and if the wallet knows every output that the transaction spends."},
+                                {RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true, "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT + ". This is negative. Only present with the charge."},
                                 {RPCResult::Type::BOOL, "abandoned", "'true' if the transaction has been abandoned (inputs are respendable)."},
                                 {RPCResult::Type::ARR, "parent_descs", /*optional=*/true, "Only if 'category' is 'receive'. List of parent descriptors for the output script of this coin.", {
                                     {RPCResult::Type::STR, "desc", "The descriptor string."},

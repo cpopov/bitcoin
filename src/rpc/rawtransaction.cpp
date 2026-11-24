@@ -257,6 +257,12 @@ static RPCMethod getrawtransaction()
         std::vector<RPCResult>{{
             RPCResult::Type::NUM, "fee", /*optional=*/true,
             "transaction fee in " + CURRENCY_UNIT + ", omitted if block undo data is not available"
+        }, {
+            RPCResult::Type::STR_AMOUNT, "charge", /*optional=*/true,
+            "BIP 462b: the demurrage charge that the inputs owed in the transaction's block, in " + CURRENCY_UNIT + ". Only with the fee, for a block in which the index had started"
+        }, {
+            RPCResult::Type::STR_AMOUNT, "net_fee", /*optional=*/true,
+            "BIP 462b: the fee less the charge, in " + CURRENCY_UNIT
         }},
         TxDoc({.elision_mode = ElisionMode::Silent,
                .prevout = true,
@@ -402,6 +408,7 @@ static RPCMethod getrawtransaction()
         undoTX = &blockUndo.vtxundo.at(it - block.vtx.begin() - 1);
     }
     TxToJSON(*tx, hash_block, result, chainman.ActiveChainstate(), undoTX, TxVerbosity::SHOW_DETAILS_AND_PREVOUT);
+    if (undoTX) DemurrageChargeToUniv(result, *tx, *undoTX, *blockindex, chainman);
     return result;
 },
     };

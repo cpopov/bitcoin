@@ -732,6 +732,20 @@ public:
         }
         return charges;
     }
+    std::optional<std::vector<CAmount>> demurrageChargesAt(const std::vector<demurrage::PolicyInput>& outputs, int spent_height) override
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman().ActiveTip()};
+        const auto charge_height{tip ? chainman().DemurrageKnownChargeHeight(tip) : std::nullopt};
+        if (!charge_height) return std::nullopt;
+        demurrage::IndexSchedule& schedule{chainman().DemurrageSchedule(*charge_height)};
+        std::vector<CAmount> charges;
+        charges.reserve(outputs.size());
+        for (const demurrage::PolicyInput& output : outputs) {
+            charges.push_back(schedule.ChargeFor(output.value, output.created_height, spent_height));
+        }
+        return charges;
+    }
     std::optional<CAmount> mempoolReplacementFee(const Txid& txid) override
     {
         if (!m_node.mempool) return std::nullopt;

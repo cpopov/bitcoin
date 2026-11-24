@@ -287,6 +287,19 @@ CAmount GetTxDemurrageCharge(const CWallet& wallet, const CTransaction& tx)
     return wallet.chain().demurragePolicyCharge(*inputs).value_or(0);
 }
 
+std::optional<CAmount> GetWalletTxDemurrageCharge(const CWallet& wallet, const CWalletTx& wtx)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const auto inputs{GetDemurrageInputs(wallet, *wtx.GetTx())};
+    if (!inputs) return std::nullopt;
+    if (const auto* confirmed{wtx.state<TxStateConfirmed>()}) {
+        const auto charges{wallet.chain().demurrageChargesAt(*inputs, confirmed->confirmed_block_height)};
+        if (!charges) return std::nullopt;
+        return std::accumulate(charges->begin(), charges->end(), CAmount{0});
+    }
+    return wallet.chain().demurragePolicyCharge(*inputs);
+}
+
 void ApplyDemurrageCharges(const CWallet& wallet, std::vector<COutput*>& outputs)
 {
     std::vector<demurrage::PolicyInput> inputs;

@@ -37,6 +37,9 @@ from test_framework.blocktools import (
 )
 from test_framework.messages import (
     COIN,
+    COutPoint,
+    CTransaction,
+    CTxIn,
     CTxOut,
     HeaderAndShortIDs,
     msg_cmpctblock,
@@ -45,6 +48,7 @@ from test_framework.messages import (
     tx_from_hex,
 )
 from test_framework.p2p import P2PInterface, p2p_lock
+from test_framework.script import CScript, OP_TRUE
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -185,9 +189,23 @@ class DemurrageInterfacesTest(BitcoinTestFramework):
         tx_hex, charge = self.raw_spend(coin, net_fee=2_000)
         result = node.submitpackage([tx_hex])
         assert_equal(result["package_msg"], "success")
-        fees = next(iter(result["tx-results"].values()))["fees"]
+        tx_result = next(iter(result["tx-results"].values()))
+        fees = tx_result["fees"]
         assert_equal((to_sat(fees["base"]), to_sat(fees["charge"]), to_sat(fees["net"])), (charge + 2_000, charge, 2_000))
-        self.mine()
+        assert_equal(tx_result["chargeheight"], self.next_height())
+        package_txid = tx_result["txid"]
+        blockhash = self.mine()[0]
+
+        self.log.info("getrawtransaction and getblock report the charge that a confirmed transaction's inputs owed")
+        # Both transactions were evaluated at the height of the block that confirmed them.
+        for confirmed in (node.getrawtransaction(package_txid, 2, blockhash), next(tx for tx in node.getblock(blockhash, 2)["tx"] if tx["txid"] == package_txid)):
+            assert_equal(to_sat(confirmed["fee"]), charge + 2_000)
+            assert_equal(to_sat(confirmed["charge"]), charge)
+            assert_equal(to_sat(confirmed["net_fee"]), 2_000)
+        block = node.getblock(blockhash, 2)
+        assert "charge" not in block["tx"][0]
+        assert_equal(sum(to_sat(tx["charge"]) for tx in block["tx"][1:]),
+                     sum(to_sat(vout["value"]) for vout in block["tx"][0]["vout"] if vout["scriptPubKey"]["hex"] == POOL_SCRIPT.hex()))
 
         self.log.info("scantxoutset and the REST interface report each output's charge and effective value")
         scan = node.scantxoutset("start", [f"addr({self.mining_address})"])
@@ -238,7 +256,10 @@ class DemurrageInterfacesTest(BitcoinTestFramework):
         fee, charge, net, vsize = self.entry(txid)
         assert_greater_than(charge, 0)
         assert_greater_than_or_equal(net, FEE_RATE * vsize)
-        assert_equal(to_sat(-self.wallet.gettransaction(txid)["fee"]), fee)
+        listed = self.wallet.gettransaction(txid)
+        assert_equal(to_sat(-listed["fee"]), fee)
+        # While the transaction is unconfirmed, the wallet reports its policy charge.
+        assert_equal((to_sat(-listed["charge"]), to_sat(-listed["net_fee"])), (charge, net))
 
         self.log.info(f"It allows for the charge to grow for {WALLET_CHARGE_MARGIN} blocks, and no more")
         margin = net - FEE_RATE * vsize
@@ -252,6 +273,16 @@ class DemurrageInterfacesTest(BitcoinTestFramework):
         # below the feerate that the wallet chose.
         assert 0 <= net_after - FEE_RATE * vsize <= 2 * FEE_RATE, net_after - FEE_RATE * vsize
         self.mine()
+
+        self.log.info("Once it is confirmed, the wallet reports the charge that its inputs owed in its block")
+        # The policy charge was last evaluated at that block's height.
+        listed = self.wallet.gettransaction(txid)
+        assert_equal(listed["confirmations"], 1)
+        assert_equal((to_sat(-listed["fee"]), to_sat(-listed["charge"]), to_sat(-listed["net_fee"])), (fee, charge_after, net_after))
+        sent = next(entry for entry in self.wallet.listtransactions("*", 20) if entry["txid"] == txid and entry["category"] == "send")
+        assert_equal((to_sat(-sent["fee"]), to_sat(-sent["charge"]), to_sat(-sent["net_fee"])), (fee, charge_after, net_after))
+        received = [entry for entry in self.wallet.listtransactions("*", 20) if entry["category"] != "send"]
+        assert received and all("charge" not in entry for entry in received)
         assert_equal(node.getrawmempool(), [])
 
         self.log.info("The charge can be subtracted from the amount sent")
@@ -405,6 +436,49 @@ class DemurrageInterfacesTest(BitcoinTestFramework):
         with p2p_lock:
             assert "getblocktxn" not in peer.last_message
         assert_equal(node.getblock(block.hash_hex)["tx"][1], claim.txid_hex)
+
+        self.log.info("It also builds the claim transaction of a compact block whose parent is not its tip")
+        template = node.getblocktemplate(DECLARED)
+        height = template["height"]
+        rivals = []
+        for script in (CScript([OP_TRUE]), CScript([OP_TRUE, OP_TRUE])):
+            coinbase = create_coinbase(height, script_pubkey=script)
+            coinbase.vout[0].nValue = template["coinbasevalue"]
+            rival = create_block(coinbase=coinbase, tmpl=template, txlist=[tx["data"] for tx in template["transactions"]])
+            add_witness_commitment(rival)
+            rival.solve()
+            rivals.append(rival)
+        active, stored = rivals
+        assert_equal(node.submitblock(active.serialize().hex()), None)
+        assert_equal(node.submitblock(stored.serialize().hex()), "inconclusive")
+        assert_equal(node.getbestblockhash(), active.hash_hex)
+        # The child of the stored block spends that block's carry, and the
+        # contribution that matures at its height, if there is one.
+        pool_inputs = [(stored.vtx[1].txid_int, 0, stored.vtx[1].vout[0].nValue)]
+        matured = node.getblock(node.getblockhash(height + 1 - 100), 2)["tx"][0]
+        for vout in matured["vout"]:
+            if vout["scriptPubKey"]["hex"] == POOL_SCRIPT.hex():
+                pool_inputs.append((int(matured["txid"], 16), vout["n"], to_sat(vout["value"])))
+        pool = sum(value for _, _, value in pool_inputs)
+        claim = CTransaction()
+        claim.version = 2
+        claim.vin = [CTxIn(COutPoint(txid, n), b"", 0xFFFFFFFF) for txid, n, _ in pool_inputs]
+        claim.vout = [CTxOut(pool - pool // 10_000, POOL_SCRIPT)]
+        coinbase = create_coinbase(height + 1)
+        coinbase.vout[0].nValue = ((50 * COIN) >> ((height + 1) // 150)) + pool // 10_000
+        child = create_block(stored.hash_int, coinbase, ntime=stored.nTime + 1, txlist=[claim])
+        add_witness_commitment(child)
+        child.solve()
+        with p2p_lock:
+            peer.last_message.pop("getblocktxn", None)
+        peer.send_without_ping(msg_headers([child]))
+        peer.wait_for_getdata([child.hash_int])
+        compact = HeaderAndShortIDs()
+        compact.initialize_from_block(child, prefill_list=[0], use_witness=True)
+        peer.send_and_ping(msg_cmpctblock(compact.to_p2p()))
+        self.wait_until(lambda: node.getbestblockhash() == child.hash_hex)
+        with p2p_lock:
+            assert "getblocktxn" not in peer.last_message
 
     def template_summary(self):
         template = self.nodes[0].getblocktemplate(DECLARED)

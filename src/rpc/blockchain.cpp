@@ -239,7 +239,26 @@ UniValue coinbaseTxToJSON(const CTransaction& coinbase_tx)
     return coinbase_tx_obj;
 }
 
-UniValue blockToJSON(BlockManager& blockman, const CBlock& block, const CBlockIndex& tip, const CBlockIndex& blockindex, TxVerbosity verbosity, const uint256 pow_limit)
+void DemurrageChargeToUniv(UniValue& entry, const CTransaction& tx, const CTxUndo& txundo, const CBlockIndex& blockindex, ChainstateManager& chainman)
+{
+    LOCK(::cs_main);
+    const auto charge_height{chainman.DemurrageChargeHeight(blockindex.pprev)};
+    if (!charge_height) return;
+    // A claim transaction spends only pool outputs, which owe no charge.
+    const bool is_claim{std::ranges::all_of(txundo.vprevout, [](const Coin& coin) { return demurrage::IsPoolScript(coin.out.scriptPubKey); }) &&
+                        tx.vout.size() == 1 && demurrage::IsPoolScript(tx.vout[0].scriptPubKey)};
+    demurrage::IndexSchedule& schedule{chainman.DemurrageSchedule(*charge_height)};
+    CAmount charge{0};
+    CAmount value_in{0};
+    for (const Coin& coin : txundo.vprevout) {
+        value_in += coin.out.nValue;
+        if (!is_claim) charge += schedule.ChargeFor(coin.out.nValue, coin.nHeight, blockindex.nHeight);
+    }
+    entry.pushKV("charge", ValueFromAmount(charge));
+    entry.pushKV("net_fee", ValueFromAmount(value_in - tx.GetValueOut() - charge));
+}
+
+UniValue blockToJSON(BlockManager& blockman, const CBlock& block, const CBlockIndex& tip, const CBlockIndex& blockindex, TxVerbosity verbosity, const uint256 pow_limit, ChainstateManager* chainman)
 {
     UniValue result = blockheaderToJSON(tip, blockindex, pow_limit);
 
@@ -274,6 +293,7 @@ UniValue blockToJSON(BlockManager& blockman, const CBlock& block, const CBlockIn
                 const CTxUndo* txundo = (have_undo && i > 0) ? &blockUndo.vtxundo.at(i - 1) : nullptr;
                 UniValue objTx(UniValue::VOBJ);
                 TxToUniv(*tx, /*block_hash=*/uint256(), /*entry=*/objTx, /*include_hex=*/true, txundo, verbosity);
+                if (txundo && chainman) DemurrageChargeToUniv(objTx, *tx, *txundo, blockindex, *chainman);
                 txs.push_back(std::move(objTx));
             }
             break;
@@ -906,7 +926,7 @@ static RPCMethod getblock()
         tx_verbosity = TxVerbosity::SHOW_DETAILS_AND_PREVOUT;
     }
 
-    return blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, tx_verbosity, chainman.GetConsensus().powLimit);
+    return blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, tx_verbosity, chainman.GetConsensus().powLimit, &chainman);
 },
     };
 }

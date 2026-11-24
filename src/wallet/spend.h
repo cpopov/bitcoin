@@ -47,6 +47,14 @@ std::optional<std::vector<demurrage::PolicyInput>> GetDemurrageInputs(const CWal
 CAmount GetTxDemurrageCharge(const CWallet& wallet, const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 /**
+ * BIP 462b: the demurrage charge of a wallet transaction: what its inputs owed
+ * in the block that confirmed it, or its policy charge now if it is
+ * unconfirmed. nullopt if the height at which charges begin is not known, or
+ * if the wallet does not know every output that the transaction spends.
+ */
+std::optional<CAmount> GetWalletTxDemurrageCharge(const CWallet& wallet, const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/**
  * BIP 462b: set the demurrage charge of each output, WALLET_CHARGE_MARGIN
  * blocks after the next block, as part of the fee to spend it. Does nothing to
  * outputs without a fee, or until the height at which charges begin is known.

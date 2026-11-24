@@ -256,6 +256,11 @@ public:
     //! Returns nullopt until the height at which charges begin is known.
     virtual std::optional<std::vector<CAmount>> demurrageCharges(const std::vector<demurrage::PolicyInput>& outputs, int blocks_ahead) = 0;
 
+    //! BIP 462b: the demurrage charge that each of these outputs owed, or
+    //! would owe, when spent in a block at spent_height. Returns nullopt
+    //! until the height at which charges begin is known.
+    virtual std::optional<std::vector<CAmount>> demurrageChargesAt(const std::vector<demurrage::PolicyInput>& outputs, int spent_height) = 0;
+
     //! BIP 462b: the fee that the mempool compares a replacement of this
     //! transaction against: the greater of its net fee now and its net fee
     //! when it was accepted, with any prioritisation. Returns nullopt if the
